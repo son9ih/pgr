@@ -69,6 +69,11 @@ def redq_sac(
         n_mc_eval=1000,
         n_mc_cutoff=350,
         reseed_each_epoch=True,
+        # wandb related
+        use_wandb=False,
+        wandb_project='PGR',
+        wandb_group='PGR',
+        wandb_name=None,
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -77,14 +82,57 @@ def redq_sac(
     if epochs == 'mbpo' or epochs < 0:
         epochs = mbpo_epoches.get(env_name, 300)
     total_steps = steps_per_epoch * epochs + 1
+    
+    # Initialize wandb if enabled
+    if use_wandb:
+        run_name = wandb_name or f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+        wandb.init(
+            project=wandb_project,
+            group=wandb_group,
+            name=run_name,
+            config={
+                "env_name": env_name,
+                "seed": seed,
+                "epochs": epochs,
+                "steps_per_epoch": steps_per_epoch,
+                "hidden_sizes": hidden_sizes,
+                "replay_size": replay_size,
+                "batch_size": batch_size,
+                "lr": lr,
+                "gamma": gamma,
+                "polyak": polyak,
+                "alpha": alpha,
+                "auto_alpha": auto_alpha,
+                "target_entropy": target_entropy,
+                "start_steps": start_steps,
+                "delay_update_steps": delay_update_steps,
+                "utd_ratio": utd_ratio,
+                "num_Q": num_Q,
+                "num_min": num_min,
+                "q_target_mode": q_target_mode,
+                "policy_update_delay": policy_update_delay,
+                "diffusion_buffer_size": diffusion_buffer_size,
+                "diffusion_sample_ratio": diffusion_sample_ratio,
+                "retrain_diffusion_every": retrain_diffusion_every,
+                "num_samples": num_samples,
+                "disable_diffusion": disable_diffusion,
+                "cfg_dropout": cfg_dropout,
+                "cond_top_frac": cond_top_frac,
+                "cfg_scale": cfg_scale,
+                "cond_hidden_size": cond_hidden_size,
+            }
+        )
+        print(f"Initialized wandb run: {run_name}")
 
     """set up logger"""
+    logger_kwargs['use_wandb'] = use_wandb
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
     """set up environment and seeding"""
     env_fn = lambda: wrap_gym(gym.make(env_name))
     env, test_env, bias_eval_env = env_fn(), env_fn(), env_fn()
+    print(f"Environment: {env_name} | Seed: {seed}")
     # seed torch and numpy
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -286,6 +334,10 @@ def redq_sac(
 
             # flush logged information to disk
             sys.stdout.flush()
+            
+    # finish wandb run when training is complete
+    if use_wandb:
+        wandb.finish()
 
 def wrap_gym(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     if rescale_actions:
@@ -321,10 +373,20 @@ if __name__ == '__main__':
     parser.add_argument('--gin_config_files', nargs='*', type=str,
                         default=['config/online/sac_synther_dmc.gin'])
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
+    
+    # wandb related arguments
+    parser.add_argument('--wandb_project', type=str, default='PGR')
+    parser.add_argument('--wandb_group', type=str, default='PGR')
+    parser.add_argument('--wandb_name', type=str, default=None)
+    parser.add_argument('--wandb', action='store_true', default=False, 
+                        help='Enable wandb logging')
+    
     args = parser.parse_args()
 
     logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
 
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
-    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs)
+    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs,
+             use_wandb=args.wandb, wandb_project=args.wandb_project,
+             wandb_group=args.wandb_group, wandb_name=args.wandb_name)
