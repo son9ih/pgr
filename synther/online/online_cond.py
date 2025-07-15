@@ -20,6 +20,8 @@ from synther.diffusion.diffusion_generator import CondDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
 
+import wandb
+
 
 @gin.configurable
 def redq_sac(
