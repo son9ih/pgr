@@ -3,6 +3,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import sys
+sys.path.append('.')
 import time
 
 import dmcgym
@@ -365,6 +366,8 @@ def get_time_limit(env: gym.Env):
 
 if __name__ == '__main__':
     import argparse
+    from datetime import datetime
+    import os
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='Hopper-v2')
@@ -382,6 +385,11 @@ if __name__ == '__main__':
                         help='Enable wandb logging')
     
     args = parser.parse_args()
+    
+    args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
+    print(args.results_folder)
+    if not os.path.exists(args.results_folder):
+        os.makedirs(args.results_folder)
 
     logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
 
