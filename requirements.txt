@@ -15,7 +15,7 @@ sortedcontainers
 pyrallis
 gin-config
 h5py
-dm-control @ git+https://github.com/deepmind/dm_control@f4e5e2336991017361f563db7e676fd08857076f
+# dm-control @ git+https://github.com/deepmind/dm_control@f4e5e2336991017361f563db7e676fd08857076f
 dm-env
 dm-tree
 dmcgym @ git+https://github.com/conglu1997/dmcgym.git@812905790dd87a448c9544a0beccb8b05ea2a850
