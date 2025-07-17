@@ -45,7 +45,9 @@ class CondDiffusionGenerator:
         for i in range(num_batches):
             print(f'Generating split {i + 1} of {num_batches}')
             # Generate condition
-            cond = self.cond_distri.sample_cond(int(self.sample_batch_size))
+            # cond = self.cond_distri.sample_cond(int(self.sample_batch_size))
+            # 여기서 cond를 None으로 두면 unconditional sampling
+            cond = None
 
             sampled_outputs = self.diffusion.sample(
                 batch_size=self.sample_batch_size,
