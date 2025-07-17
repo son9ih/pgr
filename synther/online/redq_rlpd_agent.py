@@ -52,12 +52,32 @@ class REDQRLPDCondAgent(REDQSACAgent):
             """Q loss"""
             y_q, sample_idxs = self.get_redq_q_target_no_grad(obs_next_tensor, rews_tensor, done_tensor)
             q_prediction_list = []
+            coef_list = []
+            self.cond_net.eval()  # Set conditional net to eval mode
             for q_i in range(self.num_Q):
                 q_prediction = self.q_net_list[q_i](torch.cat([obs_tensor, acts_tensor], 1))
+                curio = self.cond_net.compute_reward_torch(obs_tensor, obs_next_tensor, acts_tensor)
+                coef = curio - 1
                 q_prediction_list.append(q_prediction)
+                coef_list.append(coef)
+            self.cond_net.train()  # Set conditional net back to train mode
             q_prediction_cat = torch.cat(q_prediction_list, dim=1)
             y_q = y_q.expand((-1, self.num_Q)) if y_q.shape[1] == 1 else y_q
-            q_loss_all = self.mse_criterion(q_prediction_cat, y_q) * self.num_Q
+            # ==============================================
+            # (2) 여기에 (F(i)-1)이라는 coefficient가 들어가야됨
+            # q_loss_all = self.mse_criterion(q_prediction_cat, y_q) * self.num_Q 대신
+            q_loss_all = 0
+            for q_i in range(self.num_Q):
+                q_prediction = q_prediction_cat[:, q_i].unsqueeze(1)
+                coef = coef_list[q_i].unsqueeze(1)
+                # We use the coefficient to scale the Q loss
+                q_loss_all += (self.mse_criterion(q_prediction, y_q) * coef).mean()
+                # coef가 MSE결과가 abs를 해도 똑같음
+                # q_loss_all += (self.mse_criterion(q_prediction, y_q) * coef).abs().mean()
+            
+            
+            # ==============================================
+            # q_loss_all = self.mse_criterion(q_prediction_cat, y_q) * self.num_Q
 
             for q_i in range(self.num_Q):
                 self.q_optimizer_list[q_i].zero_grad()
