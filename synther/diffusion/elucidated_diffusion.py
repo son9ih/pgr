@@ -558,7 +558,9 @@ class REDQCondTrainer(Trainer):
             data = np.concatenate(data, axis=1)
             data = torch.from_numpy(data).float()
             cond_signal = torch.from_numpy(cond_signal).float()
-            loss = self.train_on_batch(data, cond=cond_signal)
+            # cond_signal을 같은 형태의 None으로 두기
+            # loss = self.train_on_batch(data, cond=cond_signal)
+            loss = self.train_on_batch(data, cond=None)
             if j % 1000 == 0:
                 print(f'[{j}/{num_steps}] loss: {loss:.4f}')
         
