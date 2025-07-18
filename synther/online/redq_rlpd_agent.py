@@ -14,7 +14,7 @@ def combine_two_tensors(tensor1, tensor2):
 
 class REDQRLPDCondAgent(REDQSACAgent):
 
-    def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, *args, **kwargs):
+    def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, hyper=0.1, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim, size=diffusion_buffer_size)
         self.diffusion_sample_ratio = diffusion_sample_ratio
@@ -23,6 +23,7 @@ class REDQRLPDCondAgent(REDQSACAgent):
                                     hidden_size=cond_hidden_size, 
                                     output_size=self.act_dim).to(self.device)
         self.cond_optimizer = torch.optim.Adam(self.cond_net.parameters(), lr=self.lr)
+        self.hyper = hyper
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -71,7 +72,7 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 q_prediction = q_prediction_cat[:, q_i].unsqueeze(1)
                 coef = coef_list[q_i].unsqueeze(1)
                 # We use the coefficient to scale the Q loss
-                q_loss_all += (self.mse_criterion(q_prediction, y_q) * coef).mean()
+                q_loss_all += (self.mse_criterion(q_prediction, y_q) * coef * self.hyper).mean()
                 # coef가 MSE결과가 abs를 해도 똑같음
                 # q_loss_all += (self.mse_criterion(q_prediction, y_q) * coef).abs().mean()
             

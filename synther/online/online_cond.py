@@ -75,6 +75,8 @@ def redq_sac(
         wandb_project='PGR',
         wandb_group='PGR',
         wandb_name=None,
+        # Loss weight hyperparameters
+        hyper = 0.005
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -121,6 +123,7 @@ def redq_sac(
                 "cond_top_frac": cond_top_frac,
                 "cfg_scale": cfg_scale,
                 "cond_hidden_size": cond_hidden_size,
+                "hyper": hyper,
             }
         )
         print(f"Initialized wandb run: {run_name}")
@@ -193,7 +196,7 @@ def redq_sac(
         'q_target_mode': q_target_mode,
         'policy_update_delay': policy_update_delay,
     }
-    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio, env_name, obs_dim, act_dim, act_limit, device,
+    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, env_name, obs_dim, act_dim, act_limit, device,
                               hidden_sizes, replay_size, batch_size,lr, gamma, polyak,
                               alpha, auto_alpha, target_entropy,
                               start_steps, delay_update_steps,
@@ -245,8 +248,10 @@ def redq_sac(
 
             # import ipdb; ipdb.set_trace()
 
+            # 이 classifier-free diffusion model을 unconditional diffusion으로 바꿔야해
             # Train new diffusion model
             diffusion_trainer = REDQCondTrainer(
+                # 이게 ema.ema_model이랑 같음
                 construct_diffusion_model(
                     inputs=inputs,
                     skip_dims=skip_dims,
@@ -257,6 +262,7 @@ def redq_sac(
                 results_folder=args.results_folder,
                 model_terminals=model_terminals,
             )
+            # 그대로 두어라
             diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
             cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
                                                                    curr_epoch=(t // steps_per_epoch) + 1)
@@ -384,6 +390,10 @@ if __name__ == '__main__':
     parser.add_argument('--wandb', action='store_true', default=False, 
                         help='Enable wandb logging')
     
+    # Loss weight hyperparameters
+    parser.add_argument('--hyper', type=float, default=0.005,
+                        help='Loss weight hyperparameter')
+    
     args = parser.parse_args()
     
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
@@ -397,4 +407,5 @@ if __name__ == '__main__':
 
     redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs,
              use_wandb=args.wandb, wandb_project=args.wandb_project,
-             wandb_group=args.wandb_group, wandb_name=args.wandb_name)
+             wandb_group=args.wandb_group, wandb_name=args.wandb_name
+             , hyper=args.hyper)
