@@ -43,18 +43,19 @@ def redq_sac(
         alpha=0.2,
         auto_alpha=True,
         target_entropy='mbpo',
-        start_steps=5000,
+        start_steps=5000, # number of steps to take random actions for initial exploration
         delay_update_steps='auto',
         utd_ratio=20,
         num_Q=10,
         num_min=2,
         q_target_mode='min',
         policy_update_delay=20,
-        diffusion_buffer_size=int(1e6),
+        # diffusion_buffer_size=int(1e6),
+        diffusion_buffer_size=int(1e5),
         diffusion_sample_ratio=0.5,
         # diffusion hyperparameters
         retrain_diffusion_every=10_000,
-        num_samples=100_000,
+        num_samples=100_000, # same as diffusion buffer size
         diffusion_start=0,
         disable_diffusion=True,
         print_buffer_stats=True,
@@ -76,7 +77,7 @@ def redq_sac(
         wandb_group='PGR',
         wandb_name=None,
         # Loss weight hyperparameters
-        hyper = 0.005
+        hyper = 1.0
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -391,7 +392,7 @@ if __name__ == '__main__':
                         help='Enable wandb logging')
     
     # Loss weight hyperparameters
-    parser.add_argument('--hyper', type=float, default=0.005,
+    parser.add_argument('--hyper', type=float, default=1.0,
                         help='Loss weight hyperparameter')
     
     args = parser.parse_args()
