@@ -6,6 +6,7 @@ from redq.algos.redq_sac import REDQSACAgent
 from synther.online.conditional_nets import Curiosity
 from torch import Tensor
 from tqdm import trange
+from datetime import datetime
 
 
 def combine_two_tensors(tensor1, tensor2):
@@ -14,7 +15,8 @@ def combine_two_tensors(tensor1, tensor2):
 
 class REDQRLPDCondAgent(REDQSACAgent):
 
-    def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, hyper=0.1, *args, **kwargs):
+    def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, hyper=0.1, 
+                 importance_weight=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim, size=diffusion_buffer_size)
         self.diffusion_sample_ratio = diffusion_sample_ratio
@@ -24,6 +26,26 @@ class REDQRLPDCondAgent(REDQSACAgent):
                                     output_size=self.act_dim).to(self.device)
         self.cond_optimizer = torch.optim.Adam(self.cond_net.parameters(), lr=self.lr)
         self.hyper = hyper
+        
+        # Importance weighting parameters
+        self.importance_weight = importance_weight
+        self.current_epoch = 0
+        self.beta_decay_epochs = 50
+    
+    def get_current_beta(self):
+        """Calculate beta value based on current epoch for importance weighting"""
+        if not self.importance_weight:
+            return 1.0
+        
+        if self.current_epoch >= self.beta_decay_epochs:
+            return 0.0
+        else:
+            # Linear decay from 1 to 0 over beta_decay_epochs
+            return 1.0 - (self.current_epoch / self.beta_decay_epochs)
+    
+    def update_epoch(self, epoch):
+        """Update current epoch for beta calculation"""
+        self.current_epoch = epoch
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -46,6 +68,14 @@ class REDQRLPDCondAgent(REDQSACAgent):
         self.cond_net.train()
         # this function is called after each datapoint collected.
         # when we only have very limited data, we don't make updates
+        # Get diffusion buffer curio sum for weighted loss calculation
+        # 어짜피 curiosity도 한번만 업데이트 됨
+        # 내부에 eval -> train 존재
+        # start_time = datetime.now()
+        diffusion_curio_sum = self.get_diffusion_buffer_curio_sum()
+        # curio_sum_time = datetime.now()
+        # print(f"Curio sum computation took {(curio_sum_time-start_time).total_seconds()} seconds")
+
         num_update = 0 if self.get_current_num_data() <= self.delay_update_steps else self.utd_ratio
         for i_update in range(num_update):
             sample_result = self.sample_data(self.batch_size)
@@ -58,40 +88,48 @@ class REDQRLPDCondAgent(REDQSACAgent):
             
             """Q loss"""
             y_q, sample_idxs = self.get_redq_q_target_no_grad(obs_next_tensor, rews_tensor, done_tensor)
-            q_prediction_list = []
-            curio_list = []
+            
+            # Compute curio once for all Q networks (optimization)
             self.cond_net.eval()  # Set conditional net to eval mode
+            # curio_time = datetime.now()
+            # curio = self.cond_net.compute_reward_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            # Measure time taken for curio computation
+            # print(f"Curio computation took {(datetime.now()-curio_time):.4f} seconds")
+            self.cond_net.train()  # Set conditional net back to train mode
+            
+            q_prediction_list = []
             for q_i in range(self.num_Q):
                 q_prediction = self.q_net_list[q_i](torch.cat([obs_tensor, acts_tensor], 1))
-                curio = self.cond_net.compute_reward_torch(obs_tensor, obs_next_tensor, acts_tensor)
                 q_prediction_list.append(q_prediction)
-                curio_list.append(curio)
-            self.cond_net.train()  # Set conditional net back to train mode
             q_prediction_cat = torch.cat(q_prediction_list, dim=1)
             y_q = y_q.expand((-1, self.num_Q)) if y_q.shape[1] == 1 else y_q
-            
-            # Get diffusion buffer curio sum for weighted loss calculation
-            diffusion_curio_sum = self.get_diffusion_buffer_curio_sum()
             
             q_loss_all = 0
             for q_i in range(self.num_Q):
                 q_prediction = q_prediction_cat[:, q_i].unsqueeze(1)
-                curio = curio_list[q_i].unsqueeze(1)
+                curio_unsqueezed = curio.unsqueeze(1)
                 
                 # Compute base loss
                 base_loss = self.mse_criterion(q_prediction, y_q)
                 
                 # Compute weights for each sample
-                weights = torch.ones_like(curio)
+                weights = torch.ones_like(curio_unsqueezed)
                 
                 # For online data: use curio as weight (original behavior)
-                online_indices = ~is_diffusion_mask
-                weights[online_indices] = curio[online_indices]
+                # online_indices = ~is_diffusion_mask
+                # weights[online_indices] = curio_unsqueezed[online_indices]
                 
                 # For diffusion data: use weighted curio (diffusion_buffer_size * curio / total_curio_sum)
                 diffusion_indices = is_diffusion_mask
                 if diffusion_indices.any():
-                    diffusion_weight = (self.diffusion_buffer.size * curio[diffusion_indices]) / diffusion_curio_sum
+                    diffusion_weight = (self.diffusion_buffer.size * curio_unsqueezed[diffusion_indices]) / diffusion_curio_sum
+                    
+                    # Apply importance weighting with beta decay if enabled
+                    if self.importance_weight:
+                        beta = self.get_current_beta()
+                        diffusion_weight = diffusion_weight ** beta
+                    
                     weights[diffusion_indices] = diffusion_weight
                 
                 # Apply weighted loss
@@ -215,9 +253,10 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
         with torch.no_grad():
             self.cond_net.eval()
-            curios = self.cond_net.compute_reward_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            # curio = self.cond_net.compute_reward_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
             self.cond_net.train()
-            curio_sum = curios.sum().item()
+            curio_sum = curio.sum().item()
         
         return curio_sum if curio_sum > 0 else 1.0  # Avoid division by zero
 

@@ -50,8 +50,8 @@ def redq_sac(
         num_min=2,
         q_target_mode='min',
         policy_update_delay=20,
-        # diffusion_buffer_size=int(1e6),
-        diffusion_buffer_size=int(1e5),
+        diffusion_buffer_size=int(1e6),
+        # diffusion_buffer_size=int(1e5),
         diffusion_sample_ratio=0.5,
         # diffusion hyperparameters
         retrain_diffusion_every=10_000,
@@ -77,7 +77,8 @@ def redq_sac(
         wandb_group='PGR',
         wandb_name=None,
         # Loss weight hyperparameters
-        hyper = 1.0
+        hyper = 1.0,
+        importance_weight = False
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -125,6 +126,7 @@ def redq_sac(
                 "cfg_scale": cfg_scale,
                 "cond_hidden_size": cond_hidden_size,
                 "hyper": hyper,
+                "importance_weight": importance_weight,
             }
         )
         print(f"Initialized wandb run: {run_name}")
@@ -197,7 +199,7 @@ def redq_sac(
         'q_target_mode': q_target_mode,
         'policy_update_delay': policy_update_delay,
     }
-    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, env_name, obs_dim, act_dim, act_limit, device,
+    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, importance_weight, env_name, obs_dim, act_dim, act_limit, device,
                               hidden_sizes, replay_size, batch_size,lr, gamma, polyak,
                               alpha, auto_alpha, target_entropy,
                               start_steps, delay_update_steps,
@@ -301,7 +303,9 @@ def redq_sac(
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
             epoch = t // steps_per_epoch
-
+            
+            # update the epoch for agent training
+            agent.update_epoch(epoch)
             # Test the performance of the deterministic version of the agent.
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
             if evaluate_bias:
@@ -394,6 +398,8 @@ if __name__ == '__main__':
     # Loss weight hyperparameters
     parser.add_argument('--hyper', type=float, default=1.0,
                         help='Loss weight hyperparameter')
+    parser.add_argument('--importance_weight', action='store_true', default=False,
+                        help='Use importance weight for loss calculation')
     
     args = parser.parse_args()
     
