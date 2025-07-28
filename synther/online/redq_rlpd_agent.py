@@ -16,7 +16,7 @@ def combine_two_tensors(tensor1, tensor2):
 class REDQRLPDCondAgent(REDQSACAgent):
 
     def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, hyper=0.1, 
-                 importance_weight=False, *args, **kwargs):
+                 importance_weight=False, gclip=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim, size=diffusion_buffer_size)
         self.diffusion_sample_ratio = diffusion_sample_ratio
@@ -30,7 +30,10 @@ class REDQRLPDCondAgent(REDQSACAgent):
         # Importance weighting parameters
         self.importance_weight = importance_weight
         self.current_epoch = 0
-        self.beta_decay_epochs = 50
+        self.beta_decay_epochs = 25
+        
+        # Gradient clipping with curio-based loss selection
+        self.gclip = gclip
     
     def get_current_beta(self):
         """Calculate beta value based on current epoch for importance weighting"""
@@ -73,6 +76,7 @@ class REDQRLPDCondAgent(REDQSACAgent):
         # 내부에 eval -> train 존재
         # start_time = datetime.now()
         diffusion_curio_sum = self.get_diffusion_buffer_curio_sum()
+        # diffusion_curio_sum = 1
         # curio_sum_time = datetime.now()
         # print(f"Curio sum computation took {(curio_sum_time-start_time).total_seconds()} seconds")
 
@@ -91,11 +95,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
             
             # Compute curio once for all Q networks (optimization)
             self.cond_net.eval()  # Set conditional net to eval mode
-            # curio_time = datetime.now()
-            # curio = self.cond_net.compute_reward_torch(obs_tensor, obs_next_tensor, acts_tensor)
             curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
-            # Measure time taken for curio computation
-            # print(f"Curio computation took {(datetime.now()-curio_time):.4f} seconds")
+            # curio = torch.ones(obs_tensor.shape[0], 1).to(self.device)  # Placeholder for curio
             self.cond_net.train()  # Set conditional net back to train mode
             
             q_prediction_list = []
@@ -110,18 +111,61 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 q_prediction = q_prediction_cat[:, q_i].unsqueeze(1)
                 curio_unsqueezed = curio.unsqueeze(1)
                 
-                # Compute base loss
-                base_loss = self.mse_criterion(q_prediction, y_q)
+                # Compute base loss - use different loss functions based on curio value and data source
+                online_indices = ~is_diffusion_mask
+                diffusion_indices = is_diffusion_mask
+                
+                base_loss = torch.zeros_like(q_prediction)
+                
+                # For online data: always use MSE loss
+                if online_indices.any():
+                    y_q_online = y_q[online_indices, q_i].unsqueeze(1)  # Select q_i-th Q target
+                    q_pred_online = q_prediction[online_indices]
+                    base_loss[online_indices] = torch.nn.functional.mse_loss(
+                        q_pred_online, y_q_online, reduction='none'
+                    )
+                
+                # For diffusion data: use L1 loss if gclip=True and |curio| > 1, otherwise MSE loss
+                if diffusion_indices.any():
+                    y_q_diffusion = y_q[diffusion_indices, q_i].unsqueeze(1)  # Select q_i-th Q target
+                    q_pred_diffusion = q_prediction[diffusion_indices]
+                    curio_diffusion = curio_unsqueezed[diffusion_indices]
+                    
+                    if self.gclip:
+                        # Mask for high curio values (|curio| > 1)
+                        high_curio_mask = (curio_diffusion.abs() > 1.0).squeeze(1)  # Flatten to 1D
+                        low_curio_mask = ~high_curio_mask
+                        
+                        # Initialize diffusion loss tensor
+                        diffusion_loss = torch.zeros_like(q_pred_diffusion)
+                        
+                        # Apply L1 loss for high curio values
+                        if high_curio_mask.any():
+                            diffusion_loss[high_curio_mask] = torch.nn.functional.l1_loss(
+                                q_pred_diffusion[high_curio_mask], 
+                                y_q_diffusion[high_curio_mask], 
+                                reduction='none'
+                            )
+                        
+                        # Apply MSE loss for low curio values
+                        if low_curio_mask.any():
+                            diffusion_loss[low_curio_mask] = torch.nn.functional.mse_loss(
+                                q_pred_diffusion[low_curio_mask], 
+                                y_q_diffusion[low_curio_mask],
+                                reduction='none'
+                            )
+                        
+                        base_loss[diffusion_indices] = diffusion_loss
+                    else:
+                        # If gclip=False, always use MSE loss for diffusion data
+                        base_loss[diffusion_indices] = torch.nn.functional.mse_loss(
+                            q_pred_diffusion, y_q_diffusion, reduction='none'
+                        )
                 
                 # Compute weights for each sample
                 weights = torch.ones_like(curio_unsqueezed)
                 
-                # For online data: use curio as weight (original behavior)
-                # online_indices = ~is_diffusion_mask
-                # weights[online_indices] = curio_unsqueezed[online_indices]
-                
                 # For diffusion data: use weighted curio (diffusion_buffer_size * curio / total_curio_sum)
-                diffusion_indices = is_diffusion_mask
                 if diffusion_indices.any():
                     diffusion_weight = (self.diffusion_buffer.size * curio_unsqueezed[diffusion_indices]) / diffusion_curio_sum
                     
@@ -135,7 +179,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 # Apply weighted loss
                 weighted_loss = base_loss * weights
                 q_loss_all += weighted_loss.mean()
-            
+        
+       
             
             # ==============================================
             # q_loss_all = self.mse_criterion(q_prediction_cat, y_q) * self.num_Q
