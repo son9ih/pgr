@@ -176,6 +176,12 @@ class REDQRLPDCondAgent(REDQSACAgent):
                     
                     weights[diffusion_indices] = diffusion_weight
                 
+                # Normalize weights by max weight for stability (following PER paper)
+                # "for stability reasons, we always normalize weights by (1/max_i w_i), so that they only scale the update downwards"
+                max_weight = weights.max()
+                if max_weight > 0:
+                    weights = weights / max_weight
+                
                 # Apply weighted loss
                 weighted_loss = base_loss * weights
                 q_loss_all += weighted_loss.mean()
