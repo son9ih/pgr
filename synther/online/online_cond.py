@@ -78,7 +78,8 @@ def redq_sac(
         wandb_name=None,
         # Loss weight hyperparameters
         hyper = 1.0,
-        importance_weight = False
+        importance_weight = False,
+        gclip = False
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -127,6 +128,7 @@ def redq_sac(
                 "cond_hidden_size": cond_hidden_size,
                 "hyper": hyper,
                 "importance_weight": importance_weight,
+                "gclip": gclip,
             }
         )
         print(f"Initialized wandb run: {run_name}")
@@ -199,7 +201,7 @@ def redq_sac(
         'q_target_mode': q_target_mode,
         'policy_update_delay': policy_update_delay,
     }
-    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, importance_weight, env_name, obs_dim, act_dim, act_limit, device,
+    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, importance_weight, gclip, env_name, obs_dim, act_dim, act_limit, device,
                               hidden_sizes, replay_size, batch_size,lr, gamma, polyak,
                               alpha, auto_alpha, target_entropy,
                               start_steps, delay_update_steps,
@@ -400,6 +402,8 @@ if __name__ == '__main__':
                         help='Loss weight hyperparameter')
     parser.add_argument('--importance_weight', action='store_true', default=False,
                         help='Use importance weight for loss calculation')
+    parser.add_argument('--gclip', action='store_true', default=False,
+                        help='Use gradient clipping with L1 loss for high curio values')
     
     args = parser.parse_args()
     
@@ -415,4 +419,5 @@ if __name__ == '__main__':
     redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs,
              use_wandb=args.wandb, wandb_project=args.wandb_project,
              wandb_group=args.wandb_group, wandb_name=args.wandb_name
-             , hyper=args.hyper)
+             , hyper=args.hyper, importance_weight=args.importance_weight, 
+             gclip=args.gclip)
