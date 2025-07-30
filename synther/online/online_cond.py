@@ -20,6 +20,7 @@ from synther.diffusion.elucidated_diffusion import REDQCondTrainer
 from synther.diffusion.diffusion_generator import CondDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
+from tqdm import tqdm
 
 import wandb
 
@@ -37,7 +38,7 @@ def redq_sac(
         hidden_sizes=(256, 256),
         replay_size=int(1e6),
         batch_size=256,
-        lr=3e-4,
+        lr=1e-4,
         gamma=0.99,
         polyak=0.995,
         alpha=0.2,
@@ -79,7 +80,8 @@ def redq_sac(
         # Loss weight hyperparameters
         hyper = 1.0,
         importance_weight = False,
-        gclip = False
+        gclip = False,
+        use_target = False
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -129,6 +131,7 @@ def redq_sac(
                 "hyper": hyper,
                 "importance_weight": importance_weight,
                 "gclip": gclip,
+                "use_target": use_target,
             }
         )
         print(f"Initialized wandb run: {run_name}")
@@ -201,7 +204,7 @@ def redq_sac(
         'q_target_mode': q_target_mode,
         'policy_update_delay': policy_update_delay,
     }
-    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, importance_weight, gclip, env_name, obs_dim, act_dim, act_limit, device,
+    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, importance_weight, gclip, use_target, env_name, obs_dim, act_dim, act_limit, device,
                               hidden_sizes, replay_size, batch_size,lr, gamma, polyak,
                               alpha, auto_alpha, target_entropy,
                               start_steps, delay_update_steps,
@@ -220,7 +223,19 @@ def redq_sac(
 
     o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
+    # Initialize progress bar for the first epoch
+    current_epoch = 0
+    epoch_start_step = 0
+    pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {current_epoch}", 
+                unit="step", position=0, leave=True)
+
     for t in range(total_steps):
+        # Update progress bar
+        steps_in_current_epoch = t - epoch_start_step
+        if steps_in_current_epoch < steps_per_epoch:
+            pbar.n = steps_in_current_epoch
+            pbar.refresh()
+        
         # get action from agent
         a = agent.get_exploration_action(o, env)
         # Step the env, get next observation, reward and done signal
@@ -306,8 +321,13 @@ def redq_sac(
         if (t + 1) % steps_per_epoch == 0:
             epoch = t // steps_per_epoch
             
+            # Complete current progress bar
+            pbar.n = steps_per_epoch
+            pbar.refresh()
+            pbar.close()
+            
             # update the epoch for agent training
-            agent.update_epoch(epoch)
+            agent.update_epoch(epoch, logger)
             # Test the performance of the deterministic version of the agent.
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
             if evaluate_bias:
@@ -334,6 +354,12 @@ def redq_sac(
             logger.log_tabular('Alpha', with_min_and_max=True)
             logger.log_tabular('LossAlpha', average_only=True)
             logger.log_tabular('PreTanh', with_min_and_max=True)
+            
+            # Log curiosity statistics
+            logger.log_tabular('CuriosityMean', average_only=True)
+            logger.log_tabular('CuriosityStd', average_only=True)
+            logger.log_tabular('CuriosityMin', average_only=True)
+            logger.log_tabular('CuriosityMax', average_only=True)
 
             if evaluate_bias:
                 logger.log_tabular("MCDisRet", with_min_and_max=True)
@@ -349,6 +375,17 @@ def redq_sac(
             # flush logged information to disk
             sys.stdout.flush()
             
+            # Start new progress bar for next epoch (if not the last epoch)
+            if epoch < epochs - 1:
+                current_epoch = epoch + 1
+                epoch_start_step = t + 1
+                pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {current_epoch}", 
+                           unit="step", position=0, leave=True)
+            
+    # Close the final progress bar if it exists
+    if 'pbar' in locals():
+        pbar.close()
+        
     # finish wandb run when training is complete
     if use_wandb:
         wandb.finish()
@@ -404,6 +441,8 @@ if __name__ == '__main__':
                         help='Use importance weight for loss calculation')
     parser.add_argument('--gclip', action='store_true', default=False,
                         help='Use gradient clipping with L1 loss for high curio values')
+    parser.add_argument('--target', action='store_true', default=False,
+                        help='Use target conditional network for stable curiosity computation')
     
     args = parser.parse_args()
     
@@ -420,4 +459,4 @@ if __name__ == '__main__':
              use_wandb=args.wandb, wandb_project=args.wandb_project,
              wandb_group=args.wandb_group, wandb_name=args.wandb_name
              , hyper=args.hyper, importance_weight=args.importance_weight, 
-             gclip=args.gclip)
+             gclip=args.gclip, use_target=args.target)

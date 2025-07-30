@@ -16,7 +16,7 @@ def combine_two_tensors(tensor1, tensor2):
 class REDQRLPDCondAgent(REDQSACAgent):
 
     def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, hyper=0.1, 
-                 importance_weight=False, gclip=False, *args, **kwargs):
+                 importance_weight=False, gclip=False, use_target=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim, size=diffusion_buffer_size)
         self.diffusion_sample_ratio = diffusion_sample_ratio
@@ -26,13 +26,17 @@ class REDQRLPDCondAgent(REDQSACAgent):
                                     output_size=self.act_dim).to(self.device)
         self.cond_optimizer = torch.optim.Adam(self.cond_net.parameters(), lr=self.lr)
         
-        # Target conditional network for stable curiosity computation
-        self.cond_net_target = Curiosity(input_size=self.obs_dim, 
-                                         hidden_size=cond_hidden_size, 
-                                         output_size=self.act_dim).to(self.device)
-        # Initialize target network with same weights as main network
-        self.cond_net_target.load_state_dict(self.cond_net.state_dict())
-        self.cond_net_target.eval()  # Keep target network in eval mode
+        # Target conditional network for stable curiosity computation (optional)
+        self.use_target = use_target
+        if self.use_target:
+            self.cond_net_target = Curiosity(input_size=self.obs_dim, 
+                                             hidden_size=cond_hidden_size, 
+                                             output_size=self.act_dim).to(self.device)
+            # Initialize target network with same weights as main network
+            self.cond_net_target.load_state_dict(self.cond_net.state_dict())
+            self.cond_net_target.eval()  # Keep target network in eval mode
+        else:
+            self.cond_net_target = None
         
         self.hyper = hyper
         
@@ -55,15 +59,23 @@ class REDQRLPDCondAgent(REDQSACAgent):
             # Linear decay from 1 to 0 over beta_decay_epochs
             return 1.0 - (self.current_epoch / self.beta_decay_epochs)
     
-    def update_epoch(self, epoch):
+    def update_epoch(self, epoch, logger=None):
         """Update current epoch for beta calculation and target network update"""
         self.current_epoch = epoch
         
-        # Update conditional target network every 5 epochs
-        if epoch > 0 and epoch % 5 == 0:
+        # Update conditional target network every 10 epochs (only if using target network)
+        if self.use_target and epoch > 0 and epoch % 10 == 0:
             print(f"Updating cond_net_target at epoch {epoch}")
             self.cond_net_target.load_state_dict(self.cond_net.state_dict())
             self.cond_net_target.eval()  # Keep target network in eval mode
+        
+        # Measure curiosity statistics on current replay buffer data
+        if logger is not None and epoch % 10 == 0 and epoch > 0:
+            curiosity_stats = self.get_replay_buffer_curiosity_stats()
+            logger.store(CuriosityMean=curiosity_stats['mean'],
+                        CuriosityStd=curiosity_stats['std'],
+                        CuriosityMin=curiosity_stats['min'],
+                        CuriosityMax=curiosity_stats['max'])
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -108,9 +120,14 @@ class REDQRLPDCondAgent(REDQSACAgent):
             """Q loss"""
             y_q, sample_idxs = self.get_redq_q_target_no_grad(obs_next_tensor, rews_tensor, done_tensor)
             
-            # Compute curio once for all Q networks (optimization) - use target network for stability
-            self.cond_net_target.eval()  # Ensure target net is in eval mode
-            curio = self.cond_net_target.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            # Compute curio once for all Q networks (optimization) - use target network for stability if enabled
+            if self.use_target:
+                self.cond_net_target.eval()  # Ensure target net is in eval mode
+                curio = self.cond_net_target.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            else:
+                self.cond_net.eval()  # Set conditional net to eval mode
+                curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+                self.cond_net.train()  # Set conditional net back to train mode
             # curio = torch.ones(obs_tensor.shape[0], 1).to(self.device)  # Placeholder for curio
             
             q_prediction_list = []
@@ -192,9 +209,9 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 
                 # Normalize weights by max weight for stability (following PER paper)
                 # "for stability reasons, we always normalize weights by (1/max_i w_i), so that they only scale the update downwards"
-                max_weight = weights.max()
-                if max_weight > 0:
-                    weights = weights / max_weight
+                # max_weight = weights.max()
+                # if max_weight > 0:
+                #     weights = weights / max_weight
                 
                 # Apply weighted loss
                 weighted_loss = base_loss * weights
@@ -317,12 +334,47 @@ class REDQRLPDCondAgent(REDQSACAgent):
         acts_tensor = torch.Tensor(all_data['acts']).to(self.device)
         
         with torch.no_grad():
-            self.cond_net_target.eval()
-            # curio = self.cond_net_target.compute_reward_torch(obs_tensor, obs_next_tensor, acts_tensor)
-            curio = self.cond_net_target.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            if self.use_target:
+                self.cond_net_target.eval()
+                curio = self.cond_net_target.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            else:
+                self.cond_net.eval()
+                curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+                self.cond_net.train()
             curio_sum = curio.sum().item()
         
         return curio_sum if curio_sum > 0 else 1.0  # Avoid division by zero
+
+    def get_replay_buffer_curiosity_stats(self):
+        """Compute curiosity statistics for the current replay buffer"""
+        if self.replay_buffer.size == 0:
+            return {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0}
+        
+        # Sample all data from replay buffer (or a large subset if too big)
+        sample_size = min(self.replay_buffer.size, 10000000)  # Limit to 10M samples for efficiency
+        batch_data = self.replay_buffer.sample_batch(batch_size=sample_size)
+        obs_tensor = torch.Tensor(batch_data['obs1']).to(self.device)
+        obs_next_tensor = torch.Tensor(batch_data['obs2']).to(self.device)
+        acts_tensor = torch.Tensor(batch_data['acts']).to(self.device)
+        
+        with torch.no_grad():
+            if self.use_target and self.cond_net_target is not None:
+                self.cond_net_target.eval()
+                curio = self.cond_net_target.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+            else:
+                self.cond_net.eval()
+                curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
+                self.cond_net.train()
+            
+            # Convert to numpy for statistics
+            curio_np = curio.cpu().numpy().flatten()
+            
+            return {
+                'mean': float(np.mean(curio_np)),
+                'std': float(np.std(curio_np)),
+                'min': float(np.min(curio_np)),
+                'max': float(np.max(curio_np))
+            }
 
     def sample_real_data(self, batch_size):
         data = super().sample_data(batch_size)
