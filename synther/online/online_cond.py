@@ -237,6 +237,7 @@ def redq_sac(
             pbar.refresh()
         
         # get action from agent
+        # 이것 떄문에 시간이 더 걸리구나
         a = agent.get_exploration_action(o, env)
         # Step the env, get next observation, reward and done signal
         o2, r, d, _ = env.step(a)
@@ -355,11 +356,8 @@ def redq_sac(
             logger.log_tabular('LossAlpha', average_only=True)
             logger.log_tabular('PreTanh', with_min_and_max=True)
             
-            # Log curiosity statistics
-            logger.log_tabular('CuriosityMean', average_only=True)
-            logger.log_tabular('CuriosityStd', average_only=True)
-            logger.log_tabular('CuriosityMin', average_only=True)
-            logger.log_tabular('CuriosityMax', average_only=True)
+            # Log curiosity statistics (with mean, std, min, max automatically calculated)
+            logger.log_tabular('Curiosity', with_min_and_max=True)
 
             if evaluate_bias:
                 logger.log_tabular("MCDisRet", with_min_and_max=True)

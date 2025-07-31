@@ -71,11 +71,11 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
         # Measure curiosity statistics on current replay buffer data
         if logger is not None and epoch % 10 == 0 and epoch > 0:
-            curiosity_stats = self.get_replay_buffer_curiosity_stats()
-            logger.store(CuriosityMean=curiosity_stats['mean'],
-                        CuriosityStd=curiosity_stats['std'],
-                        CuriosityMin=curiosity_stats['min'],
-                        CuriosityMax=curiosity_stats['max'])
+            curiosity_values = self.get_replay_buffer_curiosity()
+            logger.store(Curiosity=curiosity_values)
+        elif logger is not None:
+            # Store array of zeros for other epochs to maintain logging consistency
+            logger.store(Curiosity=np.array([0.0]))
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -345,10 +345,10 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
         return curio_sum if curio_sum > 0 else 1.0  # Avoid division by zero
 
-    def get_replay_buffer_curiosity_stats(self):
-        """Compute curiosity statistics for the current replay buffer"""
+    def get_replay_buffer_curiosity(self):
+        """Compute curiosity values for the current replay buffer to be used with logger.log_tabular(with_min_and_max=True)"""
         if self.replay_buffer.size == 0:
-            return {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0}
+            return np.array([0.0])
         
         # Sample all data from replay buffer (or a large subset if too big)
         sample_size = min(self.replay_buffer.size, 10000000)  # Limit to 10M samples for efficiency
@@ -366,15 +366,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
                 self.cond_net.train()
             
-            # Convert to numpy for statistics
-            curio_np = curio.cpu().numpy().flatten()
-            
-            return {
-                'mean': float(np.mean(curio_np)),
-                'std': float(np.std(curio_np)),
-                'min': float(np.min(curio_np)),
-                'max': float(np.max(curio_np))
-            }
+            # Return all curiosity values as numpy array - logger will compute mean/std/min/max automatically
+            return curio.cpu().numpy().flatten()
 
     def sample_real_data(self, batch_size):
         data = super().sample_data(batch_size)
