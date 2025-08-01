@@ -16,7 +16,7 @@ def combine_two_tensors(tensor1, tensor2):
 class REDQRLPDCondAgent(REDQSACAgent):
 
     def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, hyper=0.1, 
-                 importance_weight=False, gclip=False, use_target=False, *args, **kwargs):
+                 importance_weight=False, gclip=False, use_target=False, ampli=1.0, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim, size=diffusion_buffer_size)
         self.diffusion_sample_ratio = diffusion_sample_ratio
@@ -47,6 +47,12 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
         # Gradient clipping with curio-based loss selection
         self.gclip = gclip
+        
+        # Amplification factor for curiosity-based weighting
+        self.ampli = ampli
+        
+        # Initialize diffusion buffer curiosity sum
+        self.diffusion_curiosity_sum = 1.0  # Avoid division by zero
     
     def get_current_beta(self):
         """Calculate beta value based on current epoch for importance weighting"""
@@ -56,8 +62,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
         if self.current_epoch >= self.beta_decay_epochs:
             return 0.0
         else:
-            # Linear decay from 1 to 0 over beta_decay_epochs
-            return 1.0 - (self.current_epoch / self.beta_decay_epochs)
+            # Linear decay from 0.6 to 0 over beta_decay_epochs
+            return 0.6 * (1.0 - (self.current_epoch / self.beta_decay_epochs))
     
     def update_epoch(self, epoch, logger=None):
         """Update current epoch for beta calculation and target network update"""
@@ -70,6 +76,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
             self.cond_net_target.eval()  # Keep target network in eval mode
         
         # Measure curiosity statistics on current replay buffer data
+        # replay buffer의 curio를 재는 것은 measure를 보여주기 위한 용도, 따라서 여기엔 ampli를 붙이면 안됨
+        # diffusion buffer의 curio를 재는 것은 학습의 강도를 정하기 위한 용도
         if logger is not None and epoch % 10 == 0 and epoch > 0:
             curiosity_values = self.get_replay_buffer_curiosity()
             logger.store(Curiosity=curiosity_values)
@@ -102,13 +110,14 @@ class REDQRLPDCondAgent(REDQSACAgent):
         # 어짜피 curiosity도 한번만 업데이트 됨
         # 내부에 eval -> train 존재
         # start_time = datetime.now()
-        diffusion_curio_sum = self.get_diffusion_buffer_curio_sum()
+        diffusion_curio_sum = self.diffusion_curiosity_sum
         # diffusion_curio_sum = 1
         # curio_sum_time = datetime.now()
         # print(f"Curio sum computation took {(curio_sum_time-start_time).total_seconds()} seconds")
 
         num_update = 0 if self.get_current_num_data() <= self.delay_update_steps else self.utd_ratio
         for i_update in range(num_update):
+            # Diffusion buffer에도 샘플이 들어가는 순간 diffusion buffer에서 샘플링할 수 있게 되어 curiosity 계산을 하게 됨 -> 오래걸리는 원인
             sample_result = self.sample_data(self.batch_size)
             if len(sample_result) == 6:
                 obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor, is_diffusion_mask = sample_result
@@ -128,6 +137,9 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 self.cond_net.eval()  # Set conditional net to eval mode
                 curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
                 self.cond_net.train()  # Set conditional net back to train mode
+            
+            # Apply amplification: raise each curio to the power of ampli
+            curio = curio ** self.ampli
             # curio = torch.ones(obs_tensor.shape[0], 1).to(self.device)  # Placeholder for curio
             
             q_prediction_list = []
@@ -341,21 +353,44 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 self.cond_net.eval()
                 curio = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
                 self.cond_net.train()
+            
+            # Apply amplification: raise each curio to the power of ampli
+            curio = curio ** self.ampli
             curio_sum = curio.sum().item()
         
         return curio_sum if curio_sum > 0 else 1.0  # Avoid division by zero
 
     def get_replay_buffer_curiosity(self):
-        """Compute curiosity values for the current replay buffer to be used with logger.log_tabular(with_min_and_max=True)"""
+        """Compute curiosity values for the most recent 10,000 samples in replay buffer"""
         if self.replay_buffer.size == 0:
             return np.array([0.0])
         
-        # Sample all data from replay buffer (or a large subset if too big)
-        sample_size = min(self.replay_buffer.size, 10000000)  # Limit to 10M samples for efficiency
-        batch_data = self.replay_buffer.sample_batch(batch_size=sample_size)
-        obs_tensor = torch.Tensor(batch_data['obs1']).to(self.device)
-        obs_next_tensor = torch.Tensor(batch_data['obs2']).to(self.device)
-        acts_tensor = torch.Tensor(batch_data['acts']).to(self.device)
+        # Get the most recent 10,000 samples from replay buffer
+        sample_size = min(self.replay_buffer.size, 10000)
+        current_ptr = self.replay_buffer.ptr
+        buffer_size = self.replay_buffer.size
+        
+        # Calculate indices for the most recent samples
+        if buffer_size < self.replay_buffer.max_size:
+            # Buffer not full yet, take last sample_size samples
+            start_idx = max(0, buffer_size - sample_size)
+            end_idx = buffer_size
+            indices = np.arange(start_idx, end_idx)
+        else:
+            # Buffer is full, take sample_size samples before current pointer (most recent)
+            if current_ptr >= sample_size:
+                indices = np.arange(current_ptr - sample_size, current_ptr)
+            else:
+                # Wrap around the buffer
+                indices = np.concatenate([
+                    np.arange(self.replay_buffer.max_size - (sample_size - current_ptr), self.replay_buffer.max_size),
+                    np.arange(0, current_ptr)
+                ])
+        
+        # Extract data using indices
+        obs_tensor = torch.Tensor(self.replay_buffer.obs1_buf[indices]).to(self.device)
+        obs_next_tensor = torch.Tensor(self.replay_buffer.obs2_buf[indices]).to(self.device)
+        acts_tensor = torch.Tensor(self.replay_buffer.acts_buf[indices]).to(self.device)
         
         with torch.no_grad():
             if self.use_target and self.cond_net_target is not None:
