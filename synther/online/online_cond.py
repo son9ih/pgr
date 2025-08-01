@@ -38,7 +38,7 @@ def redq_sac(
         hidden_sizes=(256, 256),
         replay_size=int(1e6),
         batch_size=256,
-        lr=1e-4,
+        lr=3e-4,
         gamma=0.99,
         polyak=0.995,
         alpha=0.2,
@@ -81,7 +81,8 @@ def redq_sac(
         hyper = 1.0,
         importance_weight = False,
         gclip = False,
-        use_target = False
+        use_target = False,
+        ampli = 1.0
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -132,6 +133,7 @@ def redq_sac(
                 "importance_weight": importance_weight,
                 "gclip": gclip,
                 "use_target": use_target,
+                "ampli": ampli,
             }
         )
         print(f"Initialized wandb run: {run_name}")
@@ -204,7 +206,7 @@ def redq_sac(
         'q_target_mode': q_target_mode,
         'policy_update_delay': policy_update_delay,
     }
-    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, importance_weight, gclip, use_target, env_name, obs_dim, act_dim, act_limit, device,
+    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,hyper, importance_weight, gclip, use_target, ampli, env_name, obs_dim, act_dim, act_limit, device,
                               hidden_sizes, replay_size, batch_size,lr, gamma, polyak,
                               alpha, auto_alpha, target_entropy,
                               start_steps, delay_update_steps,
@@ -237,7 +239,8 @@ def redq_sac(
             pbar.refresh()
         
         # get action from agent
-        # 이것 떄문에 시간이 더 걸리구나
+        # 이것 떄문에 시간이 더 걸리구나 5000전까지 되게빠른 이유는 policy network evaluation도 안하고, 
+        # curiosity 게산도 안하기 때문
         a = agent.get_exploration_action(o, env)
         # Step the env, get next observation, reward and done signal
         o2, r, d, _ = env.step(a)
@@ -317,6 +320,12 @@ def redq_sac(
                 print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
+            
+            
+            agent.diffusion_curiosity_sum = agent.get_diffusion_buffer_curio_sum()
+            
+                
+            
 
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
@@ -441,6 +450,8 @@ if __name__ == '__main__':
                         help='Use gradient clipping with L1 loss for high curio values')
     parser.add_argument('--target', action='store_true', default=False,
                         help='Use target conditional network for stable curiosity computation')
+    parser.add_argument('--ampli', type=float, default=1.0,
+                        help='Amplification factor for curiosity-based weighting')
     
     args = parser.parse_args()
     
@@ -457,4 +468,4 @@ if __name__ == '__main__':
              use_wandb=args.wandb, wandb_project=args.wandb_project,
              wandb_group=args.wandb_group, wandb_name=args.wandb_name
              , hyper=args.hyper, importance_weight=args.importance_weight, 
-             gclip=args.gclip, use_target=args.target)
+             gclip=args.gclip, use_target=args.target, ampli=args.ampli)
