@@ -266,6 +266,13 @@ def redq_sac(
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             # reset environment
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+            
+        # End of epoch wrap-up; make sure to update target_cond_net before evaluation
+        if (t + 1) % steps_per_epoch == 0:
+            epoch = t // steps_per_epoch
+            # update the epoch for agent training
+            agent.update_epoch(epoch, logger)
+            
 
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
             print(f'Retraining diffusion model at step {t + 1}')
@@ -336,8 +343,8 @@ def redq_sac(
             pbar.refresh()
             pbar.close()
             
-            # update the epoch for agent training
-            agent.update_epoch(epoch, logger)
+            # # update the epoch for agent training
+            # agent.update_epoch(epoch, logger)
             # Test the performance of the deterministic version of the agent.
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
             if evaluate_bias:
