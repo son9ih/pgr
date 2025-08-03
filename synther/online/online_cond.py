@@ -435,6 +435,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='Hopper-v2')
+    parser.add_argument('--seed', type=int, default=3,
+                        help='Random seed for reproducibility')
     parser.add_argument('--log_dir', type=str, default='online_logs')
     parser.add_argument('--results_folder', type=str, default='./results')
     parser.add_argument('--gin_config_files', nargs='*', type=str,
@@ -471,7 +473,7 @@ if __name__ == '__main__':
 
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
-    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs,
+    redq_sac(args.env, seed=args.seed, target_entropy='auto', logger_kwargs=logger_kwargs,
              use_wandb=args.wandb, wandb_project=args.wandb_project,
              wandb_group=args.wandb_group, wandb_name=args.wandb_name
              , hyper=args.hyper, importance_weight=args.importance_weight, 
