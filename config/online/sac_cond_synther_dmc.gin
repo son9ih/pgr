@@ -8,10 +8,8 @@ redq_sac.utd_ratio = 20
 
 # SAC/REDQ diffusion args.
 redq_sac.disable_diffusion = False
-# redq_sac.retrain_diffusion_every = 10000
-redq_sac.retrain_diffusion_every = 5000
-# redq_sac.num_samples = 1000000
-redq_sac.num_samples = 100000
+redq_sac.retrain_diffusion_every = 10000
+redq_sac.num_samples = 1000000
 redq_sac.diffusion_sample_ratio = 0.5
 redq_sac.diffusion_start = 0
 redq_sac.skip_reward_norm = True
@@ -47,7 +45,6 @@ REDQCondTrainer.train_lr = 3e-4
 REDQCondTrainer.lr_scheduler = "cosine"
 REDQCondTrainer.weight_decay = 0
 # REDQCondTrainer.train_num_steps = 100000
-REDQCondTrainer.train_num_steps = 10000
 # Don't save.
 REDQCondTrainer.save_and_sample_every = 100000000
 
