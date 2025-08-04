@@ -50,8 +50,8 @@ def redq_sac(
         num_min=2,
         q_target_mode='min',
         policy_update_delay=20,
-        # diffusion_buffer_size=int(1e6),
-        diffusion_buffer_size=int(1e5),
+        diffusion_buffer_size=int(1e6),
+        # diffusion_buffer_size=int(1e5),
         diffusion_sample_ratio=0.5,
         # diffusion hyperparameters
         retrain_diffusion_every=10_000,
@@ -87,7 +87,7 @@ def redq_sac(
     
     # Initialize wandb if enabled
     if use_wandb:
-        run_name = wandb_name or f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+        run_name = wandb_name or f"{env_name}_baseline_{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
         wandb.init(
             project=wandb_project,
             group=wandb_group,
@@ -372,6 +372,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='Hopper-v2')
+    parser.add_argument('--seed', type=int, default=3,
+                        help='Random seed for reproducibility')
     parser.add_argument('--log_dir', type=str, default='online_logs')
     parser.add_argument('--results_folder', type=str, default='./results')
     parser.add_argument('--gin_config_files', nargs='*', type=str,
@@ -396,6 +398,6 @@ if __name__ == '__main__':
 
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
-    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs,
+    redq_sac(args.env, seed=args.seed, target_entropy='auto', logger_kwargs=logger_kwargs,
              use_wandb=args.wandb, wandb_project=args.wandb_project,
              wandb_group=args.wandb_group, wandb_name=args.wandb_name)
