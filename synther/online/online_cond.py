@@ -18,6 +18,7 @@ from redq.utils.logx import EpochLogger
 from redq.utils.run_utils import setup_logger_kwargs
 from synther.diffusion.elucidated_diffusion import REDQCondTrainer
 from synther.diffusion.diffusion_generator import CondDiffusionGenerator
+from synther.das.smc_diffusion_generator import SMCDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
 from tqdm import tqdm
@@ -82,7 +83,21 @@ def redq_sac(
         importance_weight = False,
         gclip = False,
         use_target = False,
-        ampli = 1.0
+        ampli = 1.0,
+        # SMC-DAS hyperparameters
+        use_smc_sampling = False,
+        smc_num_particles = 8,
+        smc_batch_p = 1,
+        smc_resample_strategy = "ssp",
+        smc_ess_threshold = 0.5,
+        smc_tempering = "schedule",
+        smc_tempering_schedule = "exp",
+        smc_tempering_gamma = 0.1,
+        smc_tempering_start = 0.3,
+        smc_kl_coeff = 1.0,
+        smc_reward_scale = 1.0,
+        smc_use_target_net = False,
+        smc_verbose = False
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -134,6 +149,19 @@ def redq_sac(
                 "gclip": gclip,
                 "use_target": use_target,
                 "ampli": ampli,
+                "use_smc_sampling": use_smc_sampling,
+                "smc_num_particles": smc_num_particles,
+                "smc_batch_p": smc_batch_p,
+                "smc_resample_strategy": smc_resample_strategy,
+                "smc_ess_threshold": smc_ess_threshold,
+                "smc_tempering": smc_tempering,
+                "smc_tempering_schedule": smc_tempering_schedule,
+                "smc_tempering_gamma": smc_tempering_gamma,
+                "smc_tempering_start": smc_tempering_start,
+                "smc_kl_coeff": smc_kl_coeff,
+                "smc_reward_scale": smc_reward_scale,
+                "smc_use_target_net": smc_use_target_net,
+                "smc_verbose": smc_verbose,
             }
         )
         print(f"Initialized wandb run: {run_name}")
@@ -300,7 +328,30 @@ def redq_sac(
             agent.reset_diffusion_buffer()
 
             # Add samples to agent replay buffer
-            generator = CondDiffusionGenerator(env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
+            if use_smc_sampling:
+                print("Using SMC-based sampling with curiosity alignment")
+                generator = SMCDiffusionGenerator(
+                    env=env, 
+                    ema_model=diffusion_trainer.ema.ema_model, 
+                    agent=agent,
+                    cond_distri=cond_distri,
+                    num_particles=smc_num_particles,
+                    batch_p=smc_batch_p,
+                    resample_strategy=smc_resample_strategy,
+                    ess_threshold=smc_ess_threshold,
+                    tempering=smc_tempering,
+                    tempering_schedule=smc_tempering_schedule,
+                    tempering_gamma=smc_tempering_gamma,
+                    tempering_start=smc_tempering_start,
+                    kl_coeff=smc_kl_coeff,
+                    reward_scale=smc_reward_scale,
+                    use_target_net=smc_use_target_net,
+                    verbose=smc_verbose
+                )
+            else:
+                print("Using standard conditional diffusion sampling")
+                generator = CondDiffusionGenerator(env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
+            
             observations, actions, rewards, next_observations, terminals = generator.sample(num_samples=num_samples,
                                                                                             cfg_scale=cfg_scale)
 
@@ -462,6 +513,34 @@ if __name__ == '__main__':
     parser.add_argument('--ampli', type=float, default=1.0,
                         help='Amplification factor for curiosity-based weighting')
     
+    # SMC-DAS arguments
+    parser.add_argument('--use_smc', action='store_true', default=False,
+                        help='Use SMC-based sampling with curiosity alignment')
+    parser.add_argument('--smc_num_particles', type=int, default=8,
+                        help='Number of SMC particles')
+    parser.add_argument('--smc_batch_p', type=int, default=1,
+                        help='Number of particles to process in parallel')
+    parser.add_argument('--smc_resample_strategy', type=str, default='ssp',
+                        help='SMC resampling strategy')
+    parser.add_argument('--smc_ess_threshold', type=float, default=0.5,
+                        help='Effective sample size threshold for resampling')
+    parser.add_argument('--smc_tempering', type=str, default='schedule',
+                        help='SMC tempering strategy')
+    parser.add_argument('--smc_tempering_schedule', type=str, default='exp',
+                        help='SMC tempering schedule')
+    parser.add_argument('--smc_tempering_gamma', type=float, default=0.1,
+                        help='SMC tempering gamma parameter')
+    parser.add_argument('--smc_tempering_start', type=float, default=0.3,
+                        help='When to start tempering (fraction of steps)')
+    parser.add_argument('--smc_kl_coeff', type=float, default=1.0,
+                        help='KL coefficient for reward scaling')
+    parser.add_argument('--smc_reward_scale', type=float, default=1.0,
+                        help='Additional reward scaling factor')
+    parser.add_argument('--smc_use_target_net', action='store_true', default=False,
+                        help='Use target conditional network for SMC rewards')
+    parser.add_argument('--smc_verbose', action='store_true', default=False,
+                        help='Print SMC debug information')
+    
     args = parser.parse_args()
     
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
@@ -475,6 +554,19 @@ if __name__ == '__main__':
 
     redq_sac(args.env, seed=args.seed, target_entropy='auto', logger_kwargs=logger_kwargs,
              use_wandb=args.wandb, wandb_project=args.wandb_project,
-             wandb_group=args.wandb_group, wandb_name=args.wandb_name
-             , hyper=args.hyper, importance_weight=args.importance_weight, 
-             gclip=args.gclip, use_target=args.target, ampli=args.ampli)
+             wandb_group=args.wandb_group, wandb_name=args.wandb_name,
+             hyper=args.hyper, importance_weight=args.importance_weight, 
+             gclip=args.gclip, use_target=args.target, ampli=args.ampli,
+             use_smc_sampling=args.use_smc,
+             smc_num_particles=args.smc_num_particles,
+             smc_batch_p=args.smc_batch_p,
+             smc_resample_strategy=args.smc_resample_strategy,
+             smc_ess_threshold=args.smc_ess_threshold,
+             smc_tempering=args.smc_tempering,
+             smc_tempering_schedule=args.smc_tempering_schedule,
+             smc_tempering_gamma=args.smc_tempering_gamma,
+             smc_tempering_start=args.smc_tempering_start,
+             smc_kl_coeff=args.smc_kl_coeff,
+             smc_reward_scale=args.smc_reward_scale,
+             smc_use_target_net=args.smc_use_target_net,
+             smc_verbose=args.smc_verbose)
