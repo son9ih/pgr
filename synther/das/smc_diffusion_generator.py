@@ -28,7 +28,8 @@ class SMCDiffusionGenerator:
             agent,
             cond_distri: CondDistri = None,
             num_sample_steps: int = 128,
-            sample_batch_size: int = 1000,  # Reduced default for SMC
+            sample_batch_size: int = 10000,
+            # sample_batch_size: int = 1000,  # Reduced default for SMC
             # SMC parameters
             num_particles: int = 8,
             batch_p: int = 1,

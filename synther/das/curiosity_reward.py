@@ -38,7 +38,7 @@ class CuriosityRewardFunction:
             rewards: Tensor of shape (batch_size,) containing curiosity values
         """
         if isinstance(transition_data, torch.Tensor):
-            transition_data = transition_data.cpu().numpy()
+            transition_data = transition_data.detach().cpu().numpy()
         
         # Split transition data into components
         transitions = split_diffusion_samples(transition_data, self.env)
@@ -55,7 +55,7 @@ class CuriosityRewardFunction:
         
         # Compute curiosity using the agent's conditional network
         with torch.no_grad():
-            curiosity_rewards = self.cond_net.compute_reward_torch(states, next_states, actions)
+            curiosity_rewards = self.cond_net.compute_reward_abs_torch(states, next_states, actions)
             # Squeeze to remove dimension if necessary
             if curiosity_rewards.dim() > 1:
                 curiosity_rewards = curiosity_rewards.squeeze(-1)
@@ -102,7 +102,7 @@ class CuriosityRewardFunctionWithTargetNet:
             rewards: Tensor of shape (batch_size,) containing scaled curiosity values
         """
         if isinstance(transition_data, torch.Tensor):
-            transition_data = transition_data.cpu().numpy()
+            transition_data = transition_data.detach().cpu().numpy()
         
         # Split transition data into components
         transitions = split_diffusion_samples(transition_data, self.env)
@@ -119,7 +119,7 @@ class CuriosityRewardFunctionWithTargetNet:
         
         # Compute curiosity using the conditional network
         with torch.no_grad():
-            curiosity_rewards = self.cond_net.compute_reward_torch(states, next_states, actions)
+            curiosity_rewards = self.cond_net.compute_reward_abs_torch(states, next_states, actions)
             # Squeeze to remove dimension if necessary
             if curiosity_rewards.dim() > 1:
                 curiosity_rewards = curiosity_rewards.squeeze(-1)
