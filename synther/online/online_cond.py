@@ -11,6 +11,8 @@ import gin
 import gym
 import numpy as np
 import torch
+import torch.nn as nn
+from typing import Optional, Union, Tuple
 from gym.wrappers.flatten_observation import FlattenObservation
 from redq.algos.core import mbpo_epoches, test_agent
 from redq.utils.bias_utils import log_bias_evaluation
@@ -18,10 +20,207 @@ from redq.utils.logx import EpochLogger
 from redq.utils.run_utils import setup_logger_kwargs
 from synther.diffusion.elucidated_diffusion import REDQCondTrainer
 from synther.diffusion.diffusion_generator import CondDiffusionGenerator
+# from synther.diffusion.smc_diffusion_generator import SMCDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
+import copy
 
 import wandb
+
+
+def _compute_gaussian_log_prob(x, mean, std):
+    """Compute log probability of x under Gaussian with given mean and std"""
+    return -0.5 * ((x - mean) / std) ** 2 - torch.log(std) - 0.5 * torch.log(torch.tensor(2 * np.pi))
+
+
+def elucidated_step_with_kl(
+    diffusion_model,
+    pre_trained_model,
+    x_t,
+    sigma_t,
+    sigma_next,
+    cond=None,
+    eta=1.0
+) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+    """
+    Single denoising step for ElucidatedDiffusion with KL divergence computation.
+    Only computes KL at the final step (when sigma_next is close to 0).
+    """
+    # Get denoised predictions from both models
+    pred_x0_finetune = diffusion_model.preconditioned_network_forward(x_t, sigma_t, cond=cond)
+    
+    with torch.no_grad():
+        pred_x0_pretrained = pre_trained_model.preconditioned_network_forward(x_t, sigma_t, cond=cond)
+    
+    # If this is the final step (sigma_next ≈ 0), return the denoised sample and compute KL
+    if sigma_next < 1e-6:
+        # Final step - return denoised sample directly
+        kl_terms = torch.mean((pred_x0_finetune - pred_x0_pretrained) ** 2, dim=-1)
+        return pred_x0_finetune, kl_terms
+    
+    # For intermediate steps, use standard Euler method from ElucidatedDiffusion
+    # Compute score functions
+    score_finetune = (x_t - pred_x0_finetune) / sigma_t
+    score_pretrained = (x_t - pred_x0_pretrained) / sigma_t
+    
+    # Euler step
+    x_next_finetune = x_t + (sigma_next - sigma_t) * score_finetune
+    x_next_pretrained = x_t + (sigma_next - sigma_t) * score_pretrained
+    
+    # Compute KL divergence only if there's noise variance
+    if eta > 0 and sigma_next > 1e-6:
+        # Approximate KL between the two distributions
+        kl_terms = torch.mean((x_next_finetune - x_next_pretrained) ** 2, dim=-1) / (2 * sigma_next ** 2)
+    else:
+        kl_terms = torch.zeros(x_t.size(0), device=x_t.device)
+    
+    return x_next_finetune, kl_terms
+
+
+def fine_tune_diffusion_step(
+    pre_trained_model, 
+    fine_tune_model, 
+    agent, 
+    env,
+    batch_size, 
+    kl_weight, 
+    num_sample_steps,
+    max_grad_norm=1.0
+):
+    """
+    Single fine-tuning step for diffusion model using reward maximization.
+    Only collects loss from the final timestep as requested.
+    """
+    device = next(fine_tune_model.parameters()).device
+    
+    # Get diffusion sigmas (noise levels) 
+    sigmas = fine_tune_model.sample_schedule(num_sample_steps)
+    
+    # Initialize from noise
+    shape = (batch_size, *fine_tune_model.event_shape)
+    x_t = sigmas[0] * torch.randn(shape, device=device)
+    
+    total_kl_loss = 0.0
+    
+    # Reverse diffusion process
+    for i, sigma in enumerate(sigmas[:-1]):
+        sigma_val = sigma.item()
+        next_sigma = sigmas[i + 1].item() if i + 1 < len(sigmas) else 0.0
+        
+        x_t, kl_div = elucidated_step_with_kl(
+            fine_tune_model,
+            pre_trained_model, 
+            x_t,
+            sigma_val,
+            next_sigma,
+            cond=None
+        )
+        
+        # Only accumulate KL loss from final step
+        if i == len(sigmas) - 2:  # Final step
+            total_kl_loss = kl_div.mean()
+    
+    # Final sample should be denoised transitions
+    final_sample = x_t
+    
+    # Compute reward using agent's conditional network (keep gradients for backprop)
+    # Split transitions into components for reward computation
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    
+    # Manual splitting to maintain gradients
+    start_idx = 0
+    obs = final_sample[:, start_idx:start_idx + obs_dim]
+    start_idx += obs_dim
+    
+    act = final_sample[:, start_idx:start_idx + act_dim]
+    start_idx += act_dim
+    
+    # Skip reward (1 dimension)
+    start_idx += 1
+    
+    next_obs = final_sample[:, start_idx:start_idx + obs_dim]
+    
+    # Compute curiosity reward using conditional network 
+    # Keep gradients for final_sample but not for conditional network parameters
+    if hasattr(agent, 'cond_net_target') and agent.cond_net_target is not None:
+        # Use detached inputs to prevent gradient flow to conditional network
+        with torch.no_grad():
+            curiosity = agent.cond_net_target.compute_reward_abs_torch(
+                obs.detach(), next_obs.detach(), act.detach()
+            )
+        # But maintain the gradient connection by multiplying with 1.0 * final_sample.mean() * 0 + curiosity
+        # This tricks PyTorch into thinking curiosity depends on final_sample
+        curiosity = curiosity + 0.0 * final_sample.sum(dim=1, keepdim=True)
+    else:
+        print('We are using the main conditional network')
+        # with torch.no_grad():
+        curiosity = agent.cond_net.compute_reward_abs_torch(
+                obs, next_obs, act
+            )
+        # Same trick to maintain gradient connection
+        curiosity = curiosity + 0.0 * final_sample.sum(dim=1, keepdim=True)
+    
+    reward = curiosity.squeeze(-1)
+    
+    # Compute loss: negative reward (for maximization) + KL regularization
+    loss = -reward.mean() + kl_weight * total_kl_loss
+    
+    return loss, reward.mean().item(), total_kl_loss.item()
+
+
+def fine_tune_diffusion_model(
+    pre_trained_model,
+    agent,
+    env, 
+    ft_epochs,
+    ft_batch_size,
+    kl_weight,
+    lr=1e-4,
+    max_grad_norm=1.0,
+    num_sample_steps=32
+):
+    """
+    Fine-tune diffusion model for reward maximization.
+    """
+    device = next(pre_trained_model.parameters()).device
+    
+    # Create a copy of the pre-trained model for fine-tuning
+    fine_tune_model = copy.deepcopy(pre_trained_model)
+    fine_tune_model.train()
+    
+    # Set up optimizer
+    optimizer = torch.optim.Adam(fine_tune_model.parameters(), lr=lr)
+    
+    print(f"Starting diffusion fine-tuning for {ft_epochs} epochs...")
+    
+    for epoch in range(ft_epochs):
+        optimizer.zero_grad()
+        
+        # avg_kl: Value should be zero in epoch 0
+        loss, avg_reward, avg_kl = fine_tune_diffusion_step(
+            pre_trained_model,
+            fine_tune_model,
+            agent,
+            env,
+            ft_batch_size,
+            kl_weight,
+            num_sample_steps,
+            max_grad_norm
+        )
+        print(loss.item())
+        loss.backward()
+        
+        # Clip gradients and perform optimization step
+        nn.utils.clip_grad_norm_(fine_tune_model.parameters(), max_grad_norm)
+        optimizer.step()
+        
+        # if epoch % 10 == 0:
+        print(f"Fine-tuning Epoch {epoch}, Loss: {loss.item():.4f}, Avg Reward: {avg_reward:.4f}, KL Div: {avg_kl:.6f}")
+    
+    print("Diffusion fine-tuning completed.")
+    fine_tune_model.eval()
+    return fine_tune_model
 
 
 @gin.configurable
@@ -55,7 +254,8 @@ def redq_sac(
         diffusion_sample_ratio=0.5,
         # diffusion hyperparameters
         retrain_diffusion_every=10_000,
-        num_samples=100_000,
+        # num_samples=100_000,
+        num_samples=10_000,
         diffusion_start=0,
         disable_diffusion=True,
         print_buffer_stats=True,
@@ -66,6 +266,14 @@ def redq_sac(
         cond_top_frac=0.05,
         cfg_scale=1.0,
         cond_hidden_size=128,
+        # fine-tuning hyperparameters
+        enable_finetuning=False,
+        ft_epochs=50,
+        ft_batch_size=256,
+        ft_kl_weight=0.1,
+        ft_lr=1e-4,
+        # # target network flag
+        # target=False,
         # following are bias evaluation related
         evaluate_bias=True,
         n_mc_eval=1000,
@@ -262,9 +470,31 @@ def redq_sac(
             cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
                                                                    curr_epoch=(t // steps_per_epoch) + 1)
             agent.reset_diffusion_buffer()
+            
+            # Start diffusion finetuning
+            if enable_finetuning:
+                print("Starting diffusion fine-tuning...")
+                fine_tuned_model = fine_tune_diffusion_model(
+                    # 이 미친놈이 범인이었네 슈밤바, 찝찝한데 ema.model을 그냥 넘어가는 건.. 나중에 알아보자
+                    # diffusion_trainer.ema.ema_model,
+                    diffusion_trainer.model,
+                    agent,
+                    env,
+                    ft_epochs=ft_epochs,
+                    ft_batch_size=ft_batch_size,
+                    kl_weight=ft_kl_weight,
+                    lr=ft_lr,
+                    # num_sample_steps=diffusion_trainer.ema.ema_model.num_sample_steps
+                    num_sample_steps=128
+                )
+                # Use fine-tuned model for generation
+                used_model = fine_tuned_model
+            else:
+                used_model = diffusion_trainer.ema.ema_model
 
-            # Add samples to agent replay buffer
-            generator = CondDiffusionGenerator(env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
+            
+            generator = CondDiffusionGenerator(env=env, ema_model=used_model, cond_distri=cond_distri)
+            
             observations, actions, rewards, next_observations, terminals = generator.sample(num_samples=num_samples,
                                                                                             cfg_scale=cfg_scale)
 
@@ -387,6 +617,22 @@ if __name__ == '__main__':
     parser.add_argument('--wandb', action='store_true', default=False, 
                         help='Enable wandb logging')
     
+    # Fine-tuning related arguments
+    parser.add_argument('--enable_finetuning', action='store_true', default=False,
+                        help='Enable diffusion fine-tuning for reward maximization')
+    parser.add_argument('--ft_epochs', type=int, default=50,
+                        help='Number of epochs for diffusion fine-tuning')
+    parser.add_argument('--ft_batch_size', type=int, default=256,
+                        help='Batch size for diffusion fine-tuning')
+    parser.add_argument('--ft_kl_weight', type=float, default=0.1,
+                        help='KL divergence weight for fine-tuning regularization')
+    parser.add_argument('--ft_lr', type=float, default=1e-4,
+                        help='Learning rate for fine-tuning')
+    
+    # Target network flag
+    # parser.add_argument('--target', action='store_true', default=False,
+    #                     help='Use target conditional network and SMC sampling')
+    
     args = parser.parse_args()
     
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
@@ -400,4 +646,7 @@ if __name__ == '__main__':
 
     redq_sac(args.env, seed=args.seed, target_entropy='auto', logger_kwargs=logger_kwargs,
              use_wandb=args.wandb, wandb_project=args.wandb_project,
-             wandb_group=args.wandb_group, wandb_name=args.wandb_name)
+             wandb_group=args.wandb_group, wandb_name=args.wandb_name,
+             enable_finetuning=args.enable_finetuning, ft_epochs=args.ft_epochs,
+             ft_batch_size=args.ft_batch_size, ft_kl_weight=args.ft_kl_weight,
+             ft_lr=args.ft_lr)

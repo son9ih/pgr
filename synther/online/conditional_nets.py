@@ -108,6 +108,11 @@ class Curiosity(nn.Module):
         icm_reward = F.mse_loss(real_next_state_feature, pred_next_state_feature, reduction='none').mean(1, keepdim=True)
 
         return icm_reward
+    
+    def compute_reward_abs_torch(self, state, next_state, action):
+        real_next_state_feature, pred_next_state_feature, _ = self.forward(state, next_state, action)
+        icm_reward = F.mse_loss(real_next_state_feature, pred_next_state_feature, reduction='none').mean(1, keepdim=True)
+        return torch.sqrt(icm_reward)
 
     def forward_loss(self, state, next_state, action):
         real_next_state_feature, pred_next_state_feature, pred_action = self.forward(state, next_state, action)
