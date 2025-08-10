@@ -183,6 +183,8 @@ class ElucidatedDiffusion(nn.Module):
             # w/o cond
             uncond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=None)
             # do cfg
+            # If we set cond=None, then cond_denoised_over_sigma is the same as uncond_denoised_over_sigma
+            # So cfg_scale is multiplied by 0, then denoised_over_sigma is the same as uncond_denoised_over_sigma
             denoised_over_sigma = uncond_denoised_over_sigma + cfg_scale * (cond_denoised_over_sigma - uncond_denoised_over_sigma)
 
             inputs_next = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma
@@ -430,8 +432,10 @@ class Trainer(object):
         accelerator = self.accelerator
         device = accelerator.device
         data = data.to(device)
+        # AttributeError: 'NoneType' object has no attribute 'to'
         if 'cond' in kwargs:
-            kwargs['cond'] = kwargs['cond'].to(device)
+            if kwargs['cond'] is not None:
+                kwargs['cond'] = kwargs['cond'].to(device)
 
         total_loss = 0.
         with self.accelerator.autocast():
@@ -539,11 +543,13 @@ class REDQCondTrainer(Trainer):
                                curr_epoch: int,
                                num_steps: Optional[int] = None):
         cond_net.eval()
+        # CondDistri computes the priority then sort the buffer according to the priority
         cond_distri = CondDistri(cond_net, self.batch_size, buffer, top_frac)
         self.update_cond_normalizer(cond_distri, device=self.accelerator.device)
 
         num_steps = num_steps or self.train_num_steps
         for j in range(num_steps):
+            # Just sample_batch without idxs is equivalent to uniform sampling
             b = cond_distri.sample_batch(self.batch_size)
             obs = b['obs1']
             next_obs = b['obs2']
@@ -558,7 +564,10 @@ class REDQCondTrainer(Trainer):
             data = np.concatenate(data, axis=1)
             data = torch.from_numpy(data).float()
             cond_signal = torch.from_numpy(cond_signal).float()
-            loss = self.train_on_batch(data, cond=cond_signal)
+            # cond_signal을 같은 형태의 None으로 두기
+            # we are gonna sample data with conditioned on None signal
+            # loss = self.train_on_batch(data, cond=cond_signal)
+            loss = self.train_on_batch(data, cond=None)
             if j % 1000 == 0:
                 print(f'[{j}/{num_steps}] loss: {loss:.4f}')
         

@@ -50,8 +50,8 @@ def redq_sac(
         num_min=2,
         q_target_mode='min',
         policy_update_delay=20,
-        diffusion_buffer_size=int(1e6),
-        # diffusion_buffer_size=int(1e5),
+        # diffusion_buffer_size=int(1e6),
+        diffusion_buffer_size=int(1e5),
         diffusion_sample_ratio=0.5,
         # diffusion hyperparameters
         retrain_diffusion_every=10_000,
