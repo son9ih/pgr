@@ -49,7 +49,7 @@ class ElucidatedDiffusion(nn.Module):
             normalizer: BaseNormalizer,
             cond_normalizer: BaseNormalizer,
             event_shape: Sequence[int],  # shape of the input and output
-            num_sample_steps: int = 32,  # number of sampling steps
+            num_sample_steps: int = 1000,  # number of sampling steps
             sigma_min: float = 0.002,  # min noise level
             sigma_max: float = 80,  # max noise level
             sigma_data: float = 1.0,  # standard deviation of data distribution
