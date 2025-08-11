@@ -107,16 +107,30 @@ def fine_tune_diffusion_step(
         sigma_val = sigma.item()
         next_sigma = sigmas[i + 1].item() if i + 1 < len(sigmas) else 0.0
         
-        x_t, kl_div = elucidated_step_with_kl(
-            fine_tune_model,
-            pre_trained_model, 
-            x_t,
-            sigma_val,
-            next_sigma,
-            cond=None
-        )
+        # Restrict the gradient backpropagation on both reward and KL divergence
+        
+        if i != len(sigmas) - 2:  # not Final step
+            with torch.no_grad():
+                x_t, kl_div = elucidated_step_with_kl(
+                    fine_tune_model,
+                    pre_trained_model, 
+                    x_t,
+                    sigma_val,
+                    next_sigma,
+                    cond=None
+                )
+        else:
+            x_t, kl_div = elucidated_step_with_kl(
+                fine_tune_model,
+                pre_trained_model, 
+                x_t,
+                sigma_val,
+                next_sigma,
+                cond=None
+            )
         
         # Only accumulate KL loss from final step
+        # kl은 모든 timestep에서 계산? 아니래
         if i == len(sigmas) - 2:  # Final step
             total_kl_loss = kl_div.mean()
     
@@ -153,7 +167,7 @@ def fine_tune_diffusion_step(
         # This tricks PyTorch into thinking curiosity depends on final_sample
         curiosity = curiosity + 0.0 * final_sample.sum(dim=1, keepdim=True)
     else:
-        print('We are using the main conditional network')
+        # print('We are using the main conditional network')
         # with torch.no_grad():
         curiosity = agent.cond_net.compute_reward_abs_torch(
                 obs, next_obs, act
@@ -249,13 +263,13 @@ def redq_sac(
         num_min=2,
         q_target_mode='min',
         policy_update_delay=20,
-        # diffusion_buffer_size=int(1e6),
-        diffusion_buffer_size=int(1e5),
+        diffusion_buffer_size=int(1e6),
+        # diffusion_buffer_size=int(1e5),
         diffusion_sample_ratio=0.5,
         # diffusion hyperparameters
         retrain_diffusion_every=10_000,
-        # num_samples=100_000,
-        num_samples=10_000,
+        num_samples=100_000,
+        # num_samples=10_000,
         diffusion_start=0,
         disable_diffusion=True,
         print_buffer_stats=True,
@@ -284,18 +298,23 @@ def redq_sac(
         wandb_project='PGR',
         wandb_group='PGR',
         wandb_name=None,
+        enable_curio=False,
+        curio_every=5000,
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training using device: {device}")
     # set number of epoch
     if epochs == 'mbpo' or epochs < 0:
-        epochs = mbpo_epoches.get(env_name, 300)
+        epochs = mbpo_epoches.get(env_name, 120)
     total_steps = steps_per_epoch * epochs + 1
     
     # Initialize wandb if enabled
     if use_wandb:
-        run_name = wandb_name or f"{env_name}_baseline_{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+        if enable_finetuning:
+            run_name = wandb_name or f"{env_name}_finetune_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_{ft_epochs}_{ft_kl_weight}"
+        else:
+            run_name = wandb_name or f"{env_name}_baseline_{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
         wandb.init(
             project=wandb_project,
             group=wandb_group,
@@ -330,6 +349,12 @@ def redq_sac(
                 "cond_top_frac": cond_top_frac,
                 "cfg_scale": cfg_scale,
                 "cond_hidden_size": cond_hidden_size,
+                "enable_finetuning": enable_finetuning,
+                "ft_epochs": ft_epochs,
+                "ft_batch_size": ft_batch_size,
+                "ft_kl_weight": ft_kl_weight,
+                "ft_lr": ft_lr,
+                "enable_curio": enable_curio,
             }
         )
         print(f"Initialized wandb run: {run_name}")
@@ -448,7 +473,10 @@ def redq_sac(
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             # reset environment
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
-
+            
+        if (t + 1) % curio_every == 0 and (t + 1) >= curio_every and enable_curio:
+            agent.update_curiosity_score()
+        
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
             print(f'Retraining diffusion model at step {t + 1}')
 
@@ -525,6 +553,10 @@ def redq_sac(
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
             epoch = t // steps_per_epoch
+            
+            if enable_curio:
+                # If not (t + 1) % retrain_diffusion_every == 0, just log the latest curiosity score
+                agent.log_curiosity_score(logger)   
 
             # Test the performance of the deterministic version of the agent.
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
@@ -552,7 +584,10 @@ def redq_sac(
             logger.log_tabular('Alpha', with_min_and_max=True)
             logger.log_tabular('LossAlpha', average_only=True)
             logger.log_tabular('PreTanh', with_min_and_max=True)
-
+            
+            if enable_curio:
+                logger.log_tabular('CuriosityScore', with_min_and_max=True)
+        
             if evaluate_bias:
                 logger.log_tabular("MCDisRet", with_min_and_max=True)
                 logger.log_tabular("MCDisRetEnt", with_min_and_max=True)
@@ -620,21 +655,26 @@ if __name__ == '__main__':
     # Fine-tuning related arguments
     parser.add_argument('--enable_finetuning', action='store_true', default=False,
                         help='Enable diffusion fine-tuning for reward maximization')
-    parser.add_argument('--ft_epochs', type=int, default=50,
+    parser.add_argument('--ft_epochs', type=int, default=15,
                         help='Number of epochs for diffusion fine-tuning')
     parser.add_argument('--ft_batch_size', type=int, default=256,
                         help='Batch size for diffusion fine-tuning')
-    parser.add_argument('--ft_kl_weight', type=float, default=0.1,
+    parser.add_argument('--ft_kl_weight', type=float, default=1.0,
                         help='KL divergence weight for fine-tuning regularization')
-    parser.add_argument('--ft_lr', type=float, default=1e-4,
+    parser.add_argument('--ft_lr', type=float, default=1e-5,
                         help='Learning rate for fine-tuning')
     
     # Target network flag
     # parser.add_argument('--target', action='store_true', default=False,
     #                     help='Use target conditional network and SMC sampling')
     
-    args = parser.parse_args()
+    # Curiosity score logging
+    parser.add_argument('--enable_curio', action='store_true', default=False,
+                        help='Enable curiosity score logging during training')
+    parser.add_argument('--curio_every', type=int, default=5000)
     
+    args = parser.parse_args()
+        
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
     print(args.results_folder)
     if not os.path.exists(args.results_folder):
@@ -649,4 +689,4 @@ if __name__ == '__main__':
              wandb_group=args.wandb_group, wandb_name=args.wandb_name,
              enable_finetuning=args.enable_finetuning, ft_epochs=args.ft_epochs,
              ft_batch_size=args.ft_batch_size, ft_kl_weight=args.ft_kl_weight,
-             ft_lr=args.ft_lr)
+             ft_lr=args.ft_lr, enable_curio=args.enable_curio, curio_every=args.curio_every)
