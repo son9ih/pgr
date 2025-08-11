@@ -24,8 +24,11 @@ class REDQRLPDCondAgent(REDQSACAgent):
                                     output_size=self.act_dim).to(self.device)
         self.cond_optimizer = torch.optim.Adam(self.cond_net.parameters(), lr=self.lr)
         
+        self.curiosity_score = 0.0
+        self.curiosity = None
+        
     # Calculate the curiosity score of data in replay buffer
-    def compute_curiosity_score(self):
+    def get_curiosity_score(self):
         if self.get_current_num_data() == 0:
             return 0.0
 
@@ -33,7 +36,19 @@ class REDQRLPDCondAgent(REDQSACAgent):
         with torch.no_grad():
             # obs_tensor, obs_next_tensor, acts_tensor is already on self.device
             curiosity = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
-        return curiosity.mean().item()
+            # from tensor to numpy
+            curiosity = curiosity.cpu().numpy()
+        return curiosity.mean(), curiosity
+    
+    def update_curiosity_score(self):
+        # Evaluation over current replay buffer
+        self.curiosity_score, self.curiosity = self.get_curiosity_score()
+            
+    def log_curiosity_score(self, logger=None):
+        if logger is not None:
+            logger.store(CuriosityScore=self.curiosity)
+            
+        
 
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
