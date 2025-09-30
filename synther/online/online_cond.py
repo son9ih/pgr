@@ -3,6 +3,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import sys
+sys.path.append('.')
 import time
 
 import dmcgym
@@ -324,6 +325,7 @@ if __name__ == '__main__':
                         default=['config/online/sac_synther_dmc.gin'])
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--wandb', action='store_true', default=False)
     args = parser.parse_args()
 
     logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
