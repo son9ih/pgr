@@ -14,10 +14,11 @@ def combine_two_tensors(tensor1, tensor2):
 
 class REDQRLPDCondAgent(REDQSACAgent):
 
-    def __init__(self, cond_hidden_size, diffusion_buffer_size=int(1e6), diffusion_sample_ratio=0.5, *args, **kwargs):
+    def __init__(self, cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio, *args, retrain_diffusion_every=1000, **kwargs):
         super().__init__(*args, **kwargs)
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim, size=diffusion_buffer_size)
         self.diffusion_sample_ratio = diffusion_sample_ratio
+        self.retrain_diffusion_every = retrain_diffusion_every
 
         self.cond_net = Curiosity(input_size=self.obs_dim, 
                                     hidden_size=cond_hidden_size, 
@@ -32,7 +33,9 @@ class REDQRLPDCondAgent(REDQSACAgent):
         if self.get_current_num_data() == 0:
             return 0.0
 
-        obs_tensor, obs_next_tensor, acts_tensor, _, _ = self.sample_data(self.replay_buffer.size)
+        # Use sequential sampling of recent data instead of random sampling
+        sample_size = min(self.retrain_diffusion_every, self.replay_buffer.size)
+        obs_tensor, obs_next_tensor, acts_tensor, _, _ = self.sample_recent_data(sample_size)
         with torch.no_grad():
             # obs_tensor, obs_next_tensor, acts_tensor is already on self.device
             curiosity = self.cond_net.compute_reward_abs_torch(obs_tensor, obs_next_tensor, acts_tensor)
@@ -171,6 +174,43 @@ class REDQRLPDCondAgent(REDQSACAgent):
 
     def sample_real_data(self, batch_size):
         return super().sample_data(batch_size)
+
+    def sample_recent_data(self, batch_size):
+        """
+        Sample the most recent data from replay buffer sequentially
+        instead of random sampling
+        """
+        if self.replay_buffer.size < batch_size:
+            # If not enough data, return all available data
+            batch_size = self.replay_buffer.size
+        
+        # Calculate indices for the most recent data
+        if self.replay_buffer.size < self.replay_buffer.max_size:
+            # Buffer not full yet, take last batch_size items
+            start_idx = max(0, self.replay_buffer.size - batch_size)
+            idxs = np.arange(start_idx, self.replay_buffer.size)
+        else:
+            # Buffer is full, consider circular nature
+            # Recent data is around the pointer position
+            start_idx = (self.replay_buffer.ptr - batch_size) % self.replay_buffer.max_size
+            if start_idx + batch_size <= self.replay_buffer.max_size:
+                idxs = np.arange(start_idx, start_idx + batch_size)
+            else:
+                # Wrap around case
+                part1_size = self.replay_buffer.max_size - start_idx
+                part2_size = batch_size - part1_size
+                idxs = np.concatenate([
+                    np.arange(start_idx, self.replay_buffer.max_size),
+                    np.arange(0, part2_size)
+                ])
+        
+        batch = self.replay_buffer.sample_batch(batch_size=batch_size, idxs=idxs)
+        obs_tensor = torch.Tensor(batch['obs1']).to(self.device)
+        obs_next_tensor = torch.Tensor(batch['obs2']).to(self.device)
+        acts_tensor = torch.Tensor(batch['acts']).to(self.device)
+        rews_tensor = torch.Tensor(batch['rews']).unsqueeze(1).to(self.device)
+        done_tensor = torch.Tensor(batch['done']).unsqueeze(1).to(self.device)
+        return obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor
 
     def reset_diffusion_buffer(self):
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim,

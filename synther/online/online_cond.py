@@ -69,6 +69,7 @@ def elucidated_step_with_kl(
     
     # Compute KL divergence only if there's noise variance
     if eta > 0 and sigma_next > 1e-6:
+        print(f"Current sigma_next isn't < 1e-6: {sigma_next}")
         # Approximate KL between the two distributions
         kl_terms = torch.mean((x_next_finetune - x_next_pretrained) ** 2, dim=-1) / (2 * sigma_next ** 2)
     else:
@@ -85,7 +86,6 @@ def fine_tune_diffusion_step(
     batch_size, 
     kl_weight, 
     num_sample_steps,
-    max_grad_norm=1.0
 ):
     """
     Single fine-tuning step for diffusion model using reward maximization.
@@ -103,13 +103,16 @@ def fine_tune_diffusion_step(
     total_kl_loss = 0.0
     
     # Reverse diffusion process
-    for i, sigma in enumerate(sigmas[:-1]):
+    for i, sigma in enumerate(sigmas[:-2]):
         sigma_val = sigma.item()
-        next_sigma = sigmas[i + 1].item() if i + 1 < len(sigmas) else 0.0
-        
+        # next_sigma = sigmas[i + 1].item() if i + 1 < len(sigmas) else 0.0
+        next_sigma = sigmas[i + 1].item()
+        print(f"Reverse diffusion step {i}: sigma={sigma_val}, next_sigma={next_sigma}")
         # Restrict the gradient backpropagation on both reward and KL divergence
         
-        if i != len(sigmas) - 2:  # not Final step
+        # if i != len(sigmas) - 2:  # not Final step
+        # if i < len(sigmas) - 3:
+        if i < len(sigmas) - 10:
             with torch.no_grad():
                 x_t, kl_div = elucidated_step_with_kl(
                     fine_tune_model,
@@ -120,6 +123,7 @@ def fine_tune_diffusion_step(
                     cond=None
                 )
         else:
+            print(f"Optimizing diffusion step {i}: sigma={sigma_val}, next_sigma={next_sigma}")
             x_t, kl_div = elucidated_step_with_kl(
                 fine_tune_model,
                 pre_trained_model, 
@@ -128,11 +132,10 @@ def fine_tune_diffusion_step(
                 next_sigma,
                 cond=None
             )
-        
-        # Only accumulate KL loss from final step
-        # kl은 모든 timestep에서 계산? 아니래
-        if i == len(sigmas) - 2:  # Final step
-            total_kl_loss = kl_div.mean()
+            # Only accumulate KL loss from final step
+            # kl은 모든 timestep에서 계산? 아니래
+            # if i == len(sigmas) - 2:  # Final step
+            total_kl_loss += kl_div.mean()
     
     # Final sample should be denoised transitions
     final_sample = x_t
@@ -169,11 +172,15 @@ def fine_tune_diffusion_step(
     else:
         # print('We are using the main conditional network')
         # with torch.no_grad():
-        curiosity = agent.cond_net.compute_reward_abs_torch(
+        # curiosity = agent.cond_net.compute_reward_abs_torch(
+        #         obs, next_obs, act
+        #     )
+        curiosity = agent.cond_net.compute_reward_torch(
                 obs, next_obs, act
             )
+        # 08/28
         # Same trick to maintain gradient connection
-        curiosity = curiosity + 0.0 * final_sample.sum(dim=1, keepdim=True)
+        # curiosity = curiosity + 0.0 * final_sample.sum(dim=1, keepdim=True)
     
     reward = curiosity.squeeze(-1)
     
@@ -192,11 +199,13 @@ def fine_tune_diffusion_model(
     kl_weight,
     lr=1e-4,
     max_grad_norm=1.0,
-    num_sample_steps=32
+    num_sample_steps=128
 ):
     """
     Fine-tune diffusion model for reward maximization.
     """
+    from ema_pytorch import EMA
+    
     device = next(pre_trained_model.parameters()).device
     
     # Create a copy of the pre-trained model for fine-tuning
@@ -206,6 +215,13 @@ def fine_tune_diffusion_model(
     # Set up optimizer
     optimizer = torch.optim.Adam(fine_tune_model.parameters(), lr=lr)
     
+    # Set up EMA for fine-tuning (같은 설정 사용)
+    ema = EMA(fine_tune_model, beta=0.995, update_every=1)
+    ema.to(device)
+    
+    # Set up learning rate scheduler (optional, 짧은 fine-tuning이므로 cosine decay 사용)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, ft_epochs)
+    
     print(f"Starting diffusion fine-tuning for {ft_epochs} epochs...")
     
     for epoch in range(ft_epochs):
@@ -213,14 +229,13 @@ def fine_tune_diffusion_model(
         
         # avg_kl: Value should be zero in epoch 0
         loss, avg_reward, avg_kl = fine_tune_diffusion_step(
-            pre_trained_model,
-            fine_tune_model,
+            pre_trained_model,  # Use original pre-trained model for KL computation
+            fine_tune_model,    # Fine-tune this model
             agent,
             env,
             ft_batch_size,
             kl_weight,
             num_sample_steps,
-            max_grad_norm
         )
         print(loss.item())
         loss.backward()
@@ -229,12 +244,21 @@ def fine_tune_diffusion_model(
         nn.utils.clip_grad_norm_(fine_tune_model.parameters(), max_grad_norm)
         optimizer.step()
         
+        # Update EMA (diffusion trainer에서와 같은 방식)
+        ema.to(device)
+        ema.update()
+        
+        # Update learning rate scheduler
+        lr_scheduler.step()
+        
         # if epoch % 10 == 0:
-        print(f"Fine-tuning Epoch {epoch}, Loss: {loss.item():.4f}, Avg Reward: {avg_reward:.4f}, KL Div: {avg_kl:.6f}")
+        print(f"Fine-tuning Epoch {epoch}, Loss: {loss.item():.4f}, Avg Reward: {avg_reward:.4f}, KL Div: {avg_kl:.6f}, LR: {lr_scheduler.get_last_lr()[0]:.6f}")
     
     print("Diffusion fine-tuning completed.")
     fine_tune_model.eval()
-    return fine_tune_model
+    
+    # Return EMA model for better stability (diffusion trainer에서와 동일)
+    return ema.ema_model
 
 
 @gin.configurable
@@ -282,10 +306,10 @@ def redq_sac(
         cond_hidden_size=128,
         # fine-tuning hyperparameters
         enable_finetuning=False,
-        ft_epochs=50,
+        ft_epochs=30,
         ft_batch_size=256,
-        ft_kl_weight=0.1,
-        ft_lr=1e-4,
+        ft_kl_weight=10.0,
+        ft_lr=1e-5,
         # # target network flag
         # target=False,
         # following are bias evaluation related
@@ -312,7 +336,7 @@ def redq_sac(
     # Initialize wandb if enabled
     if use_wandb:
         if enable_finetuning:
-            run_name = wandb_name or f"{env_name}_finetune_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_{ft_epochs}_{ft_kl_weight}"
+            run_name = wandb_name or f"{env_name}_finetune_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_{ft_epochs}_{ft_kl_weight}_{ft_lr}"
         else:
             run_name = wandb_name or f"{env_name}_baseline_{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
         wandb.init(
@@ -474,7 +498,7 @@ def redq_sac(
             # reset environment
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
             
-        if (t + 1) % curio_every == 0 and (t + 1) >= curio_every and enable_curio:
+        if (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start and enable_curio:
             agent.update_curiosity_score()
         
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
@@ -503,8 +527,7 @@ def redq_sac(
             if enable_finetuning:
                 print("Starting diffusion fine-tuning...")
                 fine_tuned_model = fine_tune_diffusion_model(
-                    # 이 미친놈이 범인이었네 슈밤바, 찝찝한데 ema.model을 그냥 넘어가는 건.. 나중에 알아보자
-                    # diffusion_trainer.ema.ema_model,
+                    # diffusion_trainer.ema.ema_model,  # Use EMA model as base - will be deep copied
                     diffusion_trainer.model,
                     agent,
                     env,
