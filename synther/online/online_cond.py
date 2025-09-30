@@ -20,6 +20,8 @@ from synther.diffusion.diffusion_generator import CondDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
 
+import wandb
+
 
 @gin.configurable
 def redq_sac(
@@ -103,7 +105,9 @@ def redq_sac(
         bias_eval_env.seed(bias_eval_env_seed)
         bias_eval_env.action_space.np_random.seed(bias_eval_env_seed)
 
-    seed_all(epoch=0)
+    # user define seed
+    seed = args.seed
+    seed_all(seed)
 
     """prepare to init agent"""
     # get obs and action dimensions
@@ -319,6 +323,7 @@ if __name__ == '__main__':
     parser.add_argument('--gin_config_files', nargs='*', type=str,
                         default=['config/online/sac_synther_dmc.gin'])
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
+    parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
     logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
