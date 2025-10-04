@@ -22,6 +22,8 @@ from synther.diffusion.utils import construct_diffusion_model
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
 
 import wandb
+from synther.online.utils import PBE, RMS, compute_intr_reward
+import pdb
 
 
 @gin.configurable
@@ -196,6 +198,12 @@ def redq_sac(
                               start_steps, delay_update_steps,
                               utd_ratio, num_Q, num_min, q_target_mode,
                               policy_update_delay)
+    
+    # pbe for state entropy evaluation
+    if args.state_ent:
+        print('Logging state entropy with PBE')
+        rms = RMS(device)
+        pbe = PBE(rms, args.knn_clip, args.knn_k, args.knn_avg, args.knn_rms, device)
 
     # set up diffusion model
     diff_dims = obs_dim + act_dim + 1 + obs_dim
@@ -301,6 +309,20 @@ def redq_sac(
             # reseed should improve reproducibility (should make results the same whether bias evaluation is on or not)
             if reseed_each_epoch:
                 seed_all(epoch)
+                
+            # Evaluation of state entropy
+            # 첫 번째 에포크에서 StateEnt를 0으로 초기화하여 헤더에 포함
+            if args.state_ent:
+                if epoch % 5 == 0 and epoch > 1:
+                    obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
+                    intr_rew = compute_intr_reward(pbe, obs_tensor)
+                    logger.store(StateEnt=intr_rew)
+                    print(f'State Entropy: {intr_rew.mean():.4f}')
+                else:
+                    # 헤더 등록을 위해 빈 값 저장 (실제 계산은 하지 않음)
+                    logger.store(StateEnt=0.0)
+                logger.log_tabular('StateEnt', average_only=True)
+            
 
             """logging"""
             # Log info about epoch
@@ -379,6 +401,13 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--wandb', action='store_true', default=False)
     parser.add_argument('--synther', action='store_true', default=False)
+    
+    parser.add_argument('--state_ent', action='store_true', default=False)
+    parser.add_argument('--knn_clip', type=float, default=0.0)
+    parser.add_argument('--knn_k', type=int, default=5)
+    parser.add_argument('--knn_avg', action='store_true', default=False) # default: True
+    parser.add_argument('--knn_rms', action='store_true', default=False)
+    parser.add_argument('--ent_eval_num', type=int, default=5000)
     
     args = parser.parse_args()
     
