@@ -79,14 +79,56 @@ def redq_sac(
     if epochs == 'mbpo' or epochs < 0:
         epochs = mbpo_epoches.get(env_name, 300)
     total_steps = steps_per_epoch * epochs + 1
+    
+    if args.wandb:
+        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+        wandb.init(
+            project = 'PGR',
+            group = 'PGR',
+            name = run_name,
+            config={
+                "env_name": env_name,
+                "seed": seed,
+                "epochs": epochs,
+                "steps_per_epoch": steps_per_epoch,
+                "hidden_sizes": hidden_sizes,
+                "replay_size": replay_size,
+                "batch_size": batch_size,
+                "lr": lr,
+                "gamma": gamma,
+                "polyak": polyak,
+                "alpha": alpha,
+                "auto_alpha": auto_alpha,
+                "target_entropy": target_entropy,
+                "start_steps": start_steps,
+                "delay_update_steps": delay_update_steps,
+                "utd_ratio": utd_ratio,
+                "num_Q": num_Q,
+                "num_min": num_min,
+                "q_target_mode": q_target_mode,
+                "policy_update_delay": policy_update_delay,
+                "diffusion_buffer_size": diffusion_buffer_size,
+                "diffusion_sample_ratio": diffusion_sample_ratio,
+                "retrain_diffusion_every": retrain_diffusion_every,
+                "num_samples": num_samples,
+                "disable_diffusion": disable_diffusion,
+                "cfg_dropout": cfg_dropout,
+                "cond_top_frac": cond_top_frac,
+                "cfg_scale": cfg_scale,
+                "cond_hidden_size": cond_hidden_size,
+            }
+        )
+        print(f'Initialized wandb with run name {run_name}')
 
     """set up logger"""
+    logger_kwargs['use_wandb'] = args.wandb
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
     """set up environment and seeding"""
     env_fn = lambda: wrap_gym(gym.make(env_name))
     env, test_env, bias_eval_env = env_fn(), env_fn(), env_fn()
+    print(f"Environment: {env_name} | Seed: {seed}")
     # seed torch and numpy
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -291,6 +333,9 @@ def redq_sac(
 
             # flush logged information to disk
             sys.stdout.flush()
+            
+    if args.wandb:
+        wandb.finish()
 
 def wrap_gym(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     if rescale_actions:
@@ -318,6 +363,7 @@ def get_time_limit(env: gym.Env):
 
 if __name__ == '__main__':
     import argparse
+    
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='Hopper-v2')
