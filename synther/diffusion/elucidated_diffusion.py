@@ -265,6 +265,7 @@ class Trainer(object):
             amp: bool = False,
             fp16: bool = False,
             split_batches: bool = True,
+            args=None,
     ):
         super().__init__()
         self.accelerator = Accelerator(
@@ -345,6 +346,8 @@ class Trainer(object):
         if self.model.cond_normalizer is not None:
             self.model.cond_normalizer.to(self.accelerator.device)
             self.ema.ema_model.cond_normalizer.to(self.accelerator.device)
+            
+        self.args = args
 
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
@@ -431,7 +434,11 @@ class Trainer(object):
         device = accelerator.device
         data = data.to(device)
         if 'cond' in kwargs:
-            kwargs['cond'] = kwargs['cond'].to(device)
+            if self.args.synther:
+                if kwargs['cond'] is not None:
+                    kwargs['cond'] = kwargs['cond'].to(device)
+            else:
+                kwargs['cond'] = kwargs['cond'].to(device)
 
         total_loss = 0.
         with self.accelerator.autocast():
@@ -476,6 +483,7 @@ class REDQCondTrainer(Trainer):
             fp16: bool = False,
             split_batches: bool = True,
             model_terminals: bool = False,
+            args = None,
     ):
         super().__init__(
             diffusion_model,
@@ -494,6 +502,7 @@ class REDQCondTrainer(Trainer):
             amp=amp,
             fp16=fp16,
             split_batches=split_batches,
+            args=args,
         )
 
         self.model_terminals = model_terminals
@@ -558,7 +567,10 @@ class REDQCondTrainer(Trainer):
             data = np.concatenate(data, axis=1)
             data = torch.from_numpy(data).float()
             cond_signal = torch.from_numpy(cond_signal).float()
-            loss = self.train_on_batch(data, cond=cond_signal)
+            if self.args.synther:
+                loss = self.train_on_batch(data, cond=None)
+            else:
+                loss = self.train_on_batch(data, cond=cond_signal)
             if j % 1000 == 0:
                 print(f'[{j}/{num_steps}] loss: {loss:.4f}')
         

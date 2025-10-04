@@ -11,6 +11,7 @@ from synther.diffusion.elucidated_diffusion import CondDistri
 class CondDiffusionGenerator:
     def __init__(
             self,
+            args,
             env: gym.Env,
             ema_model,
             cond_distri: CondDistri,
@@ -27,6 +28,7 @@ class CondDiffusionGenerator:
         self.num_sample_steps = num_sample_steps
         self.sample_batch_size = sample_batch_size
         print(f'Sampling using: {self.num_sample_steps} steps, {self.sample_batch_size} batch size.')
+        self.args = args
 
 
     def sample(
@@ -44,8 +46,11 @@ class CondDiffusionGenerator:
 
         for i in range(num_batches):
             print(f'Generating split {i + 1} of {num_batches}')
-            # Generate condition
-            cond = self.cond_distri.sample_cond(int(self.sample_batch_size))
+            if self.args.synther:
+                cond = None
+            else:
+                # Generate condition
+                cond = self.cond_distri.sample_cond(int(self.sample_batch_size))
 
             sampled_outputs = self.diffusion.sample(
                 batch_size=self.sample_batch_size,

@@ -70,6 +70,7 @@ def redq_sac(
         n_mc_eval=1000,
         n_mc_cutoff=350,
         reseed_each_epoch=True,
+        args=None,
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -210,6 +211,7 @@ def redq_sac(
                 ),
                 results_folder=args.results_folder,
                 model_terminals=model_terminals,
+                args=args,
             )
             diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
             cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
@@ -217,7 +219,7 @@ def redq_sac(
             agent.reset_diffusion_buffer()
 
             # Add samples to agent replay buffer
-            generator = CondDiffusionGenerator(env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
+            generator = CondDiffusionGenerator(args=args, env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
             observations, actions, rewards, next_observations, terminals = generator.sample(num_samples=num_samples,
                                                                                             cfg_scale=cfg_scale)
 
@@ -324,12 +326,17 @@ if __name__ == '__main__':
     parser.add_argument('--gin_config_files', nargs='*', type=str,
                         default=['config/online/sac_synther_dmc.gin'])
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
+    
+    # Additional arguments
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--wandb', action='store_true', default=False)
+    parser.add_argument('--synther', action='store_true', default=False)
+    
     args = parser.parse_args()
 
     logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
 
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
-    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs)
+    # args를 한번에 넘기는게 좋음
+    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args)
