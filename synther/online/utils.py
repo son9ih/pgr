@@ -57,15 +57,18 @@ class PBE(object):
             reward /= self.rms(reward)[0] if self.knn_rms else 1.0
             reward = torch.maximum(
                 reward - self.knn_clip,
-                torch.zeros_like(reward).to(self.device)
+                # torch.zeros_like(reward).to(self.device)
+                torch.zeros_like(reward)
             ) if self.knn_clip >= 0.0 else reward  # (b1, 1)
         else:  # average over all k nearest neighbors
             reward = reward.reshape(-1, 1)  # (b1 * k, 1)
             reward /= self.rms(reward)[0] if self.knn_rms else 1.0
             reward = torch.maximum(
                 reward - self.knn_clip,
-                torch.zeros_like(reward).to(
-                    self.device)) if self.knn_clip >= 0.0 else reward
+                # torch.zeros_like(reward).to(
+                torch.zeros_like(reward)) if self.knn_clip >= 0.0 else reward
+                    # self.device)) if self.knn_clip >= 0.0 else reward
+                    
             reward = reward.reshape((b1, self.knn_k))  # (b1, k)
             reward = reward.mean(dim=1, keepdim=True)  # (b1, 1)
         reward = torch.log(reward + 1.0)

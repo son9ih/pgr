@@ -79,7 +79,7 @@ def redq_sac(
     print(f"Training using device: {device}")
     # set number of epoch
     if epochs == 'mbpo' or epochs < 0:
-        epochs = mbpo_epoches.get(env_name, 300)
+        epochs = mbpo_epoches.get(env_name, 150)
     total_steps = steps_per_epoch * epochs + 1
     
     if args.wandb:
@@ -314,7 +314,8 @@ def redq_sac(
             # 첫 번째 에포크에서 StateEnt를 0으로 초기화하여 헤더에 포함
             if args.state_ent:
                 if epoch % 5 == 0 and epoch > 1:
-                    obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
+                    # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
+                    obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
                     intr_rew = compute_intr_reward(pbe, obs_tensor)
                     logger.store(StateEnt=intr_rew)
                     print(f'State Entropy: {intr_rew.mean():.4f}')
