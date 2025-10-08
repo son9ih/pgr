@@ -83,7 +83,7 @@ def redq_sac(
     total_steps = steps_per_epoch * epochs + 1
     
     if args.wandb:
-        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}"
         wandb.init(
             project = 'PGR',
             group = 'PGR',
@@ -202,8 +202,8 @@ def redq_sac(
     # pbe for state entropy evaluation
     if args.state_ent:
         print('Logging state entropy with PBE')
-        rms = RMS(device)
-        pbe = PBE(rms, args.knn_clip, args.knn_k, args.knn_avg, args.knn_rms, device)
+        rms = RMS(device=torch.device('cpu'))
+        pbe = PBE(rms, args.knn_clip, args.knn_k, args.knn_avg, args.knn_rms, device=torch.device('cpu'))
 
     # set up diffusion model
     diff_dims = obs_dim + act_dim + 1 + obs_dim
