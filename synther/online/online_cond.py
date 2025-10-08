@@ -82,6 +82,9 @@ def redq_sac(
         epochs = mbpo_epoches.get(env_name, 150)
     total_steps = steps_per_epoch * epochs + 1
     
+    # set seed
+    seed = args.seed
+    
     if args.wandb:
         run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}"
         wandb.init(
@@ -152,7 +155,6 @@ def redq_sac(
         bias_eval_env.action_space.np_random.seed(bias_eval_env_seed)
 
     # user define seed
-    seed = args.seed
     seed_all(seed)
 
     """prepare to init agent"""
