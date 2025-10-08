@@ -86,7 +86,10 @@ def redq_sac(
     seed = args.seed
     
     if args.wandb:
-        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}"
+        if args.synther:
+            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}"
+        else:
+            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}"
         wandb.init(
             project = 'PGR',
             group = 'PGR',
