@@ -197,12 +197,14 @@ def redq_sac(
         'q_target_mode': q_target_mode,
         'policy_update_delay': policy_update_delay,
     }
-    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio, env_name, obs_dim, act_dim, act_limit, device,
+    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,
+                              env_name, obs_dim, act_dim, act_limit, device,
                               hidden_sizes, replay_size, batch_size,lr, gamma, polyak,
                               alpha, auto_alpha, target_entropy,
                               start_steps, delay_update_steps,
                               utd_ratio, num_Q, num_min, q_target_mode,
-                              policy_update_delay)
+                              policy_update_delay,
+                              args.rnd)
     
     # pbe for state entropy evaluation
     if args.state_ent:
@@ -243,6 +245,15 @@ def redq_sac(
         # set obs to next obs
         o = o2
         ep_ret += r
+        
+        # train RND predictor network, once in a epoch
+        if (t + 1) % steps_per_epoch == 0 and args.rnd:
+            agent.pred_net.train()
+            pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
+            agent.pred_net.eval()
+            
+            logger.store(PredLoss=pred_loss)
+            logger.log_tabular('PredLoss', average_only=True)
 
         if d or (ep_len == max_ep_len):
             # store episode return and length to logger
@@ -251,6 +262,10 @@ def redq_sac(
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
+            # Regularly load predictor network weights to target network for stability reasons
+            agent.pred_net_target.load_state_dict(agent.pred_net.state_dict())
+            
+            
             print(f'Retraining diffusion model at step {t + 1}')
 
             # import ipdb; ipdb.set_trace()
@@ -414,6 +429,8 @@ if __name__ == '__main__':
     parser.add_argument('--knn_avg', action='store_true', default=False) # default: True
     parser.add_argument('--knn_rms', action='store_true', default=False)
     parser.add_argument('--ent_eval_num', type=int, default=5000)
+    
+    parser.add_argument('--rnd', action='store_true', default=False)
     
     args = parser.parse_args()
     

@@ -3,9 +3,11 @@ import torch
 from redq.algos.core import (ReplayBuffer,
                              soft_update_model1_with_model2)
 from redq.algos.redq_sac import REDQSACAgent
-from synther.online.conditional_nets import Curiosity
+from synther.online.conditional_nets import Curiosity, Predictor
 from torch import Tensor
 from tqdm import trange
+
+import pdb
 
 
 def combine_two_tensors(tensor1, tensor2):
@@ -23,6 +25,14 @@ class REDQRLPDCondAgent(REDQSACAgent):
                                     hidden_size=cond_hidden_size, 
                                     output_size=self.act_dim).to(self.device)
         self.cond_optimizer = torch.optim.Adam(self.cond_net.parameters(), lr=self.lr)
+        
+        # rnd introduction
+        if self.rnd:
+            self.pred_net = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
+            self.pred_net_target = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
+            self.fix_net = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
+            
+            self.pred_optimizer = torch.optim.Adam(self.pred_net.parameters(), lr=1e-4)
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -39,6 +49,21 @@ class REDQRLPDCondAgent(REDQSACAgent):
             else:
                 action = env.action_space.sample()
         return action
+    
+    # get novelty score based on random network distillation
+    def compute_intrinsic_reward(self, next_obs):
+        # assert
+        pred_next_feature = self.pred_net(next_obs)
+        with torch.no_grad():
+            fix_next_feature = self.fix_net(next_obs)
+        fix_next_feature = fix_next_feature.detach()
+        intrinsic_reward = (fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0
+        
+        return intrinsic_reward
+    
+    def compute_intrinsic_reward_cpu(self, next_obs):
+        pass
+        
 
     def train(self, logger):
         # Put conditional net in training mode
@@ -146,10 +171,33 @@ class REDQRLPDCondAgent(REDQSACAgent):
     def sample_real_data(self, batch_size):
         return super().sample_data(batch_size)
     
+    def sample_real_data_recent(self, batch_size):
+        return super().sample_data_recent(batch_size)
+    
     def sample_real_data_cpu(self, batch_size):
         return super().sample_data_cpu(batch_size)
 
     def reset_diffusion_buffer(self):
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim,
                                              size=self.diffusion_buffer.max_size)
+        
+    def train_pred_net(self, batch_size, mask=True, update_proportion=0.25):
+        if self.pred_optimizer is not None:
+            obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor = self.sample_real_data_recent(batch_size=batch_size)
+            self.pred_optimizer.zero_grad()
+            pred_loss = self.compute_intrinsic_reward(obs_next_tensor) # .mean()
+            if mask:
+                mask_tensor = torch.rand(len(pred_loss)).to(self.device)
+                mask_tensor = (mask_tensor < update_proportion).type(torch.FloatTensor).to(self.device)
+                pred_loss = (pred_loss * mask_tensor).mean() / torch.max(mask_tensor.sum(), torch.Tensor([1.0]).to(self.device))
+            else:
+                pred_loss = pred_loss.mean()
+            # pdb.set_trace()
+            pred_loss.backward()
+            self.pred_optimizer.step()
+        else:
+            pred_loss = Tensor([0])
+        return pred_loss.detach().cpu().numpy()
+            
+              
 

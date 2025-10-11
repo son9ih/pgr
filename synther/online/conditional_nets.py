@@ -64,6 +64,7 @@ class Curiosity(nn.Module):
             Swish(),
             nn.Linear(self.hidden_size, self.hidden_size)
         )
+        
 
     @property
     def device(self):
@@ -114,3 +115,44 @@ class Curiosity(nn.Module):
         loss = F.mse_loss(real_next_state_feature.detach(), pred_next_state_feature) + F.mse_loss(action, pred_action)
         return loss
 
+
+class Predictor(nn.Module):
+    def __init__(self, input_size, output_size=8, num_hidden=4, hidden_size=32, init_w = 3e-3, b_init_value=0.1, normalize=False, return_preactivation=False):
+        super().__init__()
+        self.input_size = input_size
+        self.num_hidden = num_hidden
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+        self.hidden_activation = F.relu
+        self.output_activation = nn.Identity()
+        self.normalize = normalize
+        in_size = input_size
+        
+        self.fcs = []
+        for i in range(num_hidden):
+            fc = nn.Linear(in_size, hidden_size)
+            in_size = hidden_size
+            fc.bias.data.fill_(b_init_value)
+            self.fcs.append(fc)
+            self.add_module("fc{}".format(i), fc)
+            
+        self.last_fc = nn.Linear(in_size, output_size)
+        self.last_fc.weight.data.uniform_(-init_w, init_w)
+        self.last_fc.bias.data.uniform_(-init_w, init_w)
+        
+    def forward(self, input, returen_preactivations=False):
+        if self.normalize:
+            mean_input = input.mean(0, keepdim=True)
+            std_input = input.std(0, keepdim=True) + 1e-6
+            input = (input - mean_input) / std_input
+        h = input
+        for i, fc in enumerate(self.fcs):
+            h = fc(h)
+            h = self.hidden_activation(h)
+        preactivation = self.last_fc(h)
+        output = self.output_activation(preactivation)
+        if returen_preactivations:
+            return output, preactivation
+        else:
+            return output
+        
