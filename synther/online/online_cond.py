@@ -224,6 +224,9 @@ def redq_sac(
 
     o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
+    # One-time header registration guard for StateEnt to avoid header errors
+    state_ent_header_initialized = False
+
     for t in range(total_steps):
         # get action from agent
         a = agent.get_exploration_action(o, env)
@@ -331,18 +334,19 @@ def redq_sac(
                 seed_all(epoch)
                 
             # Evaluation of state entropy
-            # 첫 번째 에포크에서 StateEnt를 0으로 초기화하여 헤더에 포함
-            if args.state_ent:
-                if epoch % 5 == 0 and epoch > 1:
-                    # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
-                    obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
-                    intr_rew = compute_intr_reward(pbe, obs_tensor)
-                    logger.store(StateEnt=intr_rew)
-                    print(f'State Entropy: {intr_rew.mean():.4f}')
-                else:
-                    # 헤더 등록을 위해 빈 값 저장 (실제 계산은 하지 않음)
-                    logger.store(StateEnt=0.0)
+            # 헤더 고정형 로거 대비 안전장치: 최초 dump 전에 한 번만 헤더를 미리 등록
+            if args.state_ent and not state_ent_header_initialized and epoch == 0:
+                logger.log_tabular('StateEnt', val=float('nan'), average_only=True)
+                state_ent_header_initialized = True
+
+            # 매 5의 배수 epoch에서만 계산 및 로깅 (그 외에는 저장/로깅하지 않음)
+            if args.state_ent and (epoch % 5 == 0) and (epoch > 1):
+                # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
+                obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
+                intr_rew = compute_intr_reward(pbe, obs_tensor)
+                logger.store(StateEnt=intr_rew)
                 logger.log_tabular('StateEnt', average_only=True)
+                print(f'State Entropy: {intr_rew.mean():.4f}')
             
 
             """logging"""
