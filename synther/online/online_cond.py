@@ -25,6 +25,13 @@ import wandb
 from synther.online.utils import PBE, RMS, compute_intr_reward
 import pdb
 
+import copy
+import torch.optim as optim
+import torch.nn as nn
+from typing import Optional, Tuple, Union
+import math
+import pdb
+
 
 @gin.configurable
 def redq_sac(
@@ -90,6 +97,8 @@ def redq_sac(
             run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}_ctf{cond_top_frac}"
         else:
             run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}_ctf{cond_top_frac}"
+        if args.finetune:
+            run_name += f"_finetune_kl{args.kl_weight}"
         wandb.init(
             project = 'PGR',
             group = 'PGR',
@@ -264,6 +273,7 @@ def redq_sac(
             # reset environment
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
+        # Retrain diffusion model periodically, then finetune if specified
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
             # Regularly load predictor network weights to target network for stability reasons
             agent.pred_net_target.load_state_dict(agent.pred_net.state_dict())
@@ -290,6 +300,37 @@ def redq_sac(
             cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
                                                                    curr_epoch=(t // steps_per_epoch) + 1)
             agent.reset_diffusion_buffer()
+            
+            # Start diffusion fine-tuning
+            if args.finetune:
+                print(f'Fine-tuning diffusion model for {args.backprop_epochs} epochs with lr {args.finetune_lr}')
+                
+                # backprop_model = diffusion_trainer.ema.ema_model.to(device)
+                backprop_model = diffusion_trainer.model.to(device)
+                pre_trained_model = copy.deepcopy(backprop_model).to(device)
+                
+                # scheduler = DDIMScheduler(num_train_timesteps=diffusion_trainer.train_num_stpes, device=device)
+                scheduler = DDIMScheduler(num_train_timesteps=128, device=device)
+                scheduler.set_timesteps(num_inference_steps=128)
+                
+                # optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
+                optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
+                kl_weight = args.kl_weight
+                
+                for epoch in range(args.backprop_epochs):
+                    loss, reward, kl_div = fine_tune_step(pre_trained_model, backprop_model, scheduler, optimizer, kl_weight, max_grad_norm=1.0,
+                                                          device=device, compute_reward = agent.compute_intrinsic_reward,
+                                                          input_dim=diff_dims, batch_size=args.ft_batch_size,
+                                                          obs_dim=obs_dim, act_dim=act_dim)
+                    # pdb.set_trace()
+                    # if epoch % 10 == 0:
+                    #     print(f"Fine-tuning Epoch {epoch}, Loss: {loss:.4f}, Reward: {reward:.4f}, KL Div: {kl_div:.16f}")
+                    print(f"Fine-tuning Epoch {epoch}, Loss: {loss:.16f}, Reward: {reward:.16f}, KL Div: {kl_div:.16f}")  
+                
+                # After fine-tuning, sync EMA model so sampling uses updated weights
+                diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
+                print('Synced EMA model with fine-tuned weights for sampling.')
+                        
 
             # Add samples to agent replay buffer
             generator = CondDiffusionGenerator(args=args, env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
@@ -319,6 +360,21 @@ def redq_sac(
                 print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
+                
+            # # Histograms: novelty of sampling distribution followed by original, diffusion buffer
+            # if args.wandb and :
+            #     with torch.no_grad():
+            #         # Sample real data from replay buffer
+            #         real_obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=1000)
+            #         diffusion_obs_tensor, _, _, _, _ = agent.sample_diffusion_data_cpu(batch_size=1000)
+                    
+            #         real_novelty = compute_intr_reward(pbe, real_obs_tensor).cpu().numpy()
+            #         diffusion_novelty = compute_intr_reward(pbe, diffusion_obs_tensor).cpu().numpy()
+                    
+            #     wandb.log({
+            #         'RealObs_Novelty_Hist': wandb.Histogram(real_novelty),
+            #         'DiffusionObs_Novelty_Hist': wandb.Histogram(diffusion_novelty),
+            #     }, step=t + 1)
 
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
@@ -406,6 +462,170 @@ def get_time_limit(env: gym.Env):
         return get_time_limit(env.unwrapped)
     else:
         raise ValueError("Cannot find time limit for env")
+    
+
+
+def linear_beta_schedule(timesteps, start=0.0001, end=0.02):
+    return torch.linspace(start, end, timesteps)
+
+class DDIMScheduler:
+    def __init__(self, num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, device='cpu'):
+        self.num_train_timesteps = num_train_timesteps
+        
+        self.betas = linear_beta_schedule(num_train_timesteps, beta_start, beta_end).to(device)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        
+        self.final_alpha_cumprod = self.alphas_cumprod[0]
+        self.num_inference_steps = None
+        
+    def set_timesteps(self, num_inference_steps):
+        self.num_inference_steps = num_inference_steps
+        self.timesteps = torch.linspace(self.num_train_timesteps - 1, 0, num_inference_steps, dtype=torch.long)
+        
+    def _get_variance(self, timestep, prev_timestep):
+        alpha_prod_t = self.alphas_cumprod[timestep]
+        alpha_prod_t_prev = torch.where(
+            prev_timestep >= 0,
+            self.alphas_cumprod[prev_timestep],
+            self.final_alpha_cumprod
+        )
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        return variance
+    
+def _compute_gaussian_log_prob(x, mean, std):
+    """Compute log probability for Gaussian distribution."""
+    log_scale = torch.log(std)
+    return -((x - mean) ** 2) / (2 * std ** 2) - log_scale - math.log(math.sqrt(2 * math.pi))
+    
+
+    
+def ddim_step_KL(
+    scheduler: DDIMScheduler,
+    model_output: torch.FloatTensor,
+    old_model_output: torch.FloatTensor,
+    timestep: torch.LongTensor,
+    sample: torch.FloatTensor,
+    eta: float = 0.0,
+    generator=None,
+    variance_noise: Optional[torch.FloatTensor] = None,
+) -> Union[Tuple[torch.FloatTensor, torch.FloatTensor], Tuple]:
+    
+    # 1. get previous step value (=t-1)
+    prev_timestep = timestep - scheduler.num_train_timesteps // scheduler.num_inference_steps
+
+    # 2. compute alphas, betas
+    alpha_prod_t = scheduler.alphas_cumprod[timestep]
+    alpha_prod_t_prev = torch.where(
+        prev_timestep >= 0,
+        scheduler.alphas_cumprod[prev_timestep],
+        scheduler.final_alpha_cumprod
+    )
+
+    beta_prod_t = 1 - alpha_prod_t
+
+    # 3. compute predicted original sample from predicted noise
+    pred_original_sample = (sample - beta_prod_t.sqrt().unsqueeze(-1) * model_output) / alpha_prod_t.sqrt().unsqueeze(-1)
+    old_pred_original_sample = (sample - beta_prod_t.sqrt().unsqueeze(-1) * old_model_output) / alpha_prod_t.sqrt().unsqueeze(-1)
+
+    # 4. compute variance
+    variance = scheduler._get_variance(timestep, prev_timestep)
+    std_dev_t = eta * variance.sqrt()
+
+    # 5. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2).sqrt().unsqueeze(-1) * model_output
+    old_pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2).sqrt().unsqueeze(-1) * old_model_output
+
+    # 6. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+    prev_sample_mean = alpha_prod_t_prev.sqrt().unsqueeze(-1) * pred_original_sample + pred_sample_direction
+    old_prev_sample_mean = alpha_prod_t_prev.sqrt().unsqueeze(-1) * old_pred_original_sample + old_pred_sample_direction
+
+    if eta > 0 and timestep[0] > 0:
+        device = model_output.device
+        noise = torch.randn(model_output.shape, generator=generator, device=device, dtype=model_output.dtype)
+        variance = std_dev_t.unsqueeze(-1) * noise
+
+        prev_sample = prev_sample_mean + variance
+        # print((prev_sample_mean - old_prev_sample_mean))
+        kl_terms = (prev_sample_mean - old_prev_sample_mean)**2 / (2 * (std_dev_t**2).unsqueeze(-1))
+        kl_terms = kl_terms.sum(dim=-1)  # Sum over the 2D dimensions
+        # print(kl_terms)
+    else:
+        prev_sample = prev_sample_mean
+        kl_terms = torch.zeros(prev_sample_mean.size(0), device=prev_sample_mean.device)
+
+    # 7. Compute log probability
+    log_prob = _compute_gaussian_log_prob(prev_sample, prev_sample_mean, std_dev_t.unsqueeze(-1)).mean(-1)
+
+    return prev_sample, log_prob, kl_terms
+
+    
+def fine_tune_step(pre_trained_model, fine_tune_model, scheduler, optimizer, kl_weight, max_grad_norm=1.0,
+                   device='cpu', compute_reward=None,
+                   input_dim=10, batch_size=256,
+                   obs_dim: int = None, act_dim: int = None):
+    optimizer.zero_grad()
+
+    kl_loss = 0.0
+
+    # x_prev = torch.randn((256, 2)).to(device)
+    x_prev = torch.randn((batch_size, input_dim)).to(device)
+    # batch_size = x_prev.shape[0]
+    # pdb.set_trace()
+
+    for t in scheduler.timesteps:
+        t = torch.full((batch_size,), t, device=x_prev.device, dtype=torch.long)
+        cond = None
+        
+        alpha_prod_t = scheduler.alphas_cumprod[t]
+        beta_prod_t = 1 - alpha_prod_t
+        sigma_t = torch.sqrt(beta_prod_t/alpha_prod_t)
+        
+        
+        with torch.no_grad():
+            # pre_trained_noise_pred = pre_trained_model(x_prev, t.float() / scheduler.num_train_timesteps)
+            # pre_trained_noise_pred = pre_trained_model(x_prev, t.float() / scheduler.num_train_timesteps, cond)
+            # pre_trained_noise_pred = pre_trained_model.preconditioned_network_forward(x_prev, t.float() / scheduler.num_train_timesteps, cond)
+            denoised_pre = pre_trained_model.preconditioned_network_forward(x_prev, sigma_t, cond)
+    
+        # fine_tune_noise_pred = fine_tune_model(x_prev, t.float() / scheduler.num_train_timesteps)
+        # fine_tune_noise_pred = fine_tune_model(x_prev, t.float() / scheduler.num_train_timesteps, cond)
+        # fine_tune_noise_pred = fine_tune_model.preconditioned_network_forward(x_prev, t.float() / scheduler.num_train_timesteps, cond)
+        denoised_ft = fine_tune_model.preconditioned_network_forward(x_prev, sigma_t, cond)
+        
+        sqrt_alpha = alpha_prod_t.sqrt().unsqueeze(-1)
+        sqrt_beta = beta_prod_t.sqrt().unsqueeze(-1)
+        pre_trained_epsilon = (x_prev - sqrt_alpha * denoised_pre) / sqrt_beta
+        fine_tune_epsilon = (x_prev - sqrt_alpha * denoised_ft) / sqrt_beta
+    
+        # x_prev, _, kl_div = ddim_step_KL(scheduler, fine_tune_noise_pred, pre_trained_noise_pred, t, x_prev, eta=1.0)
+        x_prev, _, kl_div = ddim_step_KL(scheduler, fine_tune_epsilon, pre_trained_epsilon, t, x_prev, eta=1.0)
+        kl_loss += kl_div
+        # pdb.set_trace()
+        
+    # Compute intrinsic reward using only next_state slice from transition vector
+    if obs_dim is None or act_dim is None:
+        raise ValueError('fine_tune_step requires obs_dim and act_dim to slice next_state from x_prev')
+    next_obs_start = obs_dim + act_dim + 1
+    next_obs_end = next_obs_start + obs_dim
+    next_obs = x_prev[:, next_obs_start:next_obs_end]
+    # pdb.set_trace()
+    reward = compute_reward(next_obs)
+    # pdb.set_trace()
+    
+    loss = -reward.mean() + kl_weight * kl_loss.mean()
+    
+    loss.backward()
+
+    # Clip gradients and perform optimization step
+    nn.utils.clip_grad_norm_(fine_tune_model.parameters(), max_grad_norm)
+    optimizer.step()
+    
+    return loss.item(), reward.mean().item(), kl_loss.mean().item()
+
 
 
 if __name__ == '__main__':
@@ -436,6 +656,15 @@ if __name__ == '__main__':
     
     parser.add_argument('--rnd', action='store_true', default=False)
     
+    # finetune arguments
+    parser.add_argument('--finetune', action='store_true', default=False)
+    parser.add_argument('--backprop_epochs', type=int, default=20)
+    parser.add_argument('--finetune_lr', type=float, default=1e-4)
+    parser.add_argument('--ft_batch_size', type=int, default=256)
+    parser.add_argument('--kl_weight', type=float, default=0.1)
+    
+    
+
     args = parser.parse_args()
     
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
