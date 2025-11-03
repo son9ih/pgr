@@ -32,6 +32,8 @@ from typing import Optional, Tuple, Union
 import math
 import pdb
 
+import matplotlib.pyplot as plt
+
 
 @gin.configurable
 def redq_sac(
@@ -361,20 +363,42 @@ def redq_sac(
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
                 
-            # # Histograms: novelty of sampling distribution followed by original, diffusion buffer
-            # if args.wandb and :
-            #     with torch.no_grad():
-            #         # Sample real data from replay buffer
-            #         real_obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=1000)
-            #         diffusion_obs_tensor, _, _, _, _ = agent.sample_diffusion_data_cpu(batch_size=1000)
+            if args.histo:
+                with torch.no_grad():
+                    # Sample real data from replay buffer
+                    real_obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=5000)
+                    diffusion_obs_tensor, _, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
                     
-            #         real_novelty = compute_intr_reward(pbe, real_obs_tensor).cpu().numpy()
-            #         diffusion_novelty = compute_intr_reward(pbe, diffusion_obs_tensor).cpu().numpy()
-                    
-            #     wandb.log({
-            #         'RealObs_Novelty_Hist': wandb.Histogram(real_novelty),
-            #         'DiffusionObs_Novelty_Hist': wandb.Histogram(diffusion_novelty),
-            #     }, step=t + 1)
+                    real_novelty = agent.compute_intrinsic_reward(real_obs_tensor).cpu().numpy()
+                    diffusion_novelty = agent.compute_intrinsic_reward(diffusion_obs_tensor).cpu().numpy()
+                    # real_novelty = compute_intr_reward(pbe, real_obs_tensor).cpu().numpy()
+                    # diffusion_novelty = compute_intr_reward(pbe, diffusion_obs_tensor).cpu().numpy()
+                    # pdb.set_trace()
+                    real_novelty = agent.compute_intrinsic_reward(real_obs_tensor).cpu().numpy().squeeze()
+                    diffusion_novelty = agent.compute_intrinsic_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
+
+                # Prepare output directory
+                out_dir = os.path.join(args.results_folder, 'histograms')
+                os.makedirs(out_dir, exist_ok=True)
+                cur_epoch = t // steps_per_epoch
+
+                # Plot and save combined histogram figure
+                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                axes[0].hist(real_novelty, bins=50, color='tab:blue', alpha=0.8)
+                axes[0].set_title('Real Obs Novelty')
+                axes[0].set_xlabel('Novelty')
+                axes[0].set_ylabel('Count')
+
+                axes[1].hist(diffusion_novelty, bins=50, color='tab:orange', alpha=0.8)
+                axes[1].set_title('Diffusion Obs Novelty')
+                axes[1].set_xlabel('Novelty')
+                axes[1].set_ylabel('Count')
+
+                plt.tight_layout()
+                out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
+                fig.savefig(out_path)
+                plt.close(fig)
+                print(f'Saved novelty histogram to {out_path}')
 
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
@@ -616,7 +640,7 @@ def fine_tune_step(pre_trained_model, fine_tune_model, scheduler, optimizer, kl_
     reward = compute_reward(next_obs)
     # pdb.set_trace()
     
-    loss = -reward.mean() + kl_weight * kl_loss.mean()
+    loss = -reward.mean() * args.reward_coef + kl_weight * kl_loss.mean()
     
     loss.backward()
 
@@ -662,6 +686,9 @@ if __name__ == '__main__':
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--ft_batch_size', type=int, default=256)
     parser.add_argument('--kl_weight', type=float, default=0.1)
+    parser.add_argument('--reward_coef', type=float, default=1.0)
+    
+    parser.add_argument('--histo', action='store_true', default=False)
     
     
 

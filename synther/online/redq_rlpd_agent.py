@@ -176,6 +176,10 @@ class REDQRLPDCondAgent(REDQSACAgent):
     
     def sample_real_data_cpu(self, batch_size):
         return super().sample_data_cpu(batch_size)
+    
+    def sample_diffusion_data_cpu(self, batch_size):
+        return super().sample_diffusion_data_cpu(batch_size)
+        
 
     def reset_diffusion_buffer(self):
         self.diffusion_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim,
