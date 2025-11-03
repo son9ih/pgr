@@ -33,6 +33,7 @@ import math
 import pdb
 
 import matplotlib.pyplot as plt
+import os
 
 
 @gin.configurable
@@ -368,14 +369,12 @@ def redq_sac(
                     # Sample real data from replay buffer
                     real_obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=5000)
                     diffusion_obs_tensor, _, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
-                    
-                    real_novelty = agent.compute_intrinsic_reward(real_obs_tensor).cpu().numpy()
-                    diffusion_novelty = agent.compute_intrinsic_reward(diffusion_obs_tensor).cpu().numpy()
-                    # real_novelty = compute_intr_reward(pbe, real_obs_tensor).cpu().numpy()
-                    # diffusion_novelty = compute_intr_reward(pbe, diffusion_obs_tensor).cpu().numpy()
-                    # pdb.set_trace()
+                    # Compute novelty (squeezed)
                     real_novelty = agent.compute_intrinsic_reward(real_obs_tensor).cpu().numpy().squeeze()
                     diffusion_novelty = agent.compute_intrinsic_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
+                    # Combined 10k observations and novelty
+                    combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
+                    combined_novelty = agent.compute_intrinsic_reward(combined_obs_tensor).cpu().numpy().squeeze()
 
                 # Prepare output directory
                 out_dir = os.path.join(args.results_folder, 'histograms')
@@ -383,7 +382,7 @@ def redq_sac(
                 cur_epoch = t // steps_per_epoch
 
                 # Plot and save combined histogram figure
-                fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                fig, axes = plt.subplots(1, 3, figsize=(15, 4))
                 axes[0].hist(real_novelty, bins=50, color='tab:blue', alpha=0.8)
                 axes[0].set_title('Real Obs Novelty')
                 axes[0].set_xlabel('Novelty')
@@ -393,6 +392,11 @@ def redq_sac(
                 axes[1].set_title('Diffusion Obs Novelty')
                 axes[1].set_xlabel('Novelty')
                 axes[1].set_ylabel('Count')
+
+                axes[2].hist(combined_novelty, bins=50, color='tab:green', alpha=0.8)
+                axes[2].set_title('Combined (10k) Novelty')
+                axes[2].set_xlabel('Novelty')
+                axes[2].set_ylabel('Count')
 
                 plt.tight_layout()
                 out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
