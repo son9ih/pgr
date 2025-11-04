@@ -381,22 +381,45 @@ def redq_sac(
                 os.makedirs(out_dir, exist_ok=True)
                 cur_epoch = t // steps_per_epoch
 
-                # Plot and save combined histogram figure
-                fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-                axes[0].hist(real_novelty, bins=50, color='tab:blue', alpha=0.8)
+                # Build shared bins/ranges using the widest x-range across the three arrays
+                x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
+                x_max = float(max(real_novelty.max(), diffusion_novelty.max(), combined_novelty.max()))
+                if x_min == x_max:
+                    # avoid zero-width bins if all values are identical
+                    x_min -= 1e-6
+                    x_max += 1e-6
+                num_bins = 100
+                bins = np.linspace(x_min, x_max, num_bins + 1)
+
+                # Pre-compute counts to unify y-axis range by the maximum count among the three
+                counts_real, _ = np.histogram(real_novelty, bins=bins)
+                counts_diff, _ = np.histogram(diffusion_novelty, bins=bins)
+                counts_comb, _ = np.histogram(combined_novelty, bins=bins)
+                y_max = int(max(counts_real.max(), counts_diff.max(), counts_comb.max()))
+                # small headroom on y-axis
+                y_max = max(1, int(np.ceil(y_max * 1.05)))
+
+                # Plot and save combined histogram figure with shared axes
+                fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
+                axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
                 axes[0].set_title('Real Obs Novelty')
                 axes[0].set_xlabel('Novelty')
                 axes[0].set_ylabel('Count')
 
-                axes[1].hist(diffusion_novelty, bins=50, color='tab:orange', alpha=0.8)
+                axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
                 axes[1].set_title('Diffusion Obs Novelty')
                 axes[1].set_xlabel('Novelty')
                 axes[1].set_ylabel('Count')
 
-                axes[2].hist(combined_novelty, bins=50, color='tab:green', alpha=0.8)
+                axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
                 axes[2].set_title('Combined (10k) Novelty')
                 axes[2].set_xlabel('Novelty')
                 axes[2].set_ylabel('Count')
+
+                # Unify axis ranges across all three plots
+                for ax in axes:
+                    ax.set_xlim(bins[0], bins[-1])
+                    ax.set_ylim(0, y_max)
 
                 plt.tight_layout()
                 out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
