@@ -101,7 +101,7 @@ def redq_sac(
         else:
             run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}_ctf{cond_top_frac}"
         if args.finetune:
-            run_name += f"_finetune_kl{args.kl_weight}"
+            run_name += f"_finetune_kl{args.kl_weight}_rewcoef{args.reward_coef}"
         wandb.init(
             project = 'PGR',
             group = 'PGR',
@@ -422,6 +422,12 @@ def redq_sac(
                     ax.set_ylim(0, y_max)
 
                 plt.tight_layout()
+
+                # Optionally log to Weights & Biases
+                # if args.wandb:
+                #     wandb.log({
+                #         'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                #     }, step=t+1)
                 out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
                 fig.savefig(out_path)
                 plt.close(fig)
@@ -447,7 +453,7 @@ def redq_sac(
                 state_ent_header_initialized = True
 
             # 매 5의 배수 epoch에서만 계산 및 로깅 (그 외에는 저장/로깅하지 않음)
-            if args.state_ent and (epoch % 5 == 0) and (epoch > 1):
+            if args.state_ent and (epoch % args.state_ent_every == 0) and (epoch > 1):
                 # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
                 obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
                 intr_rew = compute_intr_reward(pbe, obs_tensor)
@@ -699,6 +705,7 @@ if __name__ == '__main__':
     parser.add_argument('--synther', action='store_true', default=False)
     
     parser.add_argument('--state_ent', action='store_true', default=False)
+    parser.add_argument('--state_ent_every', type=int, default=5)
     parser.add_argument('--knn_clip', type=float, default=0.0)
     parser.add_argument('--knn_k', type=int, default=5)
     parser.add_argument('--knn_avg', action='store_true', default=False) # default: True
