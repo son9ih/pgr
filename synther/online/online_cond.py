@@ -83,6 +83,7 @@ def redq_sac(
         n_mc_cutoff=350,
         reseed_each_epoch=True,
         args=None,
+        run_name=None
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,28 +97,12 @@ def redq_sac(
     seed = args.seed
     
     disable_diffusion = args.disable_diffusion
+    run_name = run_name
     
     if args.wandb:
-        # REDQ
-        if args.disable_diffusion:
-            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_eval{args.ent_eval_num}_REDQ"
-        else:
-            if args.synther:
-                run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}"
-                # Ours
-                if args.finetune:
-                    run_name += f"_finetune_kl{args.kl_weight}_rewcoef{args.reward_coef}_ft_lr{args.finetune_lr}_Ours"
-                # SER
-                else:
-                    run_name += "_SER"
-            else:
-                # PGRrnd
-                if args.rnd:
-                    run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_PGRrnd"
-                # PGR
-                else:
-                    run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_PGR"
-        args.results_folder = run_name
+        
+                    
+        # args.results_folder = run_name
 
         wandb.init(
             project = f'{env_name}',
@@ -749,11 +734,34 @@ if __name__ == '__main__':
     
     parser.add_argument('--disable_diffusion', action='store_true', default=False)
     
-    
 
     args = parser.parse_args()
     
-    args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
+    
+    # REDQ
+    if args.disable_diffusion:
+        run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_eval{args.ent_eval_num}_REDQ"
+    else:
+        if args.synther:
+            run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}"
+            # Ours
+            if args.finetune:
+                run_name += f"_finetune_kl{args.kl_weight}_rewcoef{args.reward_coef}_ft_lr{args.finetune_lr}_Ours"
+            # SER
+            else:
+                run_name += "_SER"
+        else:
+            # PGRrnd
+            if args.rnd:
+                run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_PGRrnd"
+            # PGR
+            else:
+                run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_PGR"
+                
+                
+    
+    # args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
+    args.results_folder = f'./{args.results_folder}/{args.results_folder}_{run_name}'
     print(args.results_folder)
     if not os.path.exists(args.results_folder):
         os.makedirs(args.results_folder)
@@ -763,4 +771,4 @@ if __name__ == '__main__':
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
     # args를 한번에 넘기는게 좋음
-    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args)
+    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args, run_name=run_name)
