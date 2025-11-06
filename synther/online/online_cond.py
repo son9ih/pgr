@@ -385,7 +385,7 @@ def redq_sac(
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
                 
-            if args.histo:
+            if args.histo and args.rnd:
                 with torch.no_grad():
                     # Sample real data from replay buffer
                     real_obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=5000)
