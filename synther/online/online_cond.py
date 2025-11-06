@@ -95,13 +95,30 @@ def redq_sac(
     # set seed
     seed = args.seed
     
+    disable_diffusion = args.disable_diffusion
+    
     if args.wandb:
-        if args.synther:
-            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}_ctf{cond_top_frac}"
+        # REDQ
+        if args.disable_diffusion:
+            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_eval{args.ent_eval_num}_REDQ"
         else:
-            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_knn{args.knn_k}_avg{args.knn_avg}_rms{args.knn_rms}_ctf{cond_top_frac}"
-        if args.finetune:
-            run_name += f"_finetune_kl{args.kl_weight}_rewcoef{args.reward_coef}"
+            if args.synther:
+                run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}"
+                # Ours
+                if args.finetune:
+                    run_name += f"_finetune_kl{args.kl_weight}_rewcoef{args.reward_coef}_ft_lr{args.finetune_lr}_Ours"
+                # SER
+                else:
+                    run_name += "_SER"
+            else:
+                # PGRrnd
+                if args.rnd:
+                    run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_PGRrnd"
+                # PGR
+                else:
+                    run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_PGR"
+                
+            
         wandb.init(
             project = 'PGR',
             group = 'PGR',
@@ -300,7 +317,11 @@ def redq_sac(
                 args=args,
             )
             diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
-            cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
+            if not args.rnd:
+                cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
+                                                                   curr_epoch=(t // steps_per_epoch) + 1)
+            else:
+                cond_distri = diffusion_trainer.train_from_redq_buffer_rnd(agent.replay_buffer, agent, top_frac=cond_top_frac,
                                                                    curr_epoch=(t // steps_per_epoch) + 1)
             agent.reset_diffusion_buffer()
             
@@ -424,10 +445,11 @@ def redq_sac(
                 plt.tight_layout()
 
                 # Optionally log to Weights & Biases
-                # if args.wandb:
-                #     wandb.log({
-                #         'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
-                #     }, step=t+1)
+                if args.wandb:
+                    wandb.log({
+                        'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                    # }, step=t+1)novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                    })
                 out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
                 fig.savefig(out_path)
                 plt.close(fig)
@@ -722,7 +744,10 @@ if __name__ == '__main__':
     parser.add_argument('--kl_weight', type=float, default=0.1)
     parser.add_argument('--reward_coef', type=float, default=1.0)
     
+    # histogram arguments
     parser.add_argument('--histo', action='store_true', default=False)
+    
+    parser.add_argument('--disable_diffusion', action='store_true', default=False)
     
     
 
