@@ -117,11 +117,11 @@ def redq_sac(
                 # PGR
                 else:
                     run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_cfg{cfg_scale}_eval{args.ent_eval_num}_PGR"
-                
-            
+        args.results_folder = run_name
+
         wandb.init(
-            project = 'PGR',
-            group = 'PGR',
+            project = f'{env_name}',
+            group = f'{run_name.split("_")[-1]}',
             name = run_name,
             config={
                 "env_name": env_name,
