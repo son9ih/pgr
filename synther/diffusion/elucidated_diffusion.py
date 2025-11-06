@@ -17,6 +17,8 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from torch import Tensor
+
 
 # helpers
 def exists(val):
@@ -685,6 +687,7 @@ class CondDistri_RND(object):
     def __init__(self, agent, train_batch_size, buffer, top_frac):
         self.top_frac = top_frac
         self.buffer = buffer
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         # Iterate over buffer and generate the conditional generation signal
         self.irews_buf = np.zeros_like(buffer.rews_buf)
@@ -697,6 +700,7 @@ class CondDistri_RND(object):
             rewards = self.buffer.rews_buf[idxs][:, None]
             done = self.buffer.done_buf[idxs][:, None]
             with torch.no_grad():
+                next_obs = Tensor(next_obs).to(self.device)
                 self.irews_buf[idxs] = agent.compute_intrinsic_reward(next_obs).squeeze().cpu().numpy()
         
         self.top_frac_indices = np.argsort(self.irews_buf, axis=0)[-int(top_frac * buffer.size):]

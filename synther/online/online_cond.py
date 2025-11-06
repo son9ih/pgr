@@ -295,8 +295,9 @@ def redq_sac(
 
         # Retrain diffusion model periodically, then finetune if specified
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
-            # Regularly load predictor network weights to target network for stability reasons
-            agent.pred_net_target.load_state_dict(agent.pred_net.state_dict())
+            if args.rnd:
+                # Regularly load predictor network weights to target network for stability reasons
+                agent.pred_net_target.load_state_dict(agent.pred_net.state_dict())
             
             
             print(f'Retraining diffusion model at step {t + 1}')
@@ -375,8 +376,7 @@ def redq_sac(
                 print('Buffer stats:')
                 for i in range(observations.shape[1]):
                     print(f'Diffusion Obs {i}: {np.mean(observations[:, i]):.2f} {np.std(observations[:, i]):.2f}')
-                    print(
-                        f'     Real Obs {i}: {np.mean(real_observations[:, i]):.2f} {np.std(real_observations[:, i]):.2f}')
+                    print(f'     Real Obs {i}: {np.mean(real_observations[:, i]):.2f} {np.std(real_observations[:, i]):.2f}')
                 for i in range(actions.shape[1]):
                     print(f'Diffusion Action {i}: {np.mean(actions[:, i]):.2f} {np.std(actions[:, i]):.2f}')
                     print(f'     Real Action {i}: {np.mean(real_actions[:, i]):.2f} {np.std(real_actions[:, i]):.2f}')
