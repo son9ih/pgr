@@ -237,7 +237,6 @@ class TanhGaussianPolicy(Mlp):
         return (
             action * self.action_limit, mean, log_std, log_prob, std, pre_tanh_value,
         )
-
 def soft_update_model1_with_model2(model1, model2, rou):
     """
     used to polyak update a target network

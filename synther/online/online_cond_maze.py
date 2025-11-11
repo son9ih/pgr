@@ -58,8 +58,8 @@ def redq_sac(
         alpha=0.2,
         auto_alpha=True,
         target_entropy='mbpo',
-        # start_steps=5000,
-        start_steps=1000,
+        start_steps=5000,
+        # start_steps=1000,
         delay_update_steps='auto',
         utd_ratio=20,
         num_Q=10,
@@ -253,8 +253,9 @@ def redq_sac(
 
     epc = 0
    
-
+    print("Starting training!")
     for t in range(total_steps):
+        print(t)
         episode_end = False
         # get action from agent
         a = agent.get_exploration_action(o, env)
@@ -584,7 +585,8 @@ def wrap_gym_maze(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
                 np.array([0.5, 0.5]),   # Bottom-left - reward 4
                 np.array([8.5, 8.5]),   # Top-right - reward 5
             ]
-            self.goal_rewards = [2.0, 3.0, 4.0, 5.0]
+            # self.goal_rewards = [2.0, 3.0, 4.0, 5.0]
+            self.goal_rewards = [0.2, 0.3, 0.4, 0.5]
             self.goal_threshold = 0.5  # Distance threshold to consider goal reached
             
             # Center position for initial state (approximate for Medium maze)
@@ -612,7 +614,7 @@ def wrap_gym_maze(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
                 agent_pos = obs[:2]
             
             # Check if agent reached any goal
-            custom_reward = 0.0
+            custom_reward = 0.1
             for goal_pos, goal_reward in zip(self.goal_positions, self.goal_rewards):
                 distance = np.linalg.norm(agent_pos - goal_pos)
                 if distance < self.goal_threshold:

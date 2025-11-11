@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.distributions import Distribution, Normal
+import pdb
 # following SAC authors' and OpenAI implementation
 LOG_SIG_MAX = 2
 LOG_SIG_MIN = -20
@@ -208,8 +209,10 @@ class TanhGaussianPolicy(Mlp):
         :param return_log_prob: If True, return a sample and its log probability
         """
         h = obs
+        # pdb.set_trace()
         for fc_layer in self.hidden_layers:
             h = self.hidden_activation(fc_layer(h))
+        # pdb.set_trace()
         mean = self.last_fc_layer(h)
 
         log_std = self.last_fc_log_std(h)

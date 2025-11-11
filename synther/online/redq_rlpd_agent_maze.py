@@ -1,8 +1,8 @@
 import numpy as np
 import torch
-from redq.algos.core import (ReplayBuffer,
+from redq.algos.core_maze import (ReplayBuffer,
                              soft_update_model1_with_model2)
-from redq.algos.redq_sac import REDQSACAgent
+from redq.algos.redq_sac_maze import REDQSACAgent
 from synther.online.conditional_nets import Curiosity, Predictor
 from torch import Tensor
 from tqdm import trange
@@ -43,12 +43,24 @@ class REDQRLPDCondAgent(REDQSACAgent):
         with torch.no_grad():
             if self.get_current_num_data() > self.start_steps:
                 obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
+                # pdb.set_trace()
                 action_tensor = self.policy_net.forward(obs_tensor, deterministic=False,
+                # action_tensor = self.policy_net.forward(obs_tensor, deterministic=True,
                                              return_log_prob=False)[0]
+                # pdb.set_trace()
                 action = action_tensor.cpu().numpy().reshape(-1)
             else:
                 action = env.action_space.sample()
         return action
+    
+    # def get_test_action(self, obs):
+    #     # given an observation, output a deterministic action in numpy form
+    #     with torch.no_grad():
+    #         obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
+    #         action_tensor = self.policy_net.forward(obs_tensor, deterministic=True,
+    #                                      return_log_prob=False)[0]
+    #         action = action_tensor.cpu().numpy().reshape(-1)
+    #     return action
     
     # get novelty score based on random network distillation
     def compute_intrinsic_reward(self, next_obs):
@@ -73,6 +85,7 @@ class REDQRLPDCondAgent(REDQSACAgent):
         num_update = 0 if self.get_current_num_data() <= self.delay_update_steps else self.utd_ratio
         for i_update in range(num_update):
             obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor = self.sample_data(self.batch_size)
+            # Error because of obs tensor is unsqueezed, tensor?
             
             """Q loss"""
             y_q, sample_idxs = self.get_redq_q_target_no_grad(obs_next_tensor, rews_tensor, done_tensor)
@@ -91,6 +104,7 @@ class REDQRLPDCondAgent(REDQSACAgent):
             """policy and alpha loss"""
             if ((i_update + 1) % self.policy_update_delay == 0) or i_update == num_update - 1:
                 # get policy loss
+                # pdb.set_trace()
                 a_tilda, mean_a_tilda, log_std_a_tilda, log_prob_a_tilda, _, pretanh = self.policy_net.forward(obs_tensor)
                 q_a_tilda_list = []
                 for sample_idx in range(self.num_Q):
@@ -102,6 +116,9 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 policy_loss = (self.alpha * log_prob_a_tilda - ave_q).mean()
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
+                # exploding problem
+                # torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=0.000001)
+            
                 for sample_idx in range(self.num_Q):
                     self.q_net_list[sample_idx].requires_grad_(True)
 
