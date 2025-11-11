@@ -217,13 +217,14 @@ class REDQRLPDCondAgent(REDQSACAgent):
             # by default only log for the last update out of <num_update> updates
             if i_update == num_update - 1:
                 logger.store(LossCond=cond_loss.cpu().item(), LossPi=policy_loss.cpu().item(), LossQ1=q_loss_all.cpu().item() / self.num_Q,
-                             LossAlpha=alpha_loss.cpu().item(), Q1Vals=q_prediction.detach().cpu().numpy(),
-                             Alpha=self.alpha, LogPi=log_prob_a_tilda.detach().cpu().numpy(),
+                             LossAlpha=alpha_loss.cpu().item(), Q1Vals=q_prediction.detach().cpu().numpy().flatten(),
+                             Alpha=self.alpha, LogPi=log_prob_a_tilda.detach().cpu().numpy().flatten(),
                              PreTanh=pretanh.abs().detach().cpu().numpy().reshape(-1))
 
-        # if there is no update, log 0 to prevent logging problems
+        # if there is no update, log dummy values as single-element arrays to prevent logging problems
         if num_update == 0:
-            logger.store(LossCond=0, LossPi=0, LossQ1=0, LossAlpha=0, Q1Vals=0, Alpha=0, LogPi=0, PreTanh=0)
+            logger.store(LossCond=0, LossPi=0, LossQ1=0, LossAlpha=0, 
+                        Q1Vals=np.array([0.0]), Alpha=0, LogPi=np.array([0.0]), PreTanh=np.array([0.0]))
 
     def sample_data(self, batch_size):
         diffusion_batch_size = int(batch_size * self.diffusion_sample_ratio)
