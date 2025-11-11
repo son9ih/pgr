@@ -44,7 +44,7 @@ def redq_sac(
         seed=3,
         epochs=-1,
         steps_per_epoch=1000,
-        max_ep_len=1000,
+        max_ep_len=300,
         n_evals_per_epoch=1,
         logger_kwargs=dict(),
         # following are agent related hyperparameters
@@ -249,8 +249,7 @@ def redq_sac(
     o, _ = env.reset()  # gymnasium returns (obs, info)
     r, d, ep_ret, ep_len = 0, False, 0, 0
 
-    # One-time header registration guard for StateEnt to avoid header errors
-    state_ent_header_initialized = False
+    epc = 0
 
     for t in range(total_steps):
         # get action from agent
@@ -274,6 +273,7 @@ def redq_sac(
         elif ep_len >= max_ep_len:
             # Max episode length reached - treat as truncation, not termination
             d = False
+            epc += 1
         else:
             d = False
         
@@ -296,7 +296,8 @@ def redq_sac(
             ep_ret += r
         
         # train RND predictor network, once in a epoch
-        if (t + 1) % steps_per_epoch == 0 and args.rnd:
+        # if (t + 1) % steps_per_epoch == 0 and args.rnd:
+        if terminated or (ep_len >= max_ep_len):
             agent.pred_net.train()
             pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
             agent.pred_net.eval()
@@ -308,13 +309,15 @@ def redq_sac(
         # This ensures proper reset when goal is reached in PointMaze
 
         # Retrain diffusion model periodically, then finetune if specified
-        if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
+        # if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
+        if not disable_diffusion and (epc*1000) % retrain_diffusion_every == 0 and (epc * 1000) >= diffusion_start and ep_len == 0:
             if args.rnd:
                 # Regularly load predictor network weights to target network for stability reasons
                 agent.pred_net_target.load_state_dict(agent.pred_net.state_dict())
             
             
-            print(f'Retraining diffusion model at step {t + 1}')
+            # print(f'Retraining diffusion model at step {t + 1}')
+            print(f'Retraining diffusion model at end of epoch [{epc}]')
 
             # import ipdb; ipdb.set_trace()
 
@@ -334,10 +337,12 @@ def redq_sac(
             diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
             if not args.rnd:
                 cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
-                                                                   curr_epoch=(t // steps_per_epoch) + 1)
+                                                                #    curr_epoch=(t // steps_per_epoch) + 1)
+                                                                curr_epoch=epc)
             else:
                 cond_distri = diffusion_trainer.train_from_redq_buffer_rnd(agent.replay_buffer, agent, top_frac=cond_top_frac,
-                                                                   curr_epoch=(t // steps_per_epoch) + 1)
+                                                                #    curr_epoch=(t // steps_per_epoch) + 1)
+                                                                curr_epoch=epc)
             agent.reset_diffusion_buffer()
             
             # Start diffusion fine-tuning
@@ -414,7 +419,8 @@ def redq_sac(
                 # Prepare output directory
                 out_dir = os.path.join(args.results_folder, 'histograms')
                 os.makedirs(out_dir, exist_ok=True)
-                cur_epoch = t // steps_per_epoch
+                # cur_epoch = t // steps_per_epoch
+                cur_epoch = epc
 
                 # Build shared bins/ranges using the widest x-range across the three arrays
                 x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
@@ -470,8 +476,10 @@ def redq_sac(
                 print(f'Saved novelty histogram to {out_path}')
 
         # End of epoch wrap-up
-        if (t + 1) % steps_per_epoch == 0:
-            epoch = t // steps_per_epoch
+        # if (t + 1) % steps_per_epoch == 0:
+        if terminated or (ep_len >= max_ep_len):
+            # epoch = t // steps_per_epoch
+            epoch = epc
 
             # Test the performance of the deterministic version of the agent.
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
@@ -483,19 +491,20 @@ def redq_sac(
                 seed_all(epoch)
                 
             # Evaluation of state entropy
-            # 헤더 고정형 로거 대비 안전장치: 최초 dump 전에 한 번만 헤더를 미리 등록
-            if args.state_ent and not state_ent_header_initialized and epoch == 0:
-                logger.log_tabular('StateEnt', val=float('nan'), average_only=True)
-                state_ent_header_initialized = True
-
-            # 매 5의 배수 epoch에서만 계산 및 로깅 (그 외에는 저장/로깅하지 않음)
-            if args.state_ent and (epoch % args.state_ent_every == 0) and (epoch > 1):
-                # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
-                obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
-                intr_rew = compute_intr_reward(pbe, obs_tensor)
-                logger.store(StateEnt=intr_rew)
+            # StateEnt는 state_ent가 활성화되었을 때만 로깅되며,
+            # 실제 계산은 state_ent_every 주기마다만 수행
+            if args.state_ent:
+                if (epoch % args.state_ent_every == 0) and (epoch >= 0):
+                    # 실제로 계산하는 epoch
+                    obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
+                    intr_rew = compute_intr_reward(pbe, obs_tensor)
+                    logger.store(StateEnt=intr_rew)
+                    print(f'State Entropy: {intr_rew.mean():.4f}')
+                else:
+                    # 계산하지 않는 epoch에는 빈 배열 저장 (평균값 NaN으로 표시)
+                    logger.store(StateEnt=np.array([]))
+                
                 logger.log_tabular('StateEnt', average_only=True)
-                print(f'State Entropy: {intr_rew.mean():.4f}')
             
 
             """logging"""
