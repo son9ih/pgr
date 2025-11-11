@@ -21,7 +21,7 @@ from redq.utils.run_utils import setup_logger_kwargs
 from synther.diffusion.elucidated_diffusion import REDQCondTrainer
 from synther.diffusion.diffusion_generator import CondDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model
-from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
+from synther.online.redq_rlpd_agent_maze import REDQRLPDCondAgent
 
 import wandb
 from synther.online.utils import PBE, RMS, compute_intr_reward
@@ -44,6 +44,7 @@ def redq_sac(
         seed=3,
         epochs=-1,
         steps_per_epoch=1000,
+        # steps_per_epoch=300,
         max_ep_len=300,
         n_evals_per_epoch=1,
         logger_kwargs=dict(),
@@ -57,7 +58,8 @@ def redq_sac(
         alpha=0.2,
         auto_alpha=True,
         target_entropy='mbpo',
-        start_steps=5000,
+        # start_steps=5000,
+        start_steps=1000,
         delay_update_steps='auto',
         utd_ratio=20,
         num_Q=10,
@@ -250,8 +252,10 @@ def redq_sac(
     r, d, ep_ret, ep_len = 0, False, 0, 0
 
     epc = 0
+   
 
     for t in range(total_steps):
+        episode_end = False
         # get action from agent
         a = agent.get_exploration_action(o, env)
         # Step the env, get next observation, reward and done signal
@@ -270,6 +274,7 @@ def redq_sac(
         if terminated:
             # Goal reached - this is a real termination
             d = True
+            epc += 1
         elif ep_len >= max_ep_len:
             # Max episode length reached - treat as truncation, not termination
             d = False
@@ -285,9 +290,13 @@ def redq_sac(
         
         # Check if episode should end (goal reached or max length)
         if terminated or (ep_len >= max_ep_len):
+            episode_end = True
             # store episode return and length to logger
+            ep_ret += r  # add last reward
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             # reset environment for new episode
+            
+            # 이걸 logging 끝난 다음에 해야하는 이유는 ep_len이 0이 되기 때문
             o, _ = env.reset()  # gymnasium returns (obs, info)
             r, d, ep_ret, ep_len = 0, False, 0, 0
         else:
@@ -297,7 +306,8 @@ def redq_sac(
         
         # train RND predictor network, once in a epoch
         # if (t + 1) % steps_per_epoch == 0 and args.rnd:
-        if terminated or (ep_len >= max_ep_len):
+        # if terminated or (ep_len >= max_ep_len):
+        if episode_end:
             agent.pred_net.train()
             pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
             agent.pred_net.eval()
@@ -310,7 +320,7 @@ def redq_sac(
 
         # Retrain diffusion model periodically, then finetune if specified
         # if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
-        if not disable_diffusion and (epc*1000) % retrain_diffusion_every == 0 and (epc * 1000) >= diffusion_start and ep_len == 0:
+        if not disable_diffusion and (epc*1000) % retrain_diffusion_every == 0 and (epc * 1000) >= diffusion_start and episode_end :
             if args.rnd:
                 # Regularly load predictor network weights to target network for stability reasons
                 agent.pred_net_target.load_state_dict(agent.pred_net.state_dict())
@@ -477,7 +487,8 @@ def redq_sac(
 
         # End of epoch wrap-up
         # if (t + 1) % steps_per_epoch == 0:
-        if terminated or (ep_len >= max_ep_len):
+        # if terminated or (ep_len >= max_ep_len):
+        if episode_end:
             # epoch = t // steps_per_epoch
             epoch = epc
 
