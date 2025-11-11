@@ -210,10 +210,50 @@ class REDQSACAgent(object):
         with torch.no_grad():
             if self.q_target_mode == 'min':
                 """Q target is min of a subset of Q values"""
+                # ✅ 체크: obs_next_tensor
+                if torch.isnan(obs_next_tensor).any() or torch.isinf(obs_next_tensor).any():
+                    print(f"[ERROR] NaN/Inf in obs_next_tensor")
+                    print(f"obs_next_tensor: {obs_next_tensor}")
+                    raise ValueError("NaN in next observation")
+                
                 a_tilda_next, _, _, log_prob_a_tilda_next, _, _ = self.policy_net.forward(obs_next_tensor)
+                
+                # ✅ 체크: policy output (next action)
+                if torch.isnan(a_tilda_next).any() or torch.isinf(a_tilda_next).any():
+                    print(f"[ERROR] NaN/Inf in a_tilda_next (policy output for next state)")
+                    print(f"a_tilda_next: {a_tilda_next}")
+                    print(f"log_prob: {log_prob_a_tilda_next}")
+                    # Policy network 파라미터 체크
+                    print("[DEBUG] Checking policy network parameters:")
+                    for name, param in self.policy_net.named_parameters():
+                        if torch.isnan(param).any():
+                            print(f"  NaN in policy parameter: {name}")
+                        if torch.isinf(param).any():
+                            print(f"  Inf in policy parameter: {name}")
+                        # 파라미터 통계
+                        print(f"  {name}: min={param.min().item():.4f}, max={param.max().item():.4f}, mean={param.mean().item():.4f}")
+                    
+                    # obs_next_tensor 확인
+                    print(f"[DEBUG] obs_next_tensor stats: min={obs_next_tensor.min()}, max={obs_next_tensor.max()}, mean={obs_next_tensor.mean()}")
+                    
+                    raise ValueError("NaN in policy next action")
+                
                 q_prediction_next_list = []
                 for sample_idx in sample_idxs:
                     q_prediction_next = self.q_target_net_list[sample_idx](torch.cat([obs_next_tensor, a_tilda_next], 1))
+                    
+                    # ✅ 체크: Q-target prediction
+                    if torch.isnan(q_prediction_next).any() or torch.isinf(q_prediction_next).any():
+                        print(f"[ERROR] NaN/Inf in q_target_net[{sample_idx}] prediction")
+                        print(f"q_prediction_next: {q_prediction_next}")
+                        print(f"obs_next_tensor stats: min={obs_next_tensor.min()}, max={obs_next_tensor.max()}")
+                        print(f"a_tilda_next stats: min={a_tilda_next.min()}, max={a_tilda_next.max()}")
+                        # Q target network 파라미터 체크
+                        for name, param in self.q_target_net_list[sample_idx].named_parameters():
+                            if torch.isnan(param).any():
+                                print(f"  NaN in q_target_net[{sample_idx}] parameter: {name}")
+                        raise ValueError(f"NaN in Q target network {sample_idx}")
+                    
                     q_prediction_next_list.append(q_prediction_next)
                 q_prediction_next_cat = torch.cat(q_prediction_next_list, 1)
                 min_q, min_indices = torch.min(q_prediction_next_cat, dim=1, keepdim=True)

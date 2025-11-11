@@ -196,6 +196,14 @@ def redq_sac(
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
     # we need .item() to convert it from numpy float to python float
     act_limit = env.action_space.high[0].item()
+    
+    # ✅ FIX: Handle infinite action limits (common in PointMaze/continuous control)
+    if np.isinf(act_limit):
+        print(f"[WARNING] Action space has infinite bounds. Setting act_limit to 1.0")
+        act_limit = 1.0
+    
+    print(f"Action limit: {act_limit}")
+    
     # keep track of run time
     start_time = time.time()
     # flush logger (optional)
@@ -574,6 +582,10 @@ def wrap_gym_maze(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     - Non-goal transitions: reward 0
     """
     
+    # ✅ IMPORTANT: Apply RescaleAction FIRST to ensure bounded action space
+    if rescale_actions:
+        env = gym.wrappers.RescaleAction(env, -1, 1)
+    
     class MazeCustomWrapper(gym.Wrapper):
         def __init__(self, env):
             super().__init__(env)
@@ -630,8 +642,9 @@ def wrap_gym_maze(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     # Apply custom wrapper
     env = MazeCustomWrapper(env)
     
-    if rescale_actions:
-        env = gym.wrappers.RescaleAction(env, -1, 1)
+    # ✅ RescaleAction already applied at the beginning
+    # if rescale_actions:
+    #     env = gym.wrappers.RescaleAction(env, -1, 1)
 
     if isinstance(env.observation_space, gym.spaces.Dict):
         env = FlattenObservation(env)

@@ -43,11 +43,9 @@ class REDQRLPDCondAgent(REDQSACAgent):
         with torch.no_grad():
             if self.get_current_num_data() > self.start_steps:
                 obs_tensor = torch.Tensor(obs).unsqueeze(0).to(self.device)
-                # pdb.set_trace()
                 action_tensor = self.policy_net.forward(obs_tensor, deterministic=False,
                 # action_tensor = self.policy_net.forward(obs_tensor, deterministic=True,
                                              return_log_prob=False)[0]
-                # pdb.set_trace()
                 action = action_tensor.cpu().numpy().reshape(-1)
             else:
                 action = env.action_space.sample()
@@ -87,25 +85,73 @@ class REDQRLPDCondAgent(REDQSACAgent):
             obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor = self.sample_data(self.batch_size)
             # Error because of obs tensor is unsqueezed, tensor?
             
+            # ✅ 체크포인트 1: 샘플링된 데이터 확인
+            if torch.isnan(obs_tensor).any():
+                print(f"[ERROR] NaN in obs_tensor at update {i_update}")
+                print(f"Replay buffer size: {self.replay_buffer.size}")
+                raise ValueError("NaN in observation data")
+            if torch.isnan(acts_tensor).any():
+                print(f"[ERROR] NaN in acts_tensor at update {i_update}")
+                raise ValueError("NaN in action data")
+            
             """Q loss"""
             y_q, sample_idxs = self.get_redq_q_target_no_grad(obs_next_tensor, rews_tensor, done_tensor)
+            
+            # ✅ 체크포인트 2: Q-target 확인
+            if torch.isnan(y_q).any() or torch.isinf(y_q).any():
+                print(f"[ERROR] NaN/Inf in y_q at update {i_update}")
+                print(f"y_q: {y_q}")
+                print(f"rews_tensor: {rews_tensor.mean()}, max: {rews_tensor.max()}")
+                raise ValueError("NaN in Q target")
             q_prediction_list = []
             for q_i in range(self.num_Q):
                 q_prediction = self.q_net_list[q_i](torch.cat([obs_tensor, acts_tensor], 1))
+                
+                # ✅ 체크포인트 3: Q-prediction 확인
+                if torch.isnan(q_prediction).any():
+                    print(f"[ERROR] NaN in Q{q_i} prediction at update {i_update}")
+                    # Q network 파라미터 체크
+                    for name, param in self.q_net_list[q_i].named_parameters():
+                        if torch.isnan(param).any():
+                            print(f"  NaN in Q{q_i} parameter: {name}")
+                    raise ValueError(f"NaN in Q{q_i} network")
+                
                 q_prediction_list.append(q_prediction)
             q_prediction_cat = torch.cat(q_prediction_list, dim=1)
             y_q = y_q.expand((-1, self.num_Q)) if y_q.shape[1] == 1 else y_q
             q_loss_all = self.mse_criterion(q_prediction_cat, y_q) * self.num_Q
+            
+            # ✅ 체크포인트 4: Q-loss 확인
+            if torch.isnan(q_loss_all).any():
+                print(f"[ERROR] NaN in q_loss at update {i_update}")
+                raise ValueError("NaN in Q loss")
 
             for q_i in range(self.num_Q):
                 self.q_optimizer_list[q_i].zero_grad()
             q_loss_all.backward()
+            
+            # ✅ 체크포인트 5: Q-gradient 확인
+            for q_i in range(self.num_Q):
+                for name, param in self.q_net_list[q_i].named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        print(f"[ERROR] NaN in Q{q_i} gradient: {name}")
+                        raise ValueError("NaN in Q gradient")
 
             """policy and alpha loss"""
             if ((i_update + 1) % self.policy_update_delay == 0) or i_update == num_update - 1:
                 # get policy loss
-                # pdb.set_trace()
                 a_tilda, mean_a_tilda, log_std_a_tilda, log_prob_a_tilda, _, pretanh = self.policy_net.forward(obs_tensor)
+                
+                # ✅ 체크포인트 6: Policy output 확인
+                if torch.isnan(mean_a_tilda).any():
+                    print(f"[ERROR] NaN in policy mean at update {i_update}")
+                    print(f"obs_tensor stats: min={obs_tensor.min()}, max={obs_tensor.max()}, mean={obs_tensor.mean()}")
+                    # Policy network 파라미터 체크
+                    for name, param in self.policy_net.named_parameters():
+                        if torch.isnan(param).any():
+                            print(f"  NaN in policy parameter: {name}")
+                    raise ValueError("NaN in policy network output")
+                
                 q_a_tilda_list = []
                 for sample_idx in range(self.num_Q):
                     self.q_net_list[sample_idx].requires_grad_(False)
@@ -113,6 +159,15 @@ class REDQRLPDCondAgent(REDQSACAgent):
                     q_a_tilda_list.append(q_a_tilda)
                 q_a_tilda_cat = torch.cat(q_a_tilda_list, 1)
                 ave_q = torch.mean(q_a_tilda_cat, dim=1, keepdim=True)
+                
+                # ✅ 체크포인트 7: Ave Q 확인
+                if torch.isnan(ave_q).any() or torch.isinf(ave_q).any():
+                    print(f"[ERROR] NaN/Inf in ave_q at update {i_update}")
+                    print(f"ave_q: {ave_q}")
+                    for idx, q_val in enumerate(q_a_tilda_list):
+                        print(f"  Q{idx}: {q_val.mean()}")
+                    raise ValueError("NaN in average Q value")
+                
                 policy_loss = (self.alpha * log_prob_a_tilda - ave_q).mean()
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()

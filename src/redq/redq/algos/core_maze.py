@@ -214,10 +214,24 @@ class TanhGaussianPolicy(Mlp):
             h = self.hidden_activation(fc_layer(h))
         # pdb.set_trace()
         mean = self.last_fc_layer(h)
+        
+        # ✅ DEBUG: Check mean before clamp
+        if torch.isnan(mean).any() or torch.isinf(mean).any():
+            print(f"[ERROR] mean has NaN/Inf BEFORE clamp: {mean}")
+            print(f"h stats: min={h.min()}, max={h.max()}, mean={h.mean()}")
+            raise ValueError("Mean has NaN/Inf before clamp")
+        
+        # ✅ Safety: Clamp mean to prevent extreme values
+        mean = torch.clamp(mean, -10.0, 10.0)
 
         log_std = self.last_fc_log_std(h)
         log_std = torch.clamp(log_std, LOG_SIG_MIN, LOG_SIG_MAX)
         std = torch.exp(log_std)
+        
+        # ✅ DEBUG: Check std
+        if torch.isnan(std).any() or torch.isinf(std).any():
+            print(f"[ERROR] std has NaN/Inf: {std}")
+            raise ValueError("Std has NaN/Inf")
 
         normal = Normal(mean, std)
 
@@ -226,7 +240,20 @@ class TanhGaussianPolicy(Mlp):
             action = torch.tanh(mean)
         else:
             pre_tanh_value = normal.rsample()
+            # ✅ DEBUG: Check pre_tanh_value
+            if torch.isnan(pre_tanh_value).any() or torch.isinf(pre_tanh_value).any():
+                print(f"[ERROR] pre_tanh_value has NaN/Inf: {pre_tanh_value}")
+                print(f"mean: {mean}")
+                print(f"std: {std}")
+                raise ValueError("Pre-tanh value has NaN/Inf")
+                
             action = torch.tanh(pre_tanh_value)
+            
+            # ✅ DEBUG: Check action after tanh
+            if torch.isnan(action).any() or torch.isinf(action).any():
+                print(f"[ERROR] action has NaN/Inf AFTER tanh: {action}")
+                print(f"pre_tanh_value: {pre_tanh_value}")
+                raise ValueError("Action has NaN/Inf after tanh")
 
         if return_log_prob:
             log_prob = normal.log_prob(pre_tanh_value)
@@ -235,10 +262,17 @@ class TanhGaussianPolicy(Mlp):
         else:
             log_prob = None
         
-        # 계속 pre_tanh_value가 높게 나오니까 action이 1로만 나오는 중
+        # ✅ DEBUG: Check final output
+        final_action = action * self.action_limit
+        if torch.isnan(final_action).any() or torch.isinf(final_action).any():
+            print(f"[ERROR] final_action has NaN/Inf")
+            print(f"action (after tanh): {action}")
+            print(f"self.action_limit: {self.action_limit}")
+            print(f"final_action: {final_action}")
+            raise ValueError("Final action has NaN/Inf")
 
         return (
-            action * self.action_limit, mean, log_std, log_prob, std, pre_tanh_value,
+            final_action, mean, log_std, log_prob, std, pre_tanh_value,
         )
 
 def soft_update_model1_with_model2(model1, model2, rou):
