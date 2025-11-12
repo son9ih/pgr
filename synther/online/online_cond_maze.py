@@ -316,7 +316,7 @@ def redq_sac(
         # train RND predictor network, once in a epoch
         # if (t + 1) % steps_per_epoch == 0 and args.rnd:
         # if terminated or (ep_len >= max_ep_len):
-        if episode_end:
+        if episode_end and args.rnd:
             agent.pred_net.train()
             pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
             agent.pred_net.eval()
@@ -493,6 +493,205 @@ def redq_sac(
                 fig.savefig(out_path)
                 plt.close(fig)
                 print(f'Saved novelty histogram to {out_path}')
+                
+            if args.rnd:
+                # Visualize density map of data sampled from replay buffer, diffusion buffer, and data combined
+                # Important: Get raw unnormalized data directly from buffers
+                
+                # Get real data from replay buffer (unnormalized)
+                ptr_real = agent.replay_buffer.ptr
+                if ptr_real > 5000:
+                    # Sample 5000 random indices
+                    indices_real = np.random.choice(ptr_real, 5000, replace=False)
+                else:
+                    indices_real = np.arange(ptr_real)
+                real_positions = agent.replay_buffer.obs1_buf[indices_real, :2]  # First 2 dims are x, y
+                
+                # Get diffusion data from diffusion buffer (unnormalized)
+                ptr_diff = agent.diffusion_buffer.ptr
+                if ptr_diff > 5000:
+                    indices_diff = np.random.choice(ptr_diff, 5000, replace=False)
+                else:
+                    indices_diff = np.arange(ptr_diff)
+                diffusion_positions = agent.diffusion_buffer.obs1_buf[indices_diff, :2]
+                
+                # Print statistics
+                print(f"Real positions - X: min={real_positions[:, 0].min():.3f}, max={real_positions[:, 0].max():.3f}, mean={real_positions[:, 0].mean():.3f}")
+                print(f"Real positions - Y: min={real_positions[:, 1].min():.3f}, max={real_positions[:, 1].max():.3f}, mean={real_positions[:, 1].mean():.3f}")
+                print(f"Diffusion positions - X: min={diffusion_positions[:, 0].min():.3f}, max={diffusion_positions[:, 0].max():.3f}, mean={diffusion_positions[:, 0].mean():.3f}")
+                print(f"Diffusion positions - Y: min={diffusion_positions[:, 1].min():.3f}, max={diffusion_positions[:, 1].max():.3f}, mean={diffusion_positions[:, 1].mean():.3f}")
+                
+                combined_positions = np.vstack([real_positions, diffusion_positions])
+                
+                # Prepare output directory
+                map_dir = os.path.join(args.results_folder, 'density_maps')
+                os.makedirs(map_dir, exist_ok=True)
+                cur_epoch = epc
+                
+                # Define maze bounds (for PointMaze_Medium-v3)
+                x_min, x_max = 0.0, 9.0
+                y_min, y_max = 0.0, 9.0
+                
+                # Create 2D histogram (density map) with shared bins
+                bins_2d = 50  # Number of bins for 2D histogram
+                
+                # Compute histograms for all three datasets
+                hist_real, xedges, yedges = np.histogram2d(
+                    real_positions[:, 0], real_positions[:, 1],
+                    bins=bins_2d, range=[[x_min, x_max], [y_min, y_max]]
+                )
+                hist_diff, _, _ = np.histogram2d(
+                    diffusion_positions[:, 0], diffusion_positions[:, 1],
+                    bins=bins_2d, range=[[x_min, x_max], [y_min, y_max]]
+                )
+                hist_comb, _, _ = np.histogram2d(
+                    combined_positions[:, 0], combined_positions[:, 1],
+                    bins=bins_2d, range=[[x_min, x_max], [y_min, y_max]]
+                )
+                
+                # Find shared color scale (vmax) for consistency
+                vmax = max(hist_real.max(), hist_diff.max(), hist_comb.max())
+                
+                # Define MEDIUM_MAZE structure from gymnasium_robotics
+                # 1 = wall, 0 = open space
+                MEDIUM_MAZE = [
+                    [1, 1, 1, 1, 1, 1, 1, 1],
+                    [1, 0, 0, 1, 1, 0, 0, 1],
+                    [1, 0, 0, 1, 0, 0, 0, 1],
+                    [1, 1, 0, 0, 0, 1, 1, 1],
+                    [1, 0, 0, 1, 0, 0, 0, 1],
+                    [1, 0, 1, 0, 0, 1, 0, 1],
+                    [1, 0, 0, 0, 1, 0, 0, 1],
+                    [1, 1, 1, 1, 1, 1, 1, 1]
+                ]
+                
+                # Create wall mask for visualization
+                # Each cell in the maze is 1 unit, with 0.5 padding on each side
+                maze_array = np.array(MEDIUM_MAZE)
+                # Flip vertically because imshow uses bottom-left origin
+                maze_array = np.flip(maze_array, axis=0)
+                
+                # Initial position - center of open area (adjusted from maze structure)
+                # Looking at MEDIUM_MAZE, good open space is around (1-2, 1-2) -> (1.5-2.5, 1.5-2.5) in coordinates
+                initial_pos = (2.0, 2.0)  # Safe position away from walls
+                
+                # Goal positions - adjusted to be in center of open cells, away from walls
+                # Based on MEDIUM_MAZE structure [row, col] where 0 = open
+                goal_positions = [
+                    (1.8, 6.5),   # Top-left open area (row 1, col 1-2)
+                    (6.5, 6.5),   # Top-right open area (row 1, col 5-6)
+                    (2.0, 1.5),   # Bottom-left open area (row 6, col 1-2)
+                    (6.5, 2.0),   # Bottom-right open area (row 4, col 5-6)
+                ]
+                
+                # Plot density maps side by side
+                fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+                
+                # Real data density map
+                im0 = axes[0].imshow(hist_real.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                                     cmap='Blues', aspect='auto', vmin=0, vmax=vmax, alpha=0.8)
+                axes[0].set_title('Real Data Density')
+                axes[0].set_xlabel('X Position')
+                axes[0].set_ylabel('Y Position')
+                plt.colorbar(im0, ax=axes[0], label='Count')
+                
+                # Draw walls as thick gray rectangles
+                # Each cell is 1x1 unit starting from (0.5, 0.5)
+                for i in range(8):
+                    for j in range(8):
+                        if maze_array[i, j] == 1:  # Wall
+                            # Create rectangle for wall cell
+                            rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
+                                                linewidth=0, edgecolor='none', 
+                                                facecolor='gray', alpha=0.7, zorder=3)
+                            axes[0].add_patch(rect)
+                
+                # Mark initial position
+                axes[0].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
+                               edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
+                
+                # Mark goal positions
+                for idx, (goal_x, goal_y) in enumerate(goal_positions):
+                    axes[0].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
+                                   edgecolors='darkred', linewidths=1.5, zorder=4,
+                                   label='Goal' if idx == 0 else '')
+                axes[0].legend(loc='upper left', fontsize=10)
+                axes[0].set_xlim(x_min, x_max)
+                axes[0].set_ylim(y_min, y_max)
+                
+                # Diffusion data density map
+                im1 = axes[1].imshow(hist_diff.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                                     cmap='Oranges', aspect='auto', vmin=0, vmax=vmax, alpha=0.8)
+                axes[1].set_title('Diffusion Data Density')
+                axes[1].set_xlabel('X Position')
+                axes[1].set_ylabel('Y Position')
+                plt.colorbar(im1, ax=axes[1], label='Count')
+                
+                # Draw walls as thick gray rectangles
+                for i in range(8):
+                    for j in range(8):
+                        if maze_array[i, j] == 1:  # Wall
+                            rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
+                                                linewidth=0, edgecolor='none', 
+                                                facecolor='gray', alpha=0.7, zorder=3)
+                            axes[1].add_patch(rect)
+                
+                # Mark initial position
+                axes[1].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
+                               edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
+                
+                for idx, (goal_x, goal_y) in enumerate(goal_positions):
+                    axes[1].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
+                                   edgecolors='darkred', linewidths=1.5, zorder=4,
+                                   label='Goal' if idx == 0 else '')
+                axes[1].legend(loc='upper left', fontsize=10)
+                axes[1].set_xlim(x_min, x_max)
+                axes[1].set_ylim(y_min, y_max)
+                
+                # Combined data density map
+                im2 = axes[2].imshow(hist_comb.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                                     cmap='Greens', aspect='auto', vmin=0, vmax=vmax, alpha=0.8)
+                axes[2].set_title('Combined (10k) Density')
+                axes[2].set_xlabel('X Position')
+                axes[2].set_ylabel('Y Position')
+                plt.colorbar(im2, ax=axes[2], label='Count')
+                
+                # Draw walls as thick gray rectangles
+                for i in range(8):
+                    for j in range(8):
+                        if maze_array[i, j] == 1:  # Wall
+                            rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
+                                                linewidth=0, edgecolor='none', 
+                                                facecolor='gray', alpha=0.7, zorder=3)
+                            axes[2].add_patch(rect)
+                
+                # Mark initial position
+                axes[2].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
+                               edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
+                
+                for idx, (goal_x, goal_y) in enumerate(goal_positions):
+                    axes[2].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
+                                   edgecolors='darkred', linewidths=1.5, zorder=4,
+                                   label='Goal' if idx == 0 else '')
+                axes[2].legend(loc='upper left', fontsize=10)
+                axes[2].set_xlim(x_min, x_max)
+                axes[2].set_ylim(y_min, y_max)
+                
+                plt.tight_layout()
+                
+                # Save figure
+                map_path = os.path.join(map_dir, f'density_map_epoch{cur_epoch:04d}.png')
+                fig.savefig(map_path, dpi=150)
+                print(f'Saved density map to {map_path}')
+                
+                # Log to Weights & Biases
+                if args.wandb:
+                    wandb.log({
+                        'images/density_map': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                    })
+                
+                plt.close(fig)
+                
 
         # End of epoch wrap-up
         # if (t + 1) % steps_per_epoch == 0:
@@ -589,20 +788,20 @@ def wrap_gym_maze(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     class MazeCustomWrapper(gym.Wrapper):
         def __init__(self, env):
             super().__init__(env)
-            # Define 4 goal positions at maze edges (approximate positions)
-            # Adjust these based on actual maze size - these are for Medium maze
+            # Define 4 goal positions - updated to match visualization positions
+            # Based on MEDIUM_MAZE structure, goals are in center of open cells
             self.goal_positions = [
-                np.array([0.5, 8.5]),   # Top - reward 2
-                np.array([8.5, 0.5]),   # Right - reward 3
-                np.array([0.5, 0.5]),   # Bottom-left - reward 4
-                np.array([8.5, 8.5]),   # Top-right - reward 5
+                np.array([1.8, 6.5]),   # Top-left open area - reward 3
+                np.array([6.5, 6.5]),   # Top-right open area - reward 4
+                np.array([2.0, 1.5]),   # Bottom-left open area - reward 2
+                np.array([6.5, 2.0]),   # Bottom-right open area - reward 5
             ]
-            self.goal_rewards = [2.0, 3.0, 4.0, 5.0]
+            self.goal_rewards = [3.0, 4.0, 2.0, 5.0]
             # self.goal_rewards = [0.2, 0.3, 0.4, 0.5]
             self.goal_threshold = 0.5  # Distance threshold to consider goal reached
             
-            # Center position for initial state (approximate for Medium maze)
-            self.initial_position = np.array([4.5, 4.5])
+            # Initial position - center of open area (matches visualization)
+            self.initial_position = np.array([2.0, 2.0])
             
         def reset(self, **kwargs):
             # gymnasium returns (obs, info) tuple
@@ -872,6 +1071,8 @@ if __name__ == '__main__':
     
     parser.add_argument('--disable_diffusion', action='store_true', default=False)
     
+    # parser.add_argument('--map', action='store_true', default=False)
+    # parser.add_argument('--num_map_points', type=int, default=3000)
 
     args = parser.parse_args()
     
