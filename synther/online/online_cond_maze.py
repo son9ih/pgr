@@ -52,7 +52,7 @@ def redq_sac(
         # steps_per_epoch=300,
         # max_ep_len=300,
         # 학습 과정에서 에이전트가 truncated (500스텝 도달)되는 비율보다 terminated (골 도달)되는 비율이 훨씬 높아진다면, 그때 이 값을 300 정도로 줄여서 학습 효율을 높이는 것을 고려해 볼 수 있습니다.
-        max_ep_len=1000,
+        max_ep_len=200,
         n_evals_per_epoch=1,
         logger_kwargs=dict(),
         # following are agent related hyperparameters
@@ -609,6 +609,14 @@ def redq_sac(
                     [1, 0, 0, 0, 1, 0, 0, 1],
                     [1, 1, 1, 1, 1, 1, 1, 1]
                 ]
+                # MEDIUM_MAZE = [
+                #     [0, 0, 1, 1, 0, 0],
+                #     [0, 0, 1, 0, 0, 0],
+                #     [1, 0, 0, 0, 1, 1],
+                #     [0, 0, 1, 0, 0, 0],
+                #     [0, 1, 0, 0, 1, 0],
+                #     [0, 0, 0, 1, 0, 0],
+                # ]
                 
                 # Initial and goal positions in Mujoco coordinates
                 initial_pos = (0.295, 0.306)  # Center cell [3,4]
@@ -623,9 +631,70 @@ def redq_sac(
                 def draw_maze_overlay(ax):
                     """
                     Draw maze walls and markers in Mujoco coordinate system.
-                    Note: We'll draw a simplified representation since exact wall 
-                    positions in Mujoco coords would require more detailed mapping.
+                    Uses grid-to-Mujoco coordinate transformation based on empirical data.
                     """
+                    wall_color = '#404080'  # Dark blue-gray (similar to reference image)
+                    
+                    # Grid-to-Mujoco transformation parameters
+                    # Based on empirical data from map_all_maze_cells.py:
+                    # Grid [0,0] is top-left, Mujoco has center around (0, 0)
+                    # Each grid cell is approximately 1.0 Mujoco unit
+                    # Grid spans [0,7] in both dimensions
+                    # Mujoco spans approximately [-3, 3] in both dimensions
+                    
+                    # Transformation: Mujoco = grid_to_mujoco(grid_row, grid_col)
+                    # Approximate linear mapping:
+                    # x_mujoco ≈ (col - 3.5) * 0.93  (cols 0-7 map to x: -3.3 to 3.3)
+                    # y_mujoco ≈ (3.5 - row) * 0.99  (rows 0-7 map to y: 3.5 to -3.5, flipped)
+                    # Optimized parameters from empirical data (26 open cells):
+                    # Mean error: 0.18 units, Max error: 0.34 units
+                    
+                    # x_scale = 0.9998
+                    # y_scale = 0.9921
+                    # x_offset = 3.5036
+                    # y_offset = 3.4891
+                    # cell_size = 0.93  # Approximate Mujoco size per grid cell
+                    
+                    # Only draw interior walls (exclude outer boundary)
+                    # Actual playable area is 6x6 interior, excluding i=0,7 and j=0,7
+                    
+                    # ++++++++++++++++++++++++++++++++++++++++++++++
+                    # for i in range(1, 7):  # Skip outermost rows (0 and 7)
+                    #     for j in range(1, 7):  # Skip outermost cols (0 and 7)
+                    #         if MEDIUM_MAZE[i][j] == 1:  # Wall
+                    #             # Transform grid coordinates to Mujoco coordinates
+                    #             # Grid: i=row (0 at top), j=col (0 at left)
+                    #             # Mujoco: x increases right, y increases up
+                    #             # Transform: (col-4)*0.75 for x, (4-row)*0.75 for y (flip y-axis)
+                    #             x_mujoco = (j - 4) * 0.75
+                    #             y_mujoco = (4 - i) * 0.75  # Flip y-axis
+                    #             rect = patches.Rectangle(
+                    #                 (x_mujoco, y_mujoco), 0.75, 0.75,
+                    #                 linewidth=0, facecolor=wall_color, 
+                    #                 alpha=1.0, zorder=1
+                    #             )
+                    #             ax.add_patch(rect)
+                    # ++++++++++++++++++++++++++++++++++++++++++++++
+                    
+                    # Draw walls using grid-based iteration (similar to reference code)
+                    # for i in range(8):
+                    #     for j in range(8):
+                    #         if MEDIUM_MAZE[i][j] == 1:  # Wall cell
+                    #             # Convert grid cell (i, j) to Mujoco coordinates
+                    #             x_mujoco, y_mujoco = grid_to_mujoco(i, j)
+                                
+                    #             # Draw rectangle at Mujoco position
+                    #             # Rectangle bottom-left corner is (x_mujoco - cell_size/2, y_mujoco - cell_size/2)
+                    #             rect = patches.Rectangle(
+                    #                 (x_mujoco - cell_size/2, y_mujoco - cell_size/2), 
+                    #                 cell_size, cell_size,
+                    #                 linewidth=0, 
+                    #                 facecolor=wall_color, 
+                    #                 alpha=1.0, 
+                    #                 zorder=1
+                    #             )
+                    #             ax.add_patch(rect)
+                    
                     # Mark initial position
                     ax.scatter(initial_pos[0], initial_pos[1], c='cyan', marker='^', s=200, 
                             edgecolors='black', linewidths=1.5, label='Start (S)', zorder=5)
@@ -933,8 +1002,9 @@ class MazeCustomWrapper(gym.Wrapper):
             np.array([2.458, 2.739]),    # Grid [1,6] - Top-left
             np.array([2.524, -2.475]),   # Grid [6,6] - Top-right
         ]
-        self.goal_rewards = [1.0, 1.2, 1.6, 1.4]
-        self.goal_threshold = 0.5  # Distance threshold in Mujoco units
+        self.goal_rewards = [1.2, 1.4, 1.0, 1.6]
+        # self.goal_threshold = 0.5  # Distance threshold in Mujoco units
+        self.goal_threshold = 0.2  # Distance threshold in Mujoco units
         
         # Initial position - center cell [3, 4] -> Mujoco [0.295, 0.306]
         self.initial_position_coord = np.array([0.295, 0.306])
