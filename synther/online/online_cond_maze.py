@@ -161,6 +161,25 @@ def redq_sac(
 
     """set up environment and seeding"""
     gym.register_envs(gymnasium_robotics)
+    
+    # ========================================================================
+    # DEBUG: Check raw environment observation space BEFORE wrappers
+    # ========================================================================
+    raw_env = gym.make(env_name, max_episode_steps=100)
+    print("=" * 80)
+    print("DEBUG: RAW ENVIRONMENT (before any wrappers)")
+    print("=" * 80)
+    print(f"Raw observation space: {raw_env.observation_space}")
+    if isinstance(raw_env.observation_space, gym.spaces.Dict):
+        for key, space in raw_env.observation_space.spaces.items():
+            print(f"  '{key}': {space}")
+            if hasattr(space, 'low') and hasattr(space, 'high'):
+                print(f"    low:  {space.low}")
+                print(f"    high: {space.high}")
+    print("=" * 80)
+    raw_env.close()
+    # ========================================================================
+    
     env = gym.make(env_name, max_episode_steps=100)
     
     # env_fn = lambda: wrap_gym(gym.make(env_name))
@@ -268,6 +287,11 @@ def redq_sac(
 
     o, _ = env.reset()  # gymnasium returns (obs, info)
     print("Starting training! from observation :", o)
+    print(f"Initial observation shape: {o.shape}")
+    print(f"Observation space after all wrappers: {env.observation_space}")
+    if hasattr(env.observation_space, 'low') and hasattr(env.observation_space, 'high'):
+        print(f"Obs space low: {env.observation_space.low}")
+        print(f"Obs space high: {env.observation_space.high}")
     r, d, ep_ret, ep_len = 0, False, 0, 0
 
     epc = 0
@@ -548,13 +572,13 @@ def redq_sac(
                 os.makedirs(map_dir, exist_ok=True)
                 cur_epoch = epc
                 
-                # Define maze bounds (for PointMaze_Medium-v3)
-                x_min, x_max = 0.0, 8.0
-                y_min, y_max = 0.0, 8.0
+                # Define maze bounds for PointMaze_Medium-v3 (Mujoco coordinates)
+                # Based on empirical observation: roughly [-3, 3] for both x and y
+                x_min, x_max = -3.0, 3.0
+                y_min, y_max = -3.0, 3.0
                 
                 # Create 2D histogram (density map) with shared bins
-                # 맵 크기를 고려해서 bins가 나눠떨어지게 bins를 조절해야함, 유념
-                bins_2d = 80  # Number of bins for 2D histogram
+                bins_2d = 60  # Number of bins for 2D histogram
                 
                 # Compute histograms for all three datasets
                 hist_real, xedges, yedges = np.histogram2d(
@@ -586,46 +610,22 @@ def redq_sac(
                     [1, 1, 1, 1, 1, 1, 1, 1]
                 ]
                 
-                # Create wall mask for visualization
-                # Each cell in the maze is 1 unit, with 0.5 padding on each side
-                maze_array = np.array(MEDIUM_MAZE)
-                # Flip vertically because imshow uses bottom-left origin
-                maze_array = np.flip(maze_array, axis=0)
+                # Initial and goal positions in Mujoco coordinates
+                initial_pos = (0.295, 0.306)  # Center cell [3,4]
                 
-                # Initial position - center of open area (adjusted from maze structure)
-                # Looking at MEDIUM_MAZE, good open space is around (1-2, 1-2) -> (1.5-2.5, 1.5-2.5) in coordinates
-                # initial_pos = (2.0, 2.0)  # Safe position away from walls
-                initial_pos = (4.5, 3.5)
-                # initial_pos = (3.0, 4.0)
-                
-                # Goal positions - adjusted to be in center of open cells, away from walls
-                # Based on MEDIUM_MAZE structure [row, col] where 0 = open
-                # goal_positions = [
-                #     (1.8, 6.5),   # Top-left open area (row 1, col 1-2)
-                #     (6.5, 6.5),   # Top-right open area (row 1, col 5-6)
-                #     (2.0, 1.5),   # Bottom-left open area (row 6, col 1-2)
-                #     (6.5, 2.0),   # Bottom-right open area (row 4, col 5-6)
-                # ]
                 goal_positions = [
-                        (1.5, 1.5), 
-                        (6.5, 1.5), 
-                        (1.5, 6.5), 
-                        (6.5, 6.5)
-                    ]      
+                    (-2.624, 2.291),   # Grid [1,1] - Bottom-left
+                    (-2.705, -2.668),  # Grid [6,1] - Bottom-right  
+                    (2.458, 2.739),    # Grid [1,6] - Top-left
+                    (2.524, -2.475),   # Grid [6,6] - Top-right
+                ]
                 
                 def draw_maze_overlay(ax):
-                    wall_color = '#404080' # (첨부 이미지와 유사한 어두운 파란/회색)
-                    
-                    # ✅ 수정된 벽 그리기 로직 (틈새 없음)
-                    for i in range(8):
-                        for j in range(8):
-                            if MEDIUM_MAZE[i][j] == 1:  # Wall
-                                # (x, y) = (j, i)
-                                rect = patches.Rectangle((j, i), 1, 1, 
-                                                        linewidth=0, facecolor=wall_color, 
-                                                        alpha=1.0, zorder=1)
-                                ax.add_patch(rect)
-                    
+                    """
+                    Draw maze walls and markers in Mujoco coordinate system.
+                    Note: We'll draw a simplified representation since exact wall 
+                    positions in Mujoco coords would require more detailed mapping.
+                    """
                     # Mark initial position
                     ax.scatter(initial_pos[0], initial_pos[1], c='cyan', marker='^', s=200, 
                             edgecolors='black', linewidths=1.5, label='Start (S)', zorder=5)
@@ -638,8 +638,8 @@ def redq_sac(
                     
                     ax.set_xlim(x_min, x_max)
                     ax.set_ylim(y_min, y_max)
-                    ax.set_xlabel('X Position')
-                    ax.set_ylabel('Y Position')
+                    ax.set_xlabel('X Position (Mujoco)')
+                    ax.set_ylabel('Y Position (Mujoco)')
                     ax.set_aspect('equal')
                 # =========================================================================
                 # ======================== Plotting Section ==============================
@@ -919,30 +919,25 @@ class SelectObservationWrapper(gym.ObservationWrapper):
 class MazeCustomWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        # Define 4 goal positions - updated to match visualization positions
-        # Based on MEDIUM_MAZE structure, goals are in center of open cells
-        # self.goal_positions = [
-        #     np.array([1.8, 6.5]),   # Top-left open area - reward 3
-        #     np.array([6.5, 6.5]),   # Top-right open area - reward 4
-        #     np.array([2.0, 1.5]),   # Bottom-left open area - reward 2
-        #     np.array([6.5, 2.0]),   # Bottom-right open area - reward 5
-        # ]
-        # self.goal_rewards = [3.0, 4.0, 2.0, 5.0]
+        # Define 4 goal positions using ACTUAL Mujoco coordinates
+        # Mapped from grid cells to Mujoco coordinate system:
+        # Grid [row, col] -> Mujoco [x, y]
+        # [1, 1] (bottom-left) -> [-2.624, 2.291]
+        # [6, 1] (bottom-right) -> [-2.705, -2.668]
+        # [1, 6] (top-left) -> [2.458, 2.739]
+        # [6, 6] (top-right) -> [2.524, -2.475]
+        
         self.goal_positions = [
-            np.array([1.5, 1.5]),  # G(2.0)
-            np.array([6.5, 1.5]),  # G(3.0)
-            np.array([6.5, 6.5]),  # G(4.0)
-            np.array([1.5, 6.5]),  # G(5.0)
+            np.array([-2.624, 2.291]),   # Grid [1,1] - Bottom-left
+            np.array([-2.705, -2.668]),  # Grid [6,1] - Bottom-right  
+            np.array([2.458, 2.739]),    # Grid [1,6] - Top-left
+            np.array([2.524, -2.475]),   # Grid [6,6] - Top-right
         ]
         self.goal_rewards = [1.0, 1.2, 1.6, 1.4]
-        # self.goal_rewards = [0.2, 0.3, 0.4, 0.5]
-        # self.goal_threshold = 0.5  # Distance threshold to consider goal reached
-        self.goal_threshold = 0.5
+        self.goal_threshold = 0.5  # Distance threshold in Mujoco units
         
-        # Initial position - center of open area (matches visualization)
-        # self.initial_position = np.array([2.0, 2.0])
-        # self. initial_position = np.array([4.5, 3.5])
-        self.initial_position_coord = np.array([4.5, 3.5])
+        # Initial position - center cell [3, 4] -> Mujoco [0.295, 0.306]
+        self.initial_position_coord = np.array([0.295, 0.306])
         self.initial_position_cell = np.array([3, 4])   
         
     def reset(self, **kwargs):
@@ -969,6 +964,13 @@ class MazeCustomWrapper(gym.Wrapper):
         else:
             # If flattened, position is usually first 2 dimensions
             agent_pos = obs[:2]
+        
+        # ========================================================================
+        # DEBUG: Print to understand Mujoco coordinate system
+        # ========================================================================
+        # Uncomment to debug coordinate system:
+        # print(f"DEBUG step: agent_pos={agent_pos}, goal_positions={self.goal_positions[0]}")
+        # ========================================================================
         
         # Check if agent reached any goal
         # custom_reward = -0.1
