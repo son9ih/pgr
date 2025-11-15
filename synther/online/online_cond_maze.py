@@ -37,6 +37,11 @@ import pdb
 import matplotlib.pyplot as plt
 import os
 
+import matplotlib.patches as patches
+import numpy as np
+
+from gymnasium.spaces import Box, Dict
+
 
 @gin.configurable
 def redq_sac(
@@ -45,7 +50,9 @@ def redq_sac(
         epochs=-1,
         steps_per_epoch=1000,
         # steps_per_epoch=300,
-        max_ep_len=300,
+        # max_ep_len=300,
+        # 학습 과정에서 에이전트가 truncated (500스텝 도달)되는 비율보다 terminated (골 도달)되는 비율이 훨씬 높아진다면, 그때 이 값을 300 정도로 줄여서 학습 효율을 높이는 것을 고려해 볼 수 있습니다.
+        max_ep_len=1000,
         n_evals_per_epoch=1,
         logger_kwargs=dict(),
         # following are agent related hyperparameters
@@ -87,7 +94,8 @@ def redq_sac(
         n_mc_cutoff=350,
         reseed_each_epoch=True,
         args=None,
-        run_name=None
+        run_name=None,
+        algorithm=None,
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -202,7 +210,9 @@ def redq_sac(
         print(f"[WARNING] Action space has infinite bounds. Setting act_limit to 1.0")
         act_limit = 1.0
     
-    print(f"Action limit: {act_limit}")
+    # print(f"Action limit: {act_limit}")
+    print(f'obs_dim: {obs_dim}, act_dim: {act_dim}, act_limit: {act_limit}')
+    print(f'observation space: {env.observation_space}, action space: {env.action_space}')
     
     # keep track of run time
     start_time = time.time()
@@ -257,6 +267,7 @@ def redq_sac(
         skip_dims = []
 
     o, _ = env.reset()  # gymnasium returns (obs, info)
+    print("Starting training! from observation :", o)
     r, d, ep_ret, ep_len = 0, False, 0, 0
 
     epc = 0
@@ -270,6 +281,7 @@ def redq_sac(
         # Step the env, get next observation, reward and done signal
         # gymnasium returns (obs, reward, terminated, truncated, info)
         o2, r, terminated, truncated, _ = env.step(a)
+        # print(o2)
         d = terminated or truncated  # combine terminated and truncated into done
 
         # Important for PointMaze: 
@@ -307,6 +319,7 @@ def redq_sac(
             
             # 이걸 logging 끝난 다음에 해야하는 이유는 ep_len이 0이 되기 때문
             o, _ = env.reset()  # gymnasium returns (obs, info)
+            print("Starting new episode! from observation :", o)
             r, d, ep_ret, ep_len = 0, False, 0, 0
         else:
             # Continue episode
@@ -422,7 +435,8 @@ def redq_sac(
                 print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
-                
+            
+            # Drawing histograms of novelty
             if args.histo and args.rnd:
                 with torch.no_grad():
                     # Sample real data from replay buffer
@@ -448,7 +462,7 @@ def redq_sac(
                     # avoid zero-width bins if all values are identical
                     x_min -= 1e-6
                     x_max += 1e-6
-                num_bins = 100
+                num_bins = 50
                 bins = np.linspace(x_min, x_max, num_bins + 1)
 
                 # Pre-compute counts to unify y-axis range by the maximum count among the three
@@ -493,11 +507,16 @@ def redq_sac(
                 fig.savefig(out_path)
                 plt.close(fig)
                 print(f'Saved novelty histogram to {out_path}')
-                
+            
+            
+            
+            
+            # Visualize density map of data sampled from replay buffer, diffusion buffer, and data combined
+            # if there is no diffusion data, skip and return only real data map
+            # what i reaally want to do is to draw sampling distributions for evaluation
             if args.rnd:
-                # Visualize density map of data sampled from replay buffer, diffusion buffer, and data combined
-                # Important: Get raw unnormalized data directly from buffers
                 
+                # Important: Get raw unnormalized data directly from buffers
                 # Get real data from replay buffer (unnormalized)
                 ptr_real = agent.replay_buffer.ptr
                 if ptr_real > 5000:
@@ -523,17 +542,19 @@ def redq_sac(
                 
                 combined_positions = np.vstack([real_positions, diffusion_positions])
                 
+                
                 # Prepare output directory
                 map_dir = os.path.join(args.results_folder, 'density_maps')
                 os.makedirs(map_dir, exist_ok=True)
                 cur_epoch = epc
                 
                 # Define maze bounds (for PointMaze_Medium-v3)
-                x_min, x_max = 0.0, 9.0
-                y_min, y_max = 0.0, 9.0
+                x_min, x_max = 0.0, 8.0
+                y_min, y_max = 0.0, 8.0
                 
                 # Create 2D histogram (density map) with shared bins
-                bins_2d = 50  # Number of bins for 2D histogram
+                # 맵 크기를 고려해서 bins가 나눠떨어지게 bins를 조절해야함, 유념
+                bins_2d = 80  # Number of bins for 2D histogram
                 
                 # Compute histograms for all three datasets
                 hist_real, xedges, yedges = np.histogram2d(
@@ -550,7 +571,7 @@ def redq_sac(
                 )
                 
                 # Find shared color scale (vmax) for consistency
-                vmax = max(hist_real.max(), hist_diff.max(), hist_comb.max())
+                # vmax = max(hist_real.max(), hist_diff.max(), hist_comb.max())
                 
                 # Define MEDIUM_MAZE structure from gymnasium_robotics
                 # 1 = wall, 0 = open space
@@ -573,124 +594,217 @@ def redq_sac(
                 
                 # Initial position - center of open area (adjusted from maze structure)
                 # Looking at MEDIUM_MAZE, good open space is around (1-2, 1-2) -> (1.5-2.5, 1.5-2.5) in coordinates
-                initial_pos = (2.0, 2.0)  # Safe position away from walls
+                # initial_pos = (2.0, 2.0)  # Safe position away from walls
+                initial_pos = (4.5, 3.5)
+                # initial_pos = (3.0, 4.0)
                 
                 # Goal positions - adjusted to be in center of open cells, away from walls
                 # Based on MEDIUM_MAZE structure [row, col] where 0 = open
+                # goal_positions = [
+                #     (1.8, 6.5),   # Top-left open area (row 1, col 1-2)
+                #     (6.5, 6.5),   # Top-right open area (row 1, col 5-6)
+                #     (2.0, 1.5),   # Bottom-left open area (row 6, col 1-2)
+                #     (6.5, 2.0),   # Bottom-right open area (row 4, col 5-6)
+                # ]
                 goal_positions = [
-                    (1.8, 6.5),   # Top-left open area (row 1, col 1-2)
-                    (6.5, 6.5),   # Top-right open area (row 1, col 5-6)
-                    (2.0, 1.5),   # Bottom-left open area (row 6, col 1-2)
-                    (6.5, 2.0),   # Bottom-right open area (row 4, col 5-6)
-                ]
+                        (1.5, 1.5), 
+                        (6.5, 1.5), 
+                        (1.5, 6.5), 
+                        (6.5, 6.5)
+                    ]      
                 
-                # Plot density maps side by side
-                fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-                
-                # Real data density map
+                def draw_maze_overlay(ax):
+                    wall_color = '#404080' # (첨부 이미지와 유사한 어두운 파란/회색)
+                    
+                    # ✅ 수정된 벽 그리기 로직 (틈새 없음)
+                    for i in range(8):
+                        for j in range(8):
+                            if MEDIUM_MAZE[i][j] == 1:  # Wall
+                                # (x, y) = (j, i)
+                                rect = patches.Rectangle((j, i), 1, 1, 
+                                                        linewidth=0, facecolor=wall_color, 
+                                                        alpha=1.0, zorder=1)
+                                ax.add_patch(rect)
+                    
+                    # Mark initial position
+                    ax.scatter(initial_pos[0], initial_pos[1], c='cyan', marker='^', s=200, 
+                            edgecolors='black', linewidths=1.5, label='Start (S)', zorder=5)
+                    
+                    # Mark goal positions
+                    for idx, (goal_x, goal_y) in enumerate(goal_positions):
+                        ax.scatter(goal_x, goal_y, c='red', marker='*', s=300, 
+                                edgecolors='black', linewidths=1.5, zorder=4,
+                                label='Goal (G)' if idx == 0 else '')
+                    
+                    ax.set_xlim(x_min, x_max)
+                    ax.set_ylim(y_min, y_max)
+                    ax.set_xlabel('X Position')
+                    ax.set_ylabel('Y Position')
+                    ax.set_aspect('equal')
+                # =========================================================================
+                # ======================== Plotting Section ==============================
+                # =========================================================================
+                fig, axes = plt.subplots(1, 3, figsize=(20, 6)) # (약간 더 크게 조정)
+        
+                # --- Real data density map ---
                 im0 = axes[0].imshow(hist_real.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
-                                     cmap='Blues', aspect='auto', vmin=0, vmax=vmax, alpha=0.8)
+                                    # cmap='Blues', vmin=0, vmax=vmax, 
+                                    cmap='Blues', vmin=0, vmax=hist_real.max(), 
+                                    interpolation='gaussian', alpha=0.9, zorder=2)
+                draw_maze_overlay(axes[0]) # 헬퍼 함수로 오버레이 적용
                 axes[0].set_title('Real Data Density')
-                axes[0].set_xlabel('X Position')
-                axes[0].set_ylabel('Y Position')
-                plt.colorbar(im0, ax=axes[0], label='Count')
-                
-                # Draw walls as thick gray rectangles
-                # Each cell is 1x1 unit starting from (0.5, 0.5)
-                for i in range(8):
-                    for j in range(8):
-                        if maze_array[i, j] == 1:  # Wall
-                            # Create rectangle for wall cell
-                            rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
-                                                linewidth=0, edgecolor='none', 
-                                                facecolor='gray', alpha=0.7, zorder=3)
-                            axes[0].add_patch(rect)
-                
-                # Mark initial position
-                axes[0].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
-                               edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
-                
-                # Mark goal positions
-                for idx, (goal_x, goal_y) in enumerate(goal_positions):
-                    axes[0].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
-                                   edgecolors='darkred', linewidths=1.5, zorder=4,
-                                   label='Goal' if idx == 0 else '')
                 axes[0].legend(loc='upper left', fontsize=10)
-                axes[0].set_xlim(x_min, x_max)
-                axes[0].set_ylim(y_min, y_max)
+                plt.colorbar(im0, ax=axes[0], label='Count', shrink=0.8)
                 
-                # Diffusion data density map
+                # --- Diffusion data density map ---
                 im1 = axes[1].imshow(hist_diff.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
-                                     cmap='Oranges', aspect='auto', vmin=0, vmax=vmax, alpha=0.8)
+                                    # cmap='Oranges', vmin=0, vmax=vmax,
+                                    cmap='Oranges', vmin=0, vmax=hist_diff.max(),
+                                    interpolation='gaussian', alpha=0.9, zorder=2)
+                draw_maze_overlay(axes[1]) # 헬퍼 함수로 오버레이 적용
                 axes[1].set_title('Diffusion Data Density')
-                axes[1].set_xlabel('X Position')
-                axes[1].set_ylabel('Y Position')
-                plt.colorbar(im1, ax=axes[1], label='Count')
-                
-                # Draw walls as thick gray rectangles
-                for i in range(8):
-                    for j in range(8):
-                        if maze_array[i, j] == 1:  # Wall
-                            rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
-                                                linewidth=0, edgecolor='none', 
-                                                facecolor='gray', alpha=0.7, zorder=3)
-                            axes[1].add_patch(rect)
-                
-                # Mark initial position
-                axes[1].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
-                               edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
-                
-                for idx, (goal_x, goal_y) in enumerate(goal_positions):
-                    axes[1].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
-                                   edgecolors='darkred', linewidths=1.5, zorder=4,
-                                   label='Goal' if idx == 0 else '')
                 axes[1].legend(loc='upper left', fontsize=10)
-                axes[1].set_xlim(x_min, x_max)
-                axes[1].set_ylim(y_min, y_max)
+                plt.colorbar(im1, ax=axes[1], label='Count', shrink=0.8)
                 
-                # Combined data density map
+                # --- Combined data density map ---
                 im2 = axes[2].imshow(hist_comb.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
-                                     cmap='Greens', aspect='auto', vmin=0, vmax=vmax, alpha=0.8)
+                                    # cmap='Greens', vmin=0, vmax=vmax,
+                                    cmap='Greens', vmin=0, vmax=hist_comb.max(),
+                                    interpolation='gaussian', alpha=0.9, zorder=2)
+                draw_maze_overlay(axes[2]) # 헬퍼 함수로 오버레이 적용
                 axes[2].set_title('Combined (10k) Density')
-                axes[2].set_xlabel('X Position')
-                axes[2].set_ylabel('Y Position')
-                plt.colorbar(im2, ax=axes[2], label='Count')
-                
-                # Draw walls as thick gray rectangles
-                for i in range(8):
-                    for j in range(8):
-                        if maze_array[i, j] == 1:  # Wall
-                            rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
-                                                linewidth=0, edgecolor='none', 
-                                                facecolor='gray', alpha=0.7, zorder=3)
-                            axes[2].add_patch(rect)
-                
-                # Mark initial position
-                axes[2].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
-                               edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
-                
-                for idx, (goal_x, goal_y) in enumerate(goal_positions):
-                    axes[2].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
-                                   edgecolors='darkred', linewidths=1.5, zorder=4,
-                                   label='Goal' if idx == 0 else '')
                 axes[2].legend(loc='upper left', fontsize=10)
-                axes[2].set_xlim(x_min, x_max)
-                axes[2].set_ylim(y_min, y_max)
+                plt.colorbar(im2, ax=axes[2], label='Count', shrink=0.8)
                 
                 plt.tight_layout()
                 
-                # Save figure
+                # =========================================================================
+                # ======================== Save & Log Section =============================
+                # =========================================================================
+                
+                # Save figure (기존 로직 유지)
                 map_path = os.path.join(map_dir, f'density_map_epoch{cur_epoch:04d}.png')
                 fig.savefig(map_path, dpi=150)
                 print(f'Saved density map to {map_path}')
                 
-                # Log to Weights & Biases
+                # Log to Weights & Biases (기존 로직 유지)
                 if args.wandb:
                     wandb.log({
                         'images/density_map': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
                     })
                 
                 plt.close(fig)
+                # Plot density maps side by side
+                # fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+                
+                # # Real data density map
+                # im0 = axes[0].imshow(hist_real.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                #                      cmap='Blues', aspect='equal', vmin=0, vmax=vmax, alpha=0.8)
+                # axes[0].set_title('Real Data Density')
+                # axes[0].set_xlabel('X Position')
+                # axes[0].set_ylabel('Y Position')
+                # plt.colorbar(im0, ax=axes[0], label='Count')
+                
+                # # Draw walls as thick gray rectangles
+                # # Each cell is 1x1 unit starting from (0.5, 0.5)
+                # for i in range(8):
+                #     for j in range(8):
+                #         if maze_array[i, j] == 1:  # Wall
+                #             # Create rectangle for wall cell
+                #             rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
+                #                                 linewidth=0, edgecolor='none', 
+                #                                 facecolor='gray', alpha=0.7, zorder=3)
+                #             axes[0].add_patch(rect)
+                
+                # # Mark initial position
+                # axes[0].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
+                #                edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
+                
+                # # Mark goal positions
+                # for idx, (goal_x, goal_y) in enumerate(goal_positions):
+                #     axes[0].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
+                #                    edgecolors='darkred', linewidths=1.5, zorder=4,
+                #                    label='Goal' if idx == 0 else '')
+                # axes[0].legend(loc='upper left', fontsize=10)
+                # axes[0].set_xlim(x_min, x_max)
+                # axes[0].set_ylim(y_min, y_max)
+                
+                # # Diffusion data density map
+                # im1 = axes[1].imshow(hist_diff.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                #                      cmap='Oranges', aspect='equal', vmin=0, vmax=vmax, alpha=0.8)
+                # axes[1].set_title('Diffusion Data Density')
+                # axes[1].set_xlabel('X Position')
+                # axes[1].set_ylabel('Y Position')
+                # plt.colorbar(im1, ax=axes[1], label='Count')
+                
+                # # Draw walls as thick gray rectangles
+                # for i in range(8):
+                #     for j in range(8):
+                #         if maze_array[i, j] == 1:  # Wall
+                #             rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
+                #                                 linewidth=0, edgecolor='none', 
+                #                                 facecolor='gray', alpha=0.7, zorder=3)
+                #             axes[1].add_patch(rect)
+                
+                # # Mark initial position
+                # axes[1].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
+                #                edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
+                
+                # for idx, (goal_x, goal_y) in enumerate(goal_positions):
+                #     axes[1].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
+                #                    edgecolors='darkred', linewidths=1.5, zorder=4,
+                #                    label='Goal' if idx == 0 else '')
+                # axes[1].legend(loc='upper left', fontsize=10)
+                # axes[1].set_xlim(x_min, x_max)
+                # axes[1].set_ylim(y_min, y_max)
+                
+                # # Combined data density map
+                # im2 = axes[2].imshow(hist_comb.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                #                      cmap='Greens', aspect='equal', vmin=0, vmax=vmax, alpha=0.8)
+                # axes[2].set_title('Combined (10k) Density')
+                # axes[2].set_xlabel('X Position')
+                # axes[2].set_ylabel('Y Position')
+                # plt.colorbar(im2, ax=axes[2], label='Count')
+                
+                # # Draw walls as thick gray rectangles
+                # for i in range(8):
+                #     for j in range(8):
+                #         if maze_array[i, j] == 1:  # Wall
+                #             rect = plt.Rectangle((j + 0.5, i + 0.5), 1, 1, 
+                #                                 linewidth=0, edgecolor='none', 
+                #                                 facecolor='gray', alpha=0.7, zorder=3)
+                #             axes[2].add_patch(rect)
+                
+                # # Mark initial position
+                # axes[2].scatter(initial_pos[0], initial_pos[1], c='lime', marker='o', s=150, 
+                #                edgecolors='darkgreen', linewidths=2, label='Start', zorder=5)
+                
+                # for idx, (goal_x, goal_y) in enumerate(goal_positions):
+                #     axes[2].scatter(goal_x, goal_y, c='red', marker='*', s=250, 
+                #                    edgecolors='darkred', linewidths=1.5, zorder=4,
+                #                    label='Goal' if idx == 0 else '')
+                # axes[2].legend(loc='upper left', fontsize=10)
+                # axes[2].set_xlim(x_min, x_max)
+                # axes[2].set_ylim(y_min, y_max)
+                
+                # plt.tight_layout()
+                
+                # # Save figure
+                # map_path = os.path.join(map_dir, f'density_map_epoch{cur_epoch:04d}.png')
+                # fig.savefig(map_path, dpi=150)
+                # print(f'Saved density map to {map_path}')
+                
+                # # Log to Weights & Biases
+                # if args.wandb:
+                #     wandb.log({
+                #         'images/density_map': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                #     })
+                
+                # plt.close(fig)
+                
+                # ========================================================================
+                # ======================== End of Plotting Section ===========================
+                # ========================================================================
                 
 
         # End of epoch wrap-up
@@ -766,12 +880,110 @@ def wrap_gym(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
         env = gym.wrappers.RescaleAction(env, -1, 1)
 
     if isinstance(env.observation_space, gym.spaces.Dict):
+        # pointmaze obs is Dict consisting of {'observation', 'achieved_goal', 'desired_goal'}
+        # When using FlattenObservation, the observation becomes a flat array, following the order of the keys sorted alphabetically
+        # So, if we want to access coordinates, we should visit indexes maybe 4,5.
+        # observation = np.array([
+        #     ach_x, ach_y,      # from 'achieved_goal'
+        #     goal_x, goal_y,   # from 'desired_goal'
+        #     x, y, vx, vy        # from 'observation'
+        # ])
         env = FlattenObservation(env)
 
     env = gym.wrappers.ClipAction(env)
 
     return env
 
+class SelectObservationWrapper(gym.ObservationWrapper):
+    """
+    Dict observation space에서 특정 키의 값만 선택하고,
+    observation_space도 해당 키의 space로 업데이트합니다.
+    """
+    def __init__(self, env: gym.Env, key: str):
+        super().__init__(env)
+        
+        # 원본 observation_space가 딕셔너리인지, 키가 존재하는지 확인
+        if not isinstance(env.observation_space, Dict):
+            raise TypeError(f"SelectObservationWrapper는 Dict 타입의 observation space에서만 작동합니다. (현재: {type(env.observation_space)})")
+        if key not in env.observation_space.spaces:
+            raise ValueError(f"키 '{key}'가 observation space에 없습니다. 사용 가능한 키: {list(env.observation_space.spaces.keys())}")
+            
+        # 1. 새 observation_space를 'observation' 키의 space로 설정
+        self.observation_space = env.observation_space.spaces[key]
+        self._key = key
+
+    def observation(self, obs: dict) -> np.ndarray:
+        # 2. 매 스텝마다 딕셔너리(obs)에서 'observation' 키의 값만 반환
+        return obs[self._key]
+
+class MazeCustomWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        # Define 4 goal positions - updated to match visualization positions
+        # Based on MEDIUM_MAZE structure, goals are in center of open cells
+        # self.goal_positions = [
+        #     np.array([1.8, 6.5]),   # Top-left open area - reward 3
+        #     np.array([6.5, 6.5]),   # Top-right open area - reward 4
+        #     np.array([2.0, 1.5]),   # Bottom-left open area - reward 2
+        #     np.array([6.5, 2.0]),   # Bottom-right open area - reward 5
+        # ]
+        # self.goal_rewards = [3.0, 4.0, 2.0, 5.0]
+        self.goal_positions = [
+            np.array([1.5, 1.5]),  # G(2.0)
+            np.array([6.5, 1.5]),  # G(3.0)
+            np.array([6.5, 6.5]),  # G(4.0)
+            np.array([1.5, 6.5]),  # G(5.0)
+        ]
+        self.goal_rewards = [1.0, 1.2, 1.6, 1.4]
+        # self.goal_rewards = [0.2, 0.3, 0.4, 0.5]
+        # self.goal_threshold = 0.5  # Distance threshold to consider goal reached
+        self.goal_threshold = 0.5
+        
+        # Initial position - center of open area (matches visualization)
+        # self.initial_position = np.array([2.0, 2.0])
+        # self. initial_position = np.array([4.5, 3.5])
+        self.initial_position_coord = np.array([4.5, 3.5])
+        self.initial_position_cell = np.array([3, 4])   
+        
+    def reset(self, **kwargs):
+        if 'options' not in kwargs or kwargs['options'] is None:
+            kwargs['options'] = {}
+            
+        kwargs['options']['reset_cell'] = self.initial_position_cell
+        # gymnasium returns (obs, info) tuple
+        obs, info = self.env.reset(**kwargs)
+        
+        # Simply return the observation without modifying position for now
+        # The set_state approach was causing NaN issues
+        # TODO: Implement proper initial position setting if needed
+        
+        return obs, info
+    
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        
+        # Get agent position from observation
+        # For PointMaze, position is typically in obs['achieved_goal'] or first 2 dims
+        if isinstance(obs, dict) and 'achieved_goal' in obs:
+            agent_pos = obs['achieved_goal'][:2]
+        else:
+            # If flattened, position is usually first 2 dimensions
+            agent_pos = obs[:2]
+        
+        # Check if agent reached any goal
+        # custom_reward = -0.1
+        custom_reward = 0.0
+        for goal_pos, goal_reward in zip(self.goal_positions, self.goal_rewards):
+            distance = np.linalg.norm(agent_pos - goal_pos)
+            if distance < self.goal_threshold:
+                custom_reward = goal_reward
+                terminated = True  # Episode ends when goal is reached
+                break
+        
+        # Override reward with custom reward
+        reward = custom_reward
+        
+        return obs, reward, terminated, truncated, info
 
 def wrap_gym_maze(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     """
@@ -784,59 +996,9 @@ def wrap_gym_maze(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     # ✅ IMPORTANT: Apply RescaleAction FIRST to ensure bounded action space
     if rescale_actions:
         env = gym.wrappers.RescaleAction(env, -1, 1)
+        # env = gym.wrappers.RescaleAction(env, -5, 5)
     
-    class MazeCustomWrapper(gym.Wrapper):
-        def __init__(self, env):
-            super().__init__(env)
-            # Define 4 goal positions - updated to match visualization positions
-            # Based on MEDIUM_MAZE structure, goals are in center of open cells
-            self.goal_positions = [
-                np.array([1.8, 6.5]),   # Top-left open area - reward 3
-                np.array([6.5, 6.5]),   # Top-right open area - reward 4
-                np.array([2.0, 1.5]),   # Bottom-left open area - reward 2
-                np.array([6.5, 2.0]),   # Bottom-right open area - reward 5
-            ]
-            self.goal_rewards = [3.0, 4.0, 2.0, 5.0]
-            # self.goal_rewards = [0.2, 0.3, 0.4, 0.5]
-            self.goal_threshold = 0.5  # Distance threshold to consider goal reached
-            
-            # Initial position - center of open area (matches visualization)
-            self.initial_position = np.array([2.0, 2.0])
-            
-        def reset(self, **kwargs):
-            # gymnasium returns (obs, info) tuple
-            obs, info = self.env.reset(**kwargs)
-            
-            # Simply return the observation without modifying position for now
-            # The set_state approach was causing NaN issues
-            # TODO: Implement proper initial position setting if needed
-            
-            return obs, info
-        
-        def step(self, action):
-            obs, reward, terminated, truncated, info = self.env.step(action)
-            
-            # Get agent position from observation
-            # For PointMaze, position is typically in obs['achieved_goal'] or first 2 dims
-            if isinstance(obs, dict) and 'achieved_goal' in obs:
-                agent_pos = obs['achieved_goal'][:2]
-            else:
-                # If flattened, position is usually first 2 dimensions
-                agent_pos = obs[:2]
-            
-            # Check if agent reached any goal
-            custom_reward = -0.1
-            for goal_pos, goal_reward in zip(self.goal_positions, self.goal_rewards):
-                distance = np.linalg.norm(agent_pos - goal_pos)
-                if distance < self.goal_threshold:
-                    custom_reward = goal_reward
-                    terminated = True  # Episode ends when goal is reached
-                    break
-            
-            # Override reward with custom reward
-            reward = custom_reward
-            
-            return obs, reward, terminated, truncated, info
+
     
     # Apply custom wrapper
     env = MazeCustomWrapper(env)
@@ -846,7 +1008,8 @@ def wrap_gym_maze(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     #     env = gym.wrappers.RescaleAction(env, -1, 1)
 
     if isinstance(env.observation_space, gym.spaces.Dict):
-        env = FlattenObservation(env)
+        # env = FlattenObservation(env)
+        env = SelectObservationWrapper(env, key='observation')
 
     env = gym.wrappers.ClipAction(env)
 
@@ -1076,28 +1239,33 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     
+    algorithm = None
+    
     
     # REDQ
     if args.disable_diffusion:
         run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_eval{args.ent_eval_num}_REDQ"
+        algorithm = 'REDQ'
     else:
         if args.synther:
             run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}"
             # Ours
             if args.finetune:
                 run_name += f"_finetune_kl{args.kl_weight}_rewcoef{args.reward_coef}_ft_lr{args.finetune_lr}_Ours"
+                algorithm = 'Ours'
             # SER
             else:
                 run_name += "_SER"
+                algorithm = 'SER'
         else:
             # PGRrnd
             if args.rnd:
                 run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_PGRrnd"
+                algorithm = 'PGRrnd'
             # PGR
             else:
                 run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_PGR"
-                
-                
+                algorithm = 'PGR'
     
     # args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{run_name}'
@@ -1110,4 +1278,4 @@ if __name__ == '__main__':
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
     # args를 한번에 넘기는게 좋음
-    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args, run_name=run_name)
+    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args, run_name=run_name, algorithm=algorithm)
