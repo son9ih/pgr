@@ -52,7 +52,7 @@ def redq_sac(
         # steps_per_epoch=300,
         # max_ep_len=300,
         # 학습 과정에서 에이전트가 truncated (500스텝 도달)되는 비율보다 terminated (골 도달)되는 비율이 훨씬 높아진다면, 그때 이 값을 300 정도로 줄여서 학습 효율을 높이는 것을 고려해 볼 수 있습니다.
-        max_ep_len=200,
+        max_ep_len=500,
         n_evals_per_epoch=1,
         logger_kwargs=dict(),
         # following are agent related hyperparameters
@@ -65,7 +65,7 @@ def redq_sac(
         alpha=0.2,
         auto_alpha=True,
         target_entropy='mbpo',
-        start_steps=5000,
+        start_steps=3000,
         # start_steps=1000,
         delay_update_steps='auto',
         utd_ratio=20,
@@ -535,56 +535,61 @@ def redq_sac(
             
             
             
-            # Visualize density map of data sampled from replay buffer, diffusion buffer, and data combined
-            # if there is no diffusion data, skip and return only real data map
-            # what i reaally want to do is to draw sampling distributions for evaluation
-            if args.rnd:
-                
-                # Important: Get raw unnormalized data directly from buffers
-                # Get real data from replay buffer (unnormalized)
-                ptr_real = agent.replay_buffer.ptr
-                if ptr_real > 5000:
-                    # Sample 5000 random indices
-                    indices_real = np.random.choice(ptr_real, 5000, replace=False)
-                else:
-                    indices_real = np.arange(ptr_real)
-                real_positions = agent.replay_buffer.obs1_buf[indices_real, :2]  # First 2 dims are x, y
-                
-                # Get diffusion data from diffusion buffer (unnormalized)
+        # Visualize density map of data sampled from replay buffer, diffusion buffer, and data combined
+        # Always execute density map visualization, but layout depends on algorithm type
+        # REDQ: only real data (1 plot)
+        # Others: real + diffusion + combined (3 plots)
+        
+        # Important: Get raw unnormalized data directly from buffers
+        # Get real data from replay buffer (unnormalized)
+        if (epc*1000) % retrain_diffusion_every == 0 and (epc * 1000) >= diffusion_start and episode_end :
+            ptr_real = agent.replay_buffer.ptr
+            if ptr_real > 5000:
+                # Sample 5000 random indices
+                indices_real = np.random.choice(ptr_real, 5000, replace=False)
+            else:
+                indices_real = np.arange(ptr_real)
+            real_positions = agent.replay_buffer.obs1_buf[indices_real, :2]  # First 2 dims are x, y
+            
+            # Get diffusion data from diffusion buffer (unnormalized) - only if not REDQ
+            if algorithm != 'REDQ':
                 ptr_diff = agent.diffusion_buffer.ptr
                 if ptr_diff > 5000:
                     indices_diff = np.random.choice(ptr_diff, 5000, replace=False)
                 else:
                     indices_diff = np.arange(ptr_diff)
                 diffusion_positions = agent.diffusion_buffer.obs1_buf[indices_diff, :2]
-                
-                # Print statistics
-                print(f"Real positions - X: min={real_positions[:, 0].min():.3f}, max={real_positions[:, 0].max():.3f}, mean={real_positions[:, 0].mean():.3f}")
-                print(f"Real positions - Y: min={real_positions[:, 1].min():.3f}, max={real_positions[:, 1].max():.3f}, mean={real_positions[:, 1].mean():.3f}")
+            
+            # Print statistics
+            print(f"Real positions - X: min={real_positions[:, 0].min():.3f}, max={real_positions[:, 0].max():.3f}, mean={real_positions[:, 0].mean():.3f}")
+            print(f"Real positions - Y: min={real_positions[:, 1].min():.3f}, max={real_positions[:, 1].max():.3f}, mean={real_positions[:, 1].mean():.3f}")
+            
+            if algorithm != 'REDQ':
                 print(f"Diffusion positions - X: min={diffusion_positions[:, 0].min():.3f}, max={diffusion_positions[:, 0].max():.3f}, mean={diffusion_positions[:, 0].mean():.3f}")
                 print(f"Diffusion positions - Y: min={diffusion_positions[:, 1].min():.3f}, max={diffusion_positions[:, 1].max():.3f}, mean={diffusion_positions[:, 1].mean():.3f}")
-                
                 combined_positions = np.vstack([real_positions, diffusion_positions])
-                
-                
-                # Prepare output directory
-                map_dir = os.path.join(args.results_folder, 'density_maps')
-                os.makedirs(map_dir, exist_ok=True)
-                cur_epoch = epc
-                
-                # Define maze bounds for PointMaze_Medium-v3 (Mujoco coordinates)
-                # Based on empirical observation: roughly [-3, 3] for both x and y
-                x_min, x_max = -3.0, 3.0
-                y_min, y_max = -3.0, 3.0
-                
-                # Create 2D histogram (density map) with shared bins
-                bins_2d = 60  # Number of bins for 2D histogram
-                
-                # Compute histograms for all three datasets
-                hist_real, xedges, yedges = np.histogram2d(
-                    real_positions[:, 0], real_positions[:, 1],
-                    bins=bins_2d, range=[[x_min, x_max], [y_min, y_max]]
-                )
+            
+            
+            # Prepare output directory
+            map_dir = os.path.join(args.results_folder, 'density_maps')
+            os.makedirs(map_dir, exist_ok=True)
+            cur_epoch = epc
+            
+            # Define maze bounds for PointMaze_Medium-v3 (Mujoco coordinates)
+            # Based on empirical observation: roughly [-3, 3] for both x and y
+            x_min, x_max = -3.0, 3.0
+            y_min, y_max = -3.0, 3.0
+            
+            # Create 2D histogram (density map) with shared bins
+            bins_2d = 60  # Number of bins for 2D histogram
+            
+            # Compute histograms
+            hist_real, xedges, yedges = np.histogram2d(
+                real_positions[:, 0], real_positions[:, 1],
+                bins=bins_2d, range=[[x_min, x_max], [y_min, y_max]]
+            )
+            
+            if algorithm != 'REDQ':
                 hist_diff, _, _ = np.histogram2d(
                     diffusion_positions[:, 0], diffusion_positions[:, 1],
                     bins=bins_2d, range=[[x_min, x_max], [y_min, y_max]]
@@ -593,176 +598,142 @@ def redq_sac(
                     combined_positions[:, 0], combined_positions[:, 1],
                     bins=bins_2d, range=[[x_min, x_max], [y_min, y_max]]
                 )
+            
+            # Find shared color scale (vmax) for consistency
+            # vmax = max(hist_real.max(), hist_diff.max(), hist_comb.max())
+            
+            # Define MEDIUM_MAZE structure from gymnasium_robotics
+            # 1 = wall, 0 = open space
+            MEDIUM_MAZE = [
+                [1, 1, 1, 1, 1, 1, 1, 1],
+                [1, 0, 0, 1, 1, 0, 0, 1],
+                [1, 0, 0, 1, 0, 0, 0, 1],
+                [1, 1, 0, 0, 0, 1, 1, 1],
+                [1, 0, 0, 1, 0, 0, 0, 1],
+                [1, 0, 1, 0, 0, 1, 0, 1],
+                [1, 0, 0, 0, 1, 0, 0, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1]
+            ]
+            
+            # Initial and goal positions in Mujoco coordinates
+            initial_pos = (0.295, 0.306)  # Center cell [3,4]
+            
+            goal_positions = [
+                (-2.624, 2.291),   # Grid [1,1] - Bottom-left
+                (-2.705, -2.668),  # Grid [6,1] - Bottom-right  
+                (2.458, 2.739),    # Grid [1,6] - Top-left
+                (2.524, -2.475),   # Grid [6,6] - Top-right
+            ]
+            
+            def draw_maze_overlay(ax):
+                """
+                Draw maze walls and markers in Mujoco coordinate system.
+                Uses grid-to-Mujoco coordinate transformation based on empirical data.
+                """
+                wall_color = '#404080'  # Dark blue-gray (similar to reference image)
                 
-                # Find shared color scale (vmax) for consistency
-                # vmax = max(hist_real.max(), hist_diff.max(), hist_comb.max())
+                # Only draw interior walls (exclude outer boundary)
+                # Actual playable area is 6x6 interior, excluding i=0,7 and j=0,7
+                for i in range(1, 7):  # Skip outermost rows (0 and 7)
+                    for j in range(1, 7):  # Skip outermost cols (0 and 7)
+                        if MEDIUM_MAZE[i][j] == 1:  # Wall
+                            # Transform grid coordinates to Mujoco coordinates
+                            # Grid: i=row (0 at top), j=col (0 at left)
+                            # Mujoco: x increases right, y increases up
+                            # Transform: (col-4)*0.75 for x, (4-row)*0.75 for y (flip y-axis)
+                            x_mujoco = (j - 4) * 0.75
+                            y_mujoco = (4 - i) * 0.75  # Flip y-axis
+                            rect = patches.Rectangle(
+                                (x_mujoco, y_mujoco), 0.75, 0.75,
+                                linewidth=0, facecolor=wall_color, 
+                                alpha=1.0, zorder=1
+                            )
+                            ax.add_patch(rect)
                 
-                # Define MEDIUM_MAZE structure from gymnasium_robotics
-                # 1 = wall, 0 = open space
-                MEDIUM_MAZE = [
-                    [1, 1, 1, 1, 1, 1, 1, 1],
-                    [1, 0, 0, 1, 1, 0, 0, 1],
-                    [1, 0, 0, 1, 0, 0, 0, 1],
-                    [1, 1, 0, 0, 0, 1, 1, 1],
-                    [1, 0, 0, 1, 0, 0, 0, 1],
-                    [1, 0, 1, 0, 0, 1, 0, 1],
-                    [1, 0, 0, 0, 1, 0, 0, 1],
-                    [1, 1, 1, 1, 1, 1, 1, 1]
-                ]
-                # MEDIUM_MAZE = [
-                #     [0, 0, 1, 1, 0, 0],
-                #     [0, 0, 1, 0, 0, 0],
-                #     [1, 0, 0, 0, 1, 1],
-                #     [0, 0, 1, 0, 0, 0],
-                #     [0, 1, 0, 0, 1, 0],
-                #     [0, 0, 0, 1, 0, 0],
-                # ]
+                # Mark initial position
+                ax.scatter(initial_pos[0], initial_pos[1], c='cyan', marker='^', s=200, 
+                        edgecolors='black', linewidths=1.5, label='Start (S)', zorder=5)
                 
-                # Initial and goal positions in Mujoco coordinates
-                initial_pos = (0.295, 0.306)  # Center cell [3,4]
+                # Mark goal positions
+                for idx, (goal_x, goal_y) in enumerate(goal_positions):
+                    ax.scatter(goal_x, goal_y, c='red', marker='*', s=300, 
+                            edgecolors='black', linewidths=1.5, zorder=4,
+                            label='Goal (G)' if idx == 0 else '')
                 
-                goal_positions = [
-                    (-2.624, 2.291),   # Grid [1,1] - Bottom-left
-                    (-2.705, -2.668),  # Grid [6,1] - Bottom-right  
-                    (2.458, 2.739),    # Grid [1,6] - Top-left
-                    (2.524, -2.475),   # Grid [6,6] - Top-right
-                ]
+                ax.set_xlim(x_min, x_max)
+                ax.set_ylim(y_min, y_max)
+                ax.set_xlabel('X Position (Mujoco)')
+                ax.set_ylabel('Y Position (Mujoco)')
+                ax.set_aspect('equal')
+            
+            # =========================================================================
+            # ======================== Plotting Section ==============================
+            # =========================================================================
+            
+            if algorithm == 'REDQ':
+                # REDQ: Only show real data density map (1 plot)
+                fig, ax = plt.subplots(1, 1, figsize=(8, 6))
                 
-                def draw_maze_overlay(ax):
-                    """
-                    Draw maze walls and markers in Mujoco coordinate system.
-                    Uses grid-to-Mujoco coordinate transformation based on empirical data.
-                    """
-                    wall_color = '#404080'  # Dark blue-gray (similar to reference image)
-                    
-                    # Grid-to-Mujoco transformation parameters
-                    # Based on empirical data from map_all_maze_cells.py:
-                    # Grid [0,0] is top-left, Mujoco has center around (0, 0)
-                    # Each grid cell is approximately 1.0 Mujoco unit
-                    # Grid spans [0,7] in both dimensions
-                    # Mujoco spans approximately [-3, 3] in both dimensions
-                    
-                    # Transformation: Mujoco = grid_to_mujoco(grid_row, grid_col)
-                    # Approximate linear mapping:
-                    # x_mujoco ≈ (col - 3.5) * 0.93  (cols 0-7 map to x: -3.3 to 3.3)
-                    # y_mujoco ≈ (3.5 - row) * 0.99  (rows 0-7 map to y: 3.5 to -3.5, flipped)
-                    # Optimized parameters from empirical data (26 open cells):
-                    # Mean error: 0.18 units, Max error: 0.34 units
-                    
-                    # x_scale = 0.9998
-                    # y_scale = 0.9921
-                    # x_offset = 3.5036
-                    # y_offset = 3.4891
-                    # cell_size = 0.93  # Approximate Mujoco size per grid cell
-                    
-                    # Only draw interior walls (exclude outer boundary)
-                    # Actual playable area is 6x6 interior, excluding i=0,7 and j=0,7
-                    
-                    # ++++++++++++++++++++++++++++++++++++++++++++++
-                    # for i in range(1, 7):  # Skip outermost rows (0 and 7)
-                    #     for j in range(1, 7):  # Skip outermost cols (0 and 7)
-                    #         if MEDIUM_MAZE[i][j] == 1:  # Wall
-                    #             # Transform grid coordinates to Mujoco coordinates
-                    #             # Grid: i=row (0 at top), j=col (0 at left)
-                    #             # Mujoco: x increases right, y increases up
-                    #             # Transform: (col-4)*0.75 for x, (4-row)*0.75 for y (flip y-axis)
-                    #             x_mujoco = (j - 4) * 0.75
-                    #             y_mujoco = (4 - i) * 0.75  # Flip y-axis
-                    #             rect = patches.Rectangle(
-                    #                 (x_mujoco, y_mujoco), 0.75, 0.75,
-                    #                 linewidth=0, facecolor=wall_color, 
-                    #                 alpha=1.0, zorder=1
-                    #             )
-                    #             ax.add_patch(rect)
-                    # ++++++++++++++++++++++++++++++++++++++++++++++
-                    
-                    # Draw walls using grid-based iteration (similar to reference code)
-                    # for i in range(8):
-                    #     for j in range(8):
-                    #         if MEDIUM_MAZE[i][j] == 1:  # Wall cell
-                    #             # Convert grid cell (i, j) to Mujoco coordinates
-                    #             x_mujoco, y_mujoco = grid_to_mujoco(i, j)
-                                
-                    #             # Draw rectangle at Mujoco position
-                    #             # Rectangle bottom-left corner is (x_mujoco - cell_size/2, y_mujoco - cell_size/2)
-                    #             rect = patches.Rectangle(
-                    #                 (x_mujoco - cell_size/2, y_mujoco - cell_size/2), 
-                    #                 cell_size, cell_size,
-                    #                 linewidth=0, 
-                    #                 facecolor=wall_color, 
-                    #                 alpha=1.0, 
-                    #                 zorder=1
-                    #             )
-                    #             ax.add_patch(rect)
-                    
-                    # Mark initial position
-                    ax.scatter(initial_pos[0], initial_pos[1], c='cyan', marker='^', s=200, 
-                            edgecolors='black', linewidths=1.5, label='Start (S)', zorder=5)
-                    
-                    # Mark goal positions
-                    for idx, (goal_x, goal_y) in enumerate(goal_positions):
-                        ax.scatter(goal_x, goal_y, c='red', marker='*', s=300, 
-                                edgecolors='black', linewidths=1.5, zorder=4,
-                                label='Goal (G)' if idx == 0 else '')
-                    
-                    ax.set_xlim(x_min, x_max)
-                    ax.set_ylim(y_min, y_max)
-                    ax.set_xlabel('X Position (Mujoco)')
-                    ax.set_ylabel('Y Position (Mujoco)')
-                    ax.set_aspect('equal')
-                # =========================================================================
-                # ======================== Plotting Section ==============================
-                # =========================================================================
-                fig, axes = plt.subplots(1, 3, figsize=(20, 6)) # (약간 더 크게 조정)
+                im = ax.imshow(hist_real.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
+                            cmap='Blues', vmin=0, vmax=hist_real.max(), 
+                            interpolation='gaussian', alpha=0.9, zorder=2)
+                draw_maze_overlay(ax)
+                ax.set_title('Real Data Density')
+                ax.legend(loc='upper left', fontsize=10)
+                plt.colorbar(im, ax=ax, label='Count', shrink=0.8)
+                
+                plt.tight_layout()
+            else:
+                # Other algorithms: Show all 3 density maps
+                fig, axes = plt.subplots(1, 3, figsize=(20, 6))
         
                 # --- Real data density map ---
                 im0 = axes[0].imshow(hist_real.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
-                                    # cmap='Blues', vmin=0, vmax=vmax, 
                                     cmap='Blues', vmin=0, vmax=hist_real.max(), 
                                     interpolation='gaussian', alpha=0.9, zorder=2)
-                draw_maze_overlay(axes[0]) # 헬퍼 함수로 오버레이 적용
+                draw_maze_overlay(axes[0])
                 axes[0].set_title('Real Data Density')
                 axes[0].legend(loc='upper left', fontsize=10)
                 plt.colorbar(im0, ax=axes[0], label='Count', shrink=0.8)
                 
                 # --- Diffusion data density map ---
                 im1 = axes[1].imshow(hist_diff.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
-                                    # cmap='Oranges', vmin=0, vmax=vmax,
                                     cmap='Oranges', vmin=0, vmax=hist_diff.max(),
                                     interpolation='gaussian', alpha=0.9, zorder=2)
-                draw_maze_overlay(axes[1]) # 헬퍼 함수로 오버레이 적용
+                draw_maze_overlay(axes[1])
                 axes[1].set_title('Diffusion Data Density')
                 axes[1].legend(loc='upper left', fontsize=10)
                 plt.colorbar(im1, ax=axes[1], label='Count', shrink=0.8)
                 
                 # --- Combined data density map ---
                 im2 = axes[2].imshow(hist_comb.T, origin='lower', extent=[x_min, x_max, y_min, y_max],
-                                    # cmap='Greens', vmin=0, vmax=vmax,
                                     cmap='Greens', vmin=0, vmax=hist_comb.max(),
                                     interpolation='gaussian', alpha=0.9, zorder=2)
-                draw_maze_overlay(axes[2]) # 헬퍼 함수로 오버레이 적용
+                draw_maze_overlay(axes[2])
                 axes[2].set_title('Combined (10k) Density')
                 axes[2].legend(loc='upper left', fontsize=10)
                 plt.colorbar(im2, ax=axes[2], label='Count', shrink=0.8)
                 
                 plt.tight_layout()
-                
-                # =========================================================================
-                # ======================== Save & Log Section =============================
-                # =========================================================================
-                
-                # Save figure (기존 로직 유지)
-                map_path = os.path.join(map_dir, f'density_map_epoch{cur_epoch:04d}.png')
-                fig.savefig(map_path, dpi=150)
-                print(f'Saved density map to {map_path}')
-                
-                # Log to Weights & Biases (기존 로직 유지)
-                if args.wandb:
-                    wandb.log({
-                        'images/density_map': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
-                    })
-                
-                plt.close(fig)
+            
+            # =========================================================================
+            # ======================== Save & Log Section =============================
+            # =========================================================================
+            
+            # Save figure (기존 로직 유지)
+            map_path = os.path.join(map_dir, f'density_map_epoch{cur_epoch:04d}.png')
+            fig.savefig(map_path, dpi=150)
+            print(f'Saved density map to {map_path}')
+            
+            # Log to Weights & Biases (기존 로직 유지)
+            if args.wandb:
+                wandb.log({
+                    'images/density_map': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                })
+            
+            plt.close(fig)
+            
+            
                 # Plot density maps side by side
                 # fig, axes = plt.subplots(1, 3, figsize=(18, 5))
                 
@@ -874,7 +845,7 @@ def redq_sac(
                 # ========================================================================
                 # ======================== End of Plotting Section ===========================
                 # ========================================================================
-                
+                    
 
         # End of epoch wrap-up
         # if (t + 1) % steps_per_epoch == 0:
@@ -1044,7 +1015,7 @@ class MazeCustomWrapper(gym.Wrapper):
         
         # Check if agent reached any goal
         # custom_reward = -0.1
-        custom_reward = 0.0
+        custom_reward = -0.01
         for goal_pos, goal_reward in zip(self.goal_positions, self.goal_rewards):
             distance = np.linalg.norm(agent_pos - goal_pos)
             if distance < self.goal_threshold:
