@@ -35,6 +35,8 @@ import pdb
 import matplotlib.pyplot as plt
 import os
 
+from sklearn.manifold import TSNE
+
 
 @gin.configurable
 def redq_sac(
@@ -83,7 +85,8 @@ def redq_sac(
         n_mc_cutoff=350,
         reseed_each_epoch=True,
         args=None,
-        run_name=None
+        run_name=None,
+        algorithm=None
 ):
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -264,7 +267,8 @@ def redq_sac(
         ep_ret += r
         
         # train RND predictor network, once in a epoch
-        if (t + 1) % steps_per_epoch == 0 and args.rnd:
+        # if (t + 1) % steps_per_epoch == 0 and args.rnd:
+        if (t + 1) % steps_per_epoch == 0:
             agent.pred_net.train()
             pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
             agent.pred_net.eval()
@@ -280,9 +284,9 @@ def redq_sac(
 
         # Retrain diffusion model periodically, then finetune if specified
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
-            if args.rnd:
+            # if args.rnd:
                 # Regularly load predictor network weights to target network for stability reasons
-                agent.pred_net_target.load_state_dict(agent.pred_net.state_dict())
+            agent.pred_net_target.load_state_dict(agent.pred_net.state_dict())
             
             
             print(f'Retraining diffusion model at step {t + 1}')
@@ -370,75 +374,126 @@ def redq_sac(
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
                 
-            if args.histo and args.rnd:
-                with torch.no_grad():
-                    # Sample real data from replay buffer
-                    real_obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=5000)
-                    diffusion_obs_tensor, _, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
-                    # Compute novelty (squeezed)
-                    real_novelty = agent.compute_intrinsic_reward(real_obs_tensor).cpu().numpy().squeeze()
-                    diffusion_novelty = agent.compute_intrinsic_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
-                    # Combined 10k observations and novelty
-                    combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
-                    combined_novelty = agent.compute_intrinsic_reward(combined_obs_tensor).cpu().numpy().squeeze()
+        if args.histo and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
+            with torch.no_grad():
+                # Sample real data from replay buffer
+                real_obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=5000)
+                diffusion_obs_tensor, _, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
+                # Compute novelty (squeezed)
+                real_novelty = agent.compute_intrinsic_reward(real_obs_tensor).cpu().numpy().squeeze()
+                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
+                # Combined 10k observations and novelty
+                combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
+                combined_novelty = agent.compute_intrinsic_reward(combined_obs_tensor).cpu().numpy().squeeze()
 
-                # Prepare output directory
-                out_dir = os.path.join(args.results_folder, 'histograms')
-                os.makedirs(out_dir, exist_ok=True)
-                cur_epoch = t // steps_per_epoch
+            # Prepare output directory
+            out_dir = os.path.join(args.results_folder, 'histograms')
+            os.makedirs(out_dir, exist_ok=True)
+            cur_epoch = t // steps_per_epoch
 
-                # Build shared bins/ranges using the widest x-range across the three arrays
-                x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
-                x_max = float(max(real_novelty.max(), diffusion_novelty.max(), combined_novelty.max()))
-                if x_min == x_max:
-                    # avoid zero-width bins if all values are identical
-                    x_min -= 1e-6
-                    x_max += 1e-6
-                num_bins = 100
-                bins = np.linspace(x_min, x_max, num_bins + 1)
+            # Build shared bins/ranges using the widest x-range across the three arrays
+            x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
+            x_max = float(max(real_novelty.max(), diffusion_novelty.max(), combined_novelty.max()))
+            if x_min == x_max:
+                # avoid zero-width bins if all values are identical
+                x_min -= 1e-6
+                x_max += 1e-6
+            num_bins = 100
+            bins = np.linspace(x_min, x_max, num_bins + 1)
 
-                # Pre-compute counts to unify y-axis range by the maximum count among the three
-                counts_real, _ = np.histogram(real_novelty, bins=bins)
-                counts_diff, _ = np.histogram(diffusion_novelty, bins=bins)
-                counts_comb, _ = np.histogram(combined_novelty, bins=bins)
-                y_max = int(max(counts_real.max(), counts_diff.max(), counts_comb.max()))
-                # small headroom on y-axis
-                y_max = max(1, int(np.ceil(y_max * 1.05)))
+            # Pre-compute counts to unify y-axis range by the maximum count among the three
+            counts_real, _ = np.histogram(real_novelty, bins=bins)
+            counts_diff, _ = np.histogram(diffusion_novelty, bins=bins)
+            counts_comb, _ = np.histogram(combined_novelty, bins=bins)
+            y_max = int(max(counts_real.max(), counts_diff.max(), counts_comb.max()))
+            # small headroom on y-axis
+            y_max = max(1, int(np.ceil(y_max * 1.05)))
 
-                # Plot and save combined histogram figure with shared axes
-                fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
-                axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
-                axes[0].set_title('Real Obs Novelty')
-                axes[0].set_xlabel('Novelty')
-                axes[0].set_ylabel('Count')
+            # Plot and save combined histogram figure with shared axes
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
+            axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
+            axes[0].set_title('Real Obs Novelty')
+            axes[0].set_xlabel('Novelty')
+            axes[0].set_ylabel('Count')
 
-                axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
-                axes[1].set_title('Diffusion Obs Novelty')
-                axes[1].set_xlabel('Novelty')
-                axes[1].set_ylabel('Count')
+            axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
+            axes[1].set_title('Diffusion Obs Novelty')
+            axes[1].set_xlabel('Novelty')
+            axes[1].set_ylabel('Count')
 
-                axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
-                axes[2].set_title('Combined (10k) Novelty')
-                axes[2].set_xlabel('Novelty')
-                axes[2].set_ylabel('Count')
+            axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
+            axes[2].set_title('Combined (10k) Novelty')
+            axes[2].set_xlabel('Novelty')
+            axes[2].set_ylabel('Count')
 
-                # Unify axis ranges across all three plots
-                for ax in axes:
-                    ax.set_xlim(bins[0], bins[-1])
-                    ax.set_ylim(0, y_max)
+            # Unify axis ranges across all three plots
+            for ax in axes:
+                ax.set_xlim(bins[0], bins[-1])
+                ax.set_ylim(0, y_max)
 
-                plt.tight_layout()
+            plt.tight_layout()
 
-                # Optionally log to Weights & Biases
-                if args.wandb:
-                    wandb.log({
-                        'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
-                    # }, step=t+1)novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
-                    })
-                out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
-                fig.savefig(out_path)
-                plt.close(fig)
-                print(f'Saved novelty histogram to {out_path}')
+            # Optionally log to Weights & Biases
+            if args.wandb:
+                wandb.log({
+                    'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                # }, step=t+1)novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                })
+            out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
+            fig.savefig(out_path)
+            plt.close(fig)
+            print(f'Saved novelty histogram to {out_path}')
+                
+            # T-SNE
+            if args.tsne:
+                if algorithm != 'REDQ':
+                    
+                    # Prepare t-SNE visualization directory
+                    tsne_dir = os.path.join(args.results_folder, 't-sne')
+                    os.makedirs(tsne_dir, exist_ok=True)
+                    
+                    # Combine real and diffusion observations for t-SNE
+                    combined_obs = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0).cpu().numpy()
+                    
+                    # Create labels: 0 for real, 1 for diffusion
+                    labels = np.concatenate([
+                        np.zeros(real_obs_tensor.shape[0]),
+                        np.ones(diffusion_obs_tensor.shape[0])
+                    ])
+                    
+                    # Apply t-SNE
+                    print('Computing t-SNE embedding...')
+                    tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+                    embedded = tsne.fit_transform(combined_obs)
+                    
+                    # Split embeddings back into real and diffusion
+                    real_embedded = embedded[labels == 0]
+                    diffusion_embedded = embedded[labels == 1]
+                    
+                    # Create t-SNE plot
+                    fig_tsne, ax_tsne = plt.subplots(figsize=(10, 8))
+                    ax_tsne.scatter(real_embedded[:, 0], real_embedded[:, 1], 
+                                   c='red', alpha=0.5, s=10, label='Real Data')
+                    ax_tsne.scatter(diffusion_embedded[:, 0], diffusion_embedded[:, 1], 
+                                   c='blue', alpha=0.5, s=10, label='Diffusion Data')
+                    ax_tsne.set_xlabel('t-SNE Dimension 1')
+                    ax_tsne.set_ylabel('t-SNE Dimension 2')
+                    ax_tsne.set_title(f't-SNE Visualization (Epoch {cur_epoch})')
+                    ax_tsne.legend()
+                    ax_tsne.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    
+                    # Log to wandb
+                    if args.wandb:
+                        wandb.log({
+                            'images/t-sne': wandb.Image(fig_tsne, caption=f'Epoch {cur_epoch}')
+                        })
+                    
+                    # Save to disk
+                    tsne_path = os.path.join(tsne_dir, f'tsne_epoch{cur_epoch:04d}.png')
+                    fig_tsne.savefig(tsne_path)
+                    plt.close(fig_tsne)
+                    print(f'Saved t-SNE plot to {tsne_path}')
 
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
@@ -732,7 +787,11 @@ if __name__ == '__main__':
     # histogram arguments
     parser.add_argument('--histo', action='store_true', default=False)
     
+    # REDQ
     parser.add_argument('--disable_diffusion', action='store_true', default=False)
+    
+    # T-SNE visualization
+    parser.add_argument('--tsne', action='store_true', default=False)
     
 
     args = parser.parse_args()
@@ -741,23 +800,27 @@ if __name__ == '__main__':
     # REDQ
     if args.disable_diffusion:
         run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_eval{args.ent_eval_num}_REDQ"
+        algorithm = 'REDQ'
     else:
         if args.synther:
             run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}"
             # Ours
             if args.finetune:
                 run_name += f"_finetune_kl{args.kl_weight}_rewcoef{args.reward_coef}_ft_lr{args.finetune_lr}_Ours"
+                algorithm = 'Ours'
             # SER
             else:
                 run_name += "_SER"
+                algorithm = 'SER'
         else:
             # PGRrnd
             if args.rnd:
                 run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_PGRrnd"
+                algorithm = 'PGRrnd'
             # PGR
             else:
                 run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_Uncond{args.synther}_eval{args.ent_eval_num}_PGR"
-                
+                algorithm = 'PGR'
                 
     
     # args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
@@ -771,4 +834,4 @@ if __name__ == '__main__':
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
     # args를 한번에 넘기는게 좋음
-    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args, run_name=run_name)
+    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args, run_name=run_name, algorithm=algorithm)

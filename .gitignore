@@ -169,3 +169,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+.sh
+*.txt
+*.pt
+*.npy
+*.png
+*.json
+*.wandb
+*.yaml

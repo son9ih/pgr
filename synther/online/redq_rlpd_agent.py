@@ -27,12 +27,12 @@ class REDQRLPDCondAgent(REDQSACAgent):
         self.cond_optimizer = torch.optim.Adam(self.cond_net.parameters(), lr=self.lr)
         
         # rnd introduction
-        if self.rnd:
-            self.pred_net = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
-            self.pred_net_target = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
-            self.fix_net = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
-            
-            self.pred_optimizer = torch.optim.Adam(self.pred_net.parameters(), lr=1e-4)
+        # if self.rnd:
+        self.pred_net = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
+        self.pred_net_target = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
+        self.fix_net = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
+        
+        self.pred_optimizer = torch.optim.Adam(self.pred_net.parameters(), lr=1e-4)
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
