@@ -454,6 +454,9 @@ class Logger:
         # Create a dict for wandb logging
         wandb_dict = {}
         
+        # Define metrics that should be logged under "eval/" prefix
+        eval_metrics = {'StateEnt', 'PredLoss', 'LossQ1', 'AverageTestEpRet'}
+        
         for key in self.log_headers:
             val = self.log_current_row.get(key, "")
             valstr = "%8.3g"%val if hasattr(val, "__float__") else val
@@ -462,7 +465,11 @@ class Logger:
             
             # Add to wandb dict if value is numeric
             if hasattr(val, "__float__"):
-                wandb_dict[key] = val
+                # Add "eval/" prefix for specific metrics
+                if key in eval_metrics:
+                    wandb_dict[f"eval/{key}"] = val
+                else:
+                    wandb_dict[key] = val
         
         print("-"*n_slashes)
         if self.output_file is not None:

@@ -437,6 +437,7 @@ class Trainer(object):
         data = data.to(device)
         if 'cond' in kwargs:
             if self.args.synther:
+                # 이전 코드에 synther면 None이 들어오는데 이걸 device로 보내면 error 발생
                 if kwargs['cond'] is not None:
                     kwargs['cond'] = kwargs['cond'].to(device)
             else:

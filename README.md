@@ -38,34 +38,38 @@ scripts for baselines (REDQ, SER, PGR, PGR-rnd) and our methods
 
 Baseline.1: REDQ
 ```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --disable_diffusion
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --disable_diffusion
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --disable_diffusion
+python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm REDQ
+python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
+python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
 ```
 Baseline.2: SER
 ```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --synther --histo
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --synther --histo
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --synther --histo
+python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm SER
+python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
+python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
 ```
 Baseline.3: PGR
 ```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000
+python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm PGR
+python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
+python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
 ```
 Baseline.4: PGR-rnd
 ```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --rnd --histo
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --rnd --histo
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --rnd --histo
+python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm PGRrnd
+python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGRrnd
+python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGRrnd
 ```
 Ours: ??
 ```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --rnd --finetune --synther --reward_coef 1e6 --kl_weight 0.1 --histo
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --rnd --finetune --synther --reward_coef 1e6 --kl_weight 0.1 --histo
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 5 --state_ent --knn_k 12 --ent_eval_num 10000 --rnd --finetune --synther --reward_coef 1e6 --kl_weight 0.1 --histo
+python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm Ours
+python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
+python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
 ```
+
+## Running Instructions(2)
+
+scripts for baselines (REDQ, SER, PGR, PGR-rnd) and our methods in Maze
 
 ## <a name="Citing"></a>Citing PGR
 
