@@ -240,7 +240,7 @@ def redq_sac(
     o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
     # One-time header registration guard for StateEnt to avoid header errors
-    state_ent_header_initialized = False
+    # state_ent_header_initialized = False
 
     for t in range(total_steps):
         # get action from agent
@@ -266,7 +266,9 @@ def redq_sac(
         
         # train RND predictor network, once in a epoch
         # if (t + 1) % steps_per_epoch == 0 and args.rnd:
-        if (t + 1) % steps_per_epoch == 0:
+        # if (t + 1) % steps_per_epoch == 0:
+        # When episode ends, t가 max_epi_len에 도달하지 않아도 d = True가 될 수 있어서?
+        if d or (ep_len == max_ep_len):
             agent.pred_net.train()
             pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
             agent.pred_net.eval()
@@ -386,7 +388,10 @@ def redq_sac(
                 diffusion_novelty = agent.compute_intrinsic_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
                 # Combined 10k observations and novelty
                 combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
-                combined_novelty = agent.compute_intrinsic_reward(combined_obs_tensor).cpu().numpy().squeeze()       
+                combined_novelty = agent.compute_intrinsic_reward(combined_obs_tensor).cpu().numpy().squeeze()     
+            
+            
+            cur_epoch = t // steps_per_epoch  
                     
             # 1. Histogram plotting
             if (args.algorithm == 'PGRrnd' or args.algorithm == 'PGR'):
@@ -394,11 +399,20 @@ def redq_sac(
                 # Prepare output directory
                 out_dir = os.path.join(args.results_folder, 'histograms')
                 os.makedirs(out_dir, exist_ok=True)
-                cur_epoch = t // steps_per_epoch
+                # cur_epoch = t // steps_per_epoch
 
+                # # Build shared bins/ranges using the widest x-range across the three arrays
+                # x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
+                # x_max = float(max(real_novelty.max(), diffusion_novelty.max(), combined_novelty.max()))
+                # if x_min == x_max:
+                #     # avoid zero-width bins if all values are identical
+                #     x_min -= 1e-8
+                #     x_max += 1e-8
+                # num_bins = 100
+                # bins = np.linspace(x_min, x_max, num_bins + 1)
                 # Build shared bins/ranges using the widest x-range across the three arrays
                 x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
-                x_max = float(max(real_novelty.max(), diffusion_novelty.max(), combined_novelty.max()))
+                x_max = float(np.percentile(combined_novelty, 98))  # Top 2% threshold
                 if x_min == x_max:
                     # avoid zero-width bins if all values are identical
                     x_min -= 1e-8
@@ -413,20 +427,33 @@ def redq_sac(
                 y_max = int(max(counts_real.max(), counts_diff.max(), counts_comb.max()))
                 # small headroom on y-axis
                 y_max = max(1, int(np.ceil(y_max * 1.05)))
+                
+                # Compute mean values
+                real_mean = float(real_novelty.mean())
+                diffusion_mean = float(diffusion_novelty.mean())
+                combined_mean = float(combined_novelty.mean())
+                
+                print(f'Real novelty mean: {real_mean:.7f}')
+                print(f'Diffusion novelty mean: {diffusion_mean:.7f}')
+                print(f'Combined novelty mean: {combined_mean:.7f}')
+
 
                 # Plot and save combined histogram figure with shared axes
                 fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
                 axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
+                axes[0].axvline(real_mean, color='red', linestyle='--', linewidth=2)
                 axes[0].set_title('Real Obs Novelty')
                 axes[0].set_xlabel('Novelty')
                 axes[0].set_ylabel('Count')
 
                 axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
+                axes[1].axvline(diffusion_mean, color='red', linestyle='--', linewidth=2)
                 axes[1].set_title('Diffusion Obs Novelty')
                 axes[1].set_xlabel('Novelty')
                 axes[1].set_ylabel('Count')
 
                 axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
+                axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
                 axes[2].set_title('Combined (10k) Novelty')
                 axes[2].set_xlabel('Novelty')
                 axes[2].set_ylabel('Count')
@@ -453,7 +480,7 @@ def redq_sac(
                     
             # 2. T-SNE
             if args.algorithm != 'REDQ':
-                cur_epoch = t // steps_per_epoch
+                # cur_epoch = t // steps_per_epoch
                     
                 # Prepare t-SNE visualization directory
                 tsne_dir = os.path.join(args.results_folder, 't-sne')
@@ -508,6 +535,8 @@ def redq_sac(
 
             # Test the performance of the deterministic version of the agent.
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
+            
+            # Evaluate bias as in REDQ
             if evaluate_bias:
                 log_bias_evaluation(bias_eval_env, agent, logger, max_ep_len, alpha, gamma, n_mc_eval, n_mc_cutoff)
 
@@ -517,18 +546,18 @@ def redq_sac(
                 
             # Evaluation of state entropy
             # 헤더 고정형 로거 대비 안전장치: 최초 dump 전에 한 번만 헤더를 미리 등록
-            if not state_ent_header_initialized and epoch == 0:
-                logger.log_tabular('StateEnt', val=float('nan'), average_only=True)
-                state_ent_header_initialized = True
+            # if not state_ent_header_initialized and epoch == 0:
+            #     logger.log_tabular('StateEnt', val=float('nan'), average_only=True)
+            #     state_ent_header_initialized = True
 
             # 매 5의 배수 epoch에서만 계산 및 로깅 (그 외에는 저장/로깅하지 않음)
-            if (epoch % 5 == 0) and (epoch > 1):
+            # if (epoch % 5 == 0) and (epoch > 1):
                 # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
-                obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=5000)
-                intr_rew = compute_intr_reward(pbe, obs_tensor)
-                logger.store(StateEnt=intr_rew)
-                logger.log_tabular('StateEnt', average_only=True)
-                print(f'State Entropy: {intr_rew.mean():.4f}')
+            obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=4000)
+            intr_rew = compute_intr_reward(pbe, obs_tensor)
+            logger.store(StateEnt=intr_rew)
+            logger.log_tabular('StateEnt', average_only=True)
+            print(f'State Entropy: {intr_rew.mean():.4f}')
             
 
             """logging"""
