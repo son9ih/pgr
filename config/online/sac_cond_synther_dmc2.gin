@@ -1,6 +1,6 @@
 # SAC (SynthER) for DMC environments.
 
-include 'config/online/sac.gin'
+include 'config/online/sac2.gin'
 
 # Higher UTD with synthetic data.
 redq_sac.utd_ratio = 20
@@ -8,7 +8,7 @@ redq_sac.utd_ratio = 20
 # SAC/REDQ diffusion args.
 redq_sac.disable_diffusion = False
 # redq_sac.retrain_diffusion_every = 10000
-redq_sac.retrain_diffusion_every = 4000
+redq_sac.retrain_diffusion_every = 5000
 # redq_sac.num_samples = 1000000
 redq_sac.num_samples = 100000
 redq_sac.diffusion_sample_ratio = 0.5

@@ -455,7 +455,7 @@ class Logger:
         wandb_dict = {}
         
         # Define metrics that should be logged under "eval/" prefix
-        eval_metrics = {'StateEnt', 'PredLoss', 'LossQ1', 'AverageTestEpRet'}
+        eval_metrics = {'StateEnt', 'PredLoss', 'LossQ1', 'AverageTestEpRet', 'AverageNormQBias', 'AverageNormQBiasSqr'}
         
         for key in self.log_headers:
             val = self.log_current_row.get(key, "")

@@ -315,35 +315,191 @@ def redq_sac(
                                                                    curr_epoch=(t // steps_per_epoch) + 1)
             agent.reset_diffusion_buffer()
             
-            # Start diffusion fine-tuning
-            if args.finetune:
-                print(f'Fine-tuning diffusion model for {args.backprop_epochs} epochs with lr {args.finetune_lr}')
+            
+            if args.rtb:
+                print(f'Fine-tuning diffusion model with RTB for {args.backprop_epochs} epochs with lr {args.finetune_lr}')
                 
-                # backprop_model = diffusion_trainer.ema.ema_model.to(device)
+                # Get pre-trained model and create fine-tuning model
                 backprop_model = diffusion_trainer.model.to(device)
+                backprop_model.train()  # Set to training mode for fine-tuning
+                
                 pre_trained_model = copy.deepcopy(backprop_model).to(device)
+                pre_trained_model.eval()  # Freeze pre-trained model
                 
-                # scheduler = DDIMScheduler(num_train_timesteps=diffusion_trainer.train_num_stpes, device=device)
-                scheduler = DDIMScheduler(num_train_timesteps=128, device=device)
-                scheduler.set_timesteps(num_inference_steps=128)
-                
-                # optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
+                # Setup optimizer and log partition function
                 optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
-                kl_weight = args.kl_weight
+                log_Z = torch.nn.Parameter(torch.tensor(0.0, device=device))
+                # optimizer.add_param_group({'params': [log_Z]})
+                optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
                 
+                # Get sigma schedule from diffusion model (using ElucidatedDiffusion's sample_schedule)
+                num_rtb_steps = 128  # Number of steps in RTB trajectory
+                sigmas = backprop_model.sample_schedule(num_rtb_steps).to(device)
+                
+                # 1) Compute reward statistics from entire replay buffer for normalization
+                print("Computing reward statistics from entire replay buffer...")
+                ptr_location = agent.replay_buffer.ptr
+                all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location]).to(device)
+                
+                # Compute rewards in batches to avoid OOM
+                all_rewards = []
+                batch_size_stat = args.ft_batch_size
+                with torch.no_grad():
+                    for i in range(0, ptr_location, batch_size_stat):
+                        batch_next_obs = all_next_obs[i:i+batch_size_stat]
+                        batch_rewards = agent.compute_intrinsic_reward(batch_next_obs)
+                        all_rewards.append(batch_rewards)
+                    all_rewards = torch.cat(all_rewards, dim=0)
+                
+                reward_mean = all_rewards.mean().item()
+                reward_std = all_rewards.std().item()
+                print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
+                
+                # 2) Create dataset and dataloader for proper epoch iteration
+                from torch.utils.data import TensorDataset, DataLoader
+                
+                obs_data = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
+                obs_next_data = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
+                acts_data = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
+                rews_data = torch.FloatTensor(agent.replay_buffer.rews_buf[:ptr_location])
+                done_data = torch.FloatTensor(agent.replay_buffer.done_buf[:ptr_location])
+                
+                dataset = TensorDataset(obs_data, obs_next_data, acts_data, rews_data, done_data)
+                dataloader = DataLoader(dataset, batch_size=args.ft_batch_size, shuffle=True, drop_last=True)
+                
+                # Training loop - now truly iterating over entire dataset each epoch
                 for epoch in range(args.backprop_epochs):
-                    loss, reward, kl_div = fine_tune_step(pre_trained_model, backprop_model, scheduler, optimizer, kl_weight, max_grad_norm=1.0,
-                                                          device=device, compute_reward = agent.compute_intrinsic_reward,
-                                                          input_dim=diff_dims, batch_size=args.ft_batch_size,
-                                                          obs_dim=obs_dim, act_dim=act_dim)
-                    # pdb.set_trace()
-                    # if epoch % 10 == 0:
-                    #     print(f"Fine-tuning Epoch {epoch}, Loss: {loss:.4f}, Reward: {reward:.4f}, KL Div: {kl_div:.16f}")
-                    print(f"Fine-tuning Epoch {epoch}, Loss: {loss:.16f}, Reward: {reward:.16f}, KL Div: {kl_div:.16f}")  
+                    epoch_loss = 0.0
+                    epoch_log_z = 0.0
+                    epoch_reward = 0.0
+                    epoch_log_ratio = 0.0
+                    num_batches = 0
+                    
+                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
+                        obs = obs.to(device)
+                        next_obs = next_obs.to(device)
+                        act = act.to(device)
+                        rew = rew.to(device)
+                        
+                        current_batch_size = obs.size(0)
+                        
+                        # Construct x1 (clean samples): [obs, act, rew, next_obs]
+                        x1 = torch.cat([obs, act, rew.unsqueeze(-1), next_obs], dim=-1).to(device)
+                        
+                        # Normalize x1
+                        x1_normalized = backprop_model.normalizer.normalize(x1)
+                        
+                        # Compute reward r(x1) using intrinsic reward on next_obs
+                        with torch.no_grad():
+                            rewards = agent.compute_intrinsic_reward(next_obs)  # r(x1)
+                        # Normalize rewards using buffer statistics
+                        rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
+                        rewards_norm = rewards_norm * args.beta  # Scale by beta
+                        
+                        # Compute RTB loss
+                        optimizer.zero_grad()
+                        optimizer_z.zero_grad()
+                        
+                        # Add noise to x1 to get x0 (maximum noise level)
+                        sigma_max = sigmas[0]  # Maximum sigma
+                        noise = torch.randn_like(x1_normalized)
+                        x_t = x1_normalized + sigma_max * noise  # Start from noisy version
+                        
+                        log_ratio_sum = torch.zeros(current_batch_size, device=device)
+                        cond = None  # No conditioning
+                        
+                        # Denoise from x_T (noisy) to x_0 (clean), computing likelihood ratio at each step
+                        for i in range(len(sigmas) - 1):
+                            sigma_curr = sigmas[i].item()  # Convert to float
+                            sigma_next = sigmas[i + 1].item()  # Convert to float
+                            
+                            # Predict denoised output with both models
+                            with torch.no_grad():
+                                denoised_prior = pre_trained_model.preconditioned_network_forward(x_t, sigma_curr, cond=cond)
+                            
+                            denoised_post = backprop_model.preconditioned_network_forward(x_t, sigma_curr, cond=cond)
+                            
+                            # Compute score functions: (x_t - denoised) / sigma
+                            # Score is gradient of log p(x_t)
+                            score_prior = (x_t - denoised_prior) / (sigma_curr + 1e-8)
+                            score_post = (x_t - denoised_post) / (sigma_curr + 1e-8)
+                            
+                            # Compute log likelihood ratio for this step
+                            # Using Gaussian transition: p(x_{t-1} | x_t) ∝ exp(-||score||^2 * sigma^2 / 2)
+                            # Log ratio: log p_post - log p_prior
+                            step_log_ratio = -0.5 * sigma_curr**2 * (
+                                torch.sum(score_post**2, dim=-1) - torch.sum(score_prior**2, dim=-1)
+                            )
+                            log_ratio_sum = log_ratio_sum + step_log_ratio
+                            
+                            # Update x_t using posterior prediction for next iteration
+                            # Simple Euler-Maruyama update: x_{t-dt} = x_t + (sigma_t - sigma_{t-dt}) * score
+                            x_t = x_t + (sigma_next - sigma_curr) * score_post
+                        
+                        # Compute RTB loss: (log(Z/r(x1)) + Σ log(p_post/p_prior))^2
+                        # Use normalized rewards
+                        rtb_loss = (log_Z - rewards_norm.squeeze() + log_ratio_sum) ** 2
+                        rtb_loss = rtb_loss.mean()
+                        
+                        # Backpropagate
+                        rtb_loss.backward()
+                        nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+                        nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+                        optimizer.step()
+                        optimizer_z.step()
+                        
+                        # Accumulate statistics
+                        epoch_loss += rtb_loss.item()
+                        epoch_log_z += log_Z.item()
+                        epoch_reward += rewards.mean().item()
+                        epoch_log_ratio += log_ratio_sum.mean().item()
+                        num_batches += 1
+                    
+                    # Print epoch statistics
+                    if epoch % 1 == 0:
+                        print(f"RTB Epoch {epoch}/{args.backprop_epochs}, "
+                              f"Loss: {epoch_loss/num_batches:.6f}, "
+                              f"log_Z: {epoch_log_z/num_batches:.4f}, "
+                              f"Avg Reward: {epoch_reward/num_batches:.6f}, "
+                              f"Log Ratio: {epoch_log_ratio/num_batches:.4f}, "
+                              f"Batches: {num_batches}")
                 
-                # After fine-tuning, sync EMA model so sampling uses updated weights
+                # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
-                print('Synced EMA model with fine-tuned weights for sampling.')
+                print('RTB fine-tuning complete. Synced EMA model with fine-tuned weights.')
+            
+            # # Start diffusion fine-tuning
+            # if args.finetune:
+            #     print(f'Fine-tuning diffusion model for {args.backprop_epochs} epochs with lr {args.finetune_lr}')
+                
+            #     # backprop_model = diffusion_trainer.ema.ema_model.to(device)
+            #     backprop_model = diffusion_trainer.model.to(device)
+            #     backprop_model.train()  # Set to training mode
+                
+            #     pre_trained_model = copy.deepcopy(backprop_model).to(device)
+            #     pre_trained_model.eval()  # Freeze pre-trained model
+                
+            #     # scheduler = DDIMScheduler(num_train_timesteps=diffusion_trainer.train_num_stpes, device=device)
+            #     scheduler = DDIMScheduler(num_train_timesteps=128, device=device)
+            #     scheduler.set_timesteps(num_inference_steps=128)
+                
+            #     # optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
+            #     optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
+            #     kl_weight = args.kl_weight
+                
+            #     for epoch in range(args.backprop_epochs):
+            #         loss, reward, kl_div = fine_tune_step(pre_trained_model, backprop_model, scheduler, optimizer, kl_weight, max_grad_norm=1.0,
+            #                                               device=device, compute_reward = agent.compute_intrinsic_reward,
+            #                                               input_dim=diff_dims, batch_size=args.ft_batch_size,
+            #                                               obs_dim=obs_dim, act_dim=act_dim)
+            #         # pdb.set_trace()
+            #         # if epoch % 10 == 0:
+            #         #     print(f"Fine-tuning Epoch {epoch}, Loss: {loss:.4f}, Reward: {reward:.4f}, KL Div: {kl_div:.16f}")
+            #         print(f"Fine-tuning Epoch {epoch}, Loss: {loss:.16f}, Reward: {reward:.16f}, KL Div: {kl_div:.16f}")  
+                
+            #     # After fine-tuning, sync EMA model so sampling uses updated weights
+            #     diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
+            #     print('Synced EMA model with fine-tuned weights for sampling.')
                         
 
             # Add samples to agent replay buffer
@@ -392,9 +548,9 @@ def redq_sac(
             
             
             cur_epoch = t // steps_per_epoch  
-                    
+            
             # 1. Histogram plotting
-            if (args.algorithm == 'PGRrnd' or args.algorithm == 'PGR'):
+            if (args.algorithm == 'PGRrnd' or args.algorithm == 'PGR' or args.algorithm == 'Ours'):
 
                 # Prepare output directory
                 out_dir = os.path.join(args.results_folder, 'histograms')
@@ -470,7 +626,7 @@ def redq_sac(
                     wandb.log({
                         'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
                     # }, step=t+1)novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
-                    })
+                    }, step=cur_epoch)
                 out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
                 fig.savefig(out_path)
                 plt.close(fig)
@@ -521,7 +677,7 @@ def redq_sac(
                 if args.wandb:
                     wandb.log({
                         'images/t-sne': wandb.Image(fig_tsne, caption=f'Epoch {cur_epoch}')
-                    })
+                    }, step=cur_epoch)
                 
                 # Save to disk
                 tsne_path = os.path.join(tsne_dir, f'tsne_epoch{cur_epoch:04d}.png')
@@ -813,21 +969,15 @@ if __name__ == '__main__':
     parser.add_argument('--rnd', action='store_true', default=False)
     
     # finetune arguments
-    parser.add_argument('--finetune', action='store_true', default=False)
-    parser.add_argument('--backprop_epochs', type=int, default=20)
-    parser.add_argument('--finetune_lr', type=float, default=1e-4)
-    parser.add_argument('--ft_batch_size', type=int, default=256)
-    parser.add_argument('--kl_weight', type=float, default=0.1)
-    parser.add_argument('--reward_coef', type=float, default=1.0)
-    
-    # histogram arguments
-    # parser.add_argument('--histo', action='store_true', default=False)
+    # parser.add_argument('--finetune', action='store_true', default=False)
+    parser.add_argument('--backprop_epochs', type=int, default=15)
+    parser.add_argument('--finetune_lr', type=float, default=1e-5)
+    parser.add_argument('--ft_batch_size', type=int, default=1024)
+    parser.add_argument('--rtb', action='store_true', default=False)
+    parser.add_argument('--beta', type=float, default=1.0)
     
     # REDQ
     parser.add_argument('--disable_diffusion', action='store_true', default=False)
-    
-    # T-SNE visualization
-    # parser.add_argument('--tsne', action='store_true', default=False)
     
     parser.add_argument('--algorithm', type=str, default='REDQ')  # placeholder, not used directly
     
@@ -839,27 +989,27 @@ if __name__ == '__main__':
         args.disable_diffusion = True
         args.synther = False
         args.rnd = False
-        args.finetune - False
+        args.rtb = True
     if args.algorithm == 'SER':
         args.disable_diffusion = False
         args.synther = True
         args.rnd = False
-        args.finetune - False
+        args.rtb = True
     if args.algorithm == 'PGR':
         args.disable_diffusion = False
         args.synther = False
         args.rnd = False
-        args.finetune - False
+        args.rtb = True
     if args.algorithm == 'PGRrnd':
         args.disable_diffusion = False
         args.synther = False
         args.rnd = True
-        args.finetune - False
+        args.rtb = True
     if args.algorithm == 'Ours':
         args.disable_diffusion = False
         args.synther = True
         args.rnd = True
-        args.finetune = True
+        args.rtb = True
         
     
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{run_name}'
