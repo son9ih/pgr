@@ -970,9 +970,9 @@ if __name__ == '__main__':
     
     # finetune arguments
     # parser.add_argument('--finetune', action='store_true', default=False)
-    parser.add_argument('--backprop_epochs', type=int, default=15)
-    parser.add_argument('--finetune_lr', type=float, default=1e-5)
-    parser.add_argument('--ft_batch_size', type=int, default=1024)
+    parser.add_argument('--backprop_epochs', type=int, default=40)
+    parser.add_argument('--finetune_lr', type=float, default=3e-4)
+    parser.add_argument('--ft_batch_size', type=int, default=512)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     
@@ -989,22 +989,22 @@ if __name__ == '__main__':
         args.disable_diffusion = True
         args.synther = False
         args.rnd = False
-        args.rtb = True
+        args.rtb = False
     if args.algorithm == 'SER':
         args.disable_diffusion = False
         args.synther = True
         args.rnd = False
-        args.rtb = True
+        args.rtb = False
     if args.algorithm == 'PGR':
         args.disable_diffusion = False
         args.synther = False
         args.rnd = False
-        args.rtb = True
+        args.rtb = False
     if args.algorithm == 'PGRrnd':
         args.disable_diffusion = False
         args.synther = False
         args.rnd = True
-        args.rtb = True
+        args.rtb = False
     if args.algorithm == 'Ours':
         args.disable_diffusion = False
         args.synther = True
