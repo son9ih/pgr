@@ -367,13 +367,17 @@ def redq_sac(
                 dataset = TensorDataset(obs_data, obs_next_data, acts_data, rews_data, done_data)
                 dataloader = DataLoader(dataset, batch_size=args.ft_batch_size, shuffle=True, drop_last=True)
                 
-                # Training loop - now truly iterating over entire dataset each epoch
+                # Training loop with gradient accumulation to reduce GPU memory usage
+                accumulation_steps = args.accumulation_steps
                 for epoch in range(args.backprop_epochs):
                     epoch_loss = 0.0
                     epoch_log_z = 0.0
                     epoch_reward = 0.0
                     epoch_log_ratio = 0.0
                     num_batches = 0
+                    
+                    optimizer.zero_grad()
+                    optimizer_z.zero_grad()
                     
                     for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
                         obs = obs.to(device)
@@ -392,13 +396,9 @@ def redq_sac(
                         # Compute reward r(x1) using intrinsic reward on next_obs
                         with torch.no_grad():
                             rewards = agent.compute_intrinsic_reward(next_obs)  # r(x1)
-                        # Normalize rewards using buffer statistics
-                        rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
-                        rewards_norm = rewards_norm * args.beta  # Scale by beta
-                        
-                        # Compute RTB loss
-                        optimizer.zero_grad()
-                        optimizer_z.zero_grad()
+                            # Normalize rewards using buffer statistics
+                            rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
+                            rewards_norm = rewards_norm * args.beta  # Scale by beta
                         
                         # Add noise to x1 to get x0 (maximum noise level)
                         sigma_max = sigmas[0]  # Maximum sigma
@@ -437,23 +437,37 @@ def redq_sac(
                             x_t = x_t + (sigma_next - sigma_curr) * score_post
                         
                         # Compute RTB loss: (log(Z/r(x1)) + Σ log(p_post/p_prior))^2
-                        # Use normalized rewards
+                        # Use normalized rewards, divided by accumulation_steps for gradient accumulation
                         rtb_loss = (log_Z - rewards_norm.squeeze() + log_ratio_sum) ** 2
-                        rtb_loss = rtb_loss.mean()
+                        rtb_loss = rtb_loss.mean() / accumulation_steps
                         
-                        # Backpropagate
+                        # Backpropagate (accumulate gradients)
                         rtb_loss.backward()
-                        nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
-                        nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
-                        optimizer.step()
-                        optimizer_z.step()
                         
-                        # Accumulate statistics
-                        epoch_loss += rtb_loss.item()
+                        # Accumulate statistics (multiply by accumulation_steps to get actual loss)
+                        epoch_loss += rtb_loss.item() * accumulation_steps
                         epoch_log_z += log_Z.item()
                         epoch_reward += rewards.mean().item()
                         epoch_log_ratio += log_ratio_sum.mean().item()
                         num_batches += 1
+                        
+                        # Perform optimization step every accumulation_steps batches
+                        if (batch_idx + 1) % accumulation_steps == 0:
+                            nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+                            nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+                            optimizer.step()
+                            optimizer_z.step()
+                            optimizer.zero_grad()
+                            optimizer_z.zero_grad()
+                    
+                    # Update remaining accumulated gradients at end of epoch if needed
+                    if num_batches % accumulation_steps != 0:
+                        nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+                        nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+                        optimizer.step()
+                        optimizer_z.step()
+                        optimizer.zero_grad()
+                        optimizer_z.zero_grad()
                     
                     # Print epoch statistics
                     if epoch % 1 == 0:
@@ -462,7 +476,8 @@ def redq_sac(
                               f"log_Z: {epoch_log_z/num_batches:.4f}, "
                               f"Avg Reward: {epoch_reward/num_batches:.6f}, "
                               f"Log Ratio: {epoch_log_ratio/num_batches:.4f}, "
-                              f"Batches: {num_batches}")
+                              f"Batches: {num_batches}, "
+                              f"Accum Steps: {accumulation_steps}")
                 
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
@@ -970,11 +985,12 @@ if __name__ == '__main__':
     
     # finetune arguments
     # parser.add_argument('--finetune', action='store_true', default=False)
-    parser.add_argument('--backprop_epochs', type=int, default=40)
-    parser.add_argument('--finetune_lr', type=float, default=3e-4)
+    parser.add_argument('--backprop_epochs', type=int, default=20)
+    parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--ft_batch_size', type=int, default=512)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
+    parser.add_argument('--accumulation_steps', type=int, default=4)
     
     # REDQ
     parser.add_argument('--disable_diffusion', action='store_true', default=False)
