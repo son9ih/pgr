@@ -333,7 +333,8 @@ def redq_sac(
                 optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
                 
                 # Get sigma schedule from diffusion model (using ElucidatedDiffusion's sample_schedule)
-                num_rtb_steps = 128  # Number of steps in RTB trajectory
+                # 50% of actual diffusion steps for efficiency
+                num_rtb_steps = 64  # Number of steps in RTB trajectory
                 sigmas = backprop_model.sample_schedule(num_rtb_steps).to(device)
                 
                 # 1) Compute reward statistics from entire replay buffer for normalization
@@ -427,6 +428,7 @@ def redq_sac(
                             # Compute log likelihood ratio for this step
                             # Using Gaussian transition: p(x_{t-1} | x_t) ∝ exp(-||score||^2 * sigma^2 / 2)
                             # Log ratio: log p_post - log p_prior
+                            # Squaring these large scores in score**2 causes exponential growth.
                             step_log_ratio = -0.5 * sigma_curr**2 * (
                                 torch.sum(score_post**2, dim=-1) - torch.sum(score_prior**2, dim=-1)
                             )
@@ -437,15 +439,24 @@ def redq_sac(
                             x_t = x_t + (sigma_next - sigma_curr) * score_post
                         
                         # Compute RTB loss: (log(Z/r(x1)) + Σ log(p_post/p_prior))^2
-                        # Use normalized rewards, divided by accumulation_steps for gradient accumulation
-                        rtb_loss = (log_Z - rewards_norm.squeeze() + log_ratio_sum) ** 2
-                        rtb_loss = rtb_loss.mean() / accumulation_steps
+                        rtb_loss_per_sample = (log_Z - rewards_norm.squeeze() + log_ratio_sum) ** 2
                         
-                        # Backpropagate (accumulate gradients)
-                        rtb_loss.backward()
+                        # Loss clipping: skip updates when loss is too small (well-fit trajectories)
+                        # Following RTB paper's stabilization method with threshold 0.1
+                        valid_mask = rtb_loss_per_sample > 0.1
                         
-                        # Accumulate statistics (multiply by accumulation_steps to get actual loss)
-                        epoch_loss += rtb_loss.item() * accumulation_steps
+                        if valid_mask.any():
+                            # Only compute loss for samples above threshold
+                            rtb_loss = rtb_loss_per_sample[valid_mask].mean() / accumulation_steps
+                            
+                            # Backpropagate (accumulate gradients)
+                            rtb_loss.backward()
+                            
+                            # Accumulate statistics (multiply by accumulation_steps to get actual loss)
+                            epoch_loss += rtb_loss.item() * accumulation_steps
+                        else:
+                            # All samples below threshold - skip this batch
+                            epoch_loss += 0.0
                         epoch_log_z += log_Z.item()
                         epoch_reward += rewards.mean().item()
                         epoch_log_ratio += log_ratio_sum.mean().item()
@@ -987,7 +998,7 @@ if __name__ == '__main__':
     # parser.add_argument('--finetune', action='store_true', default=False)
     parser.add_argument('--backprop_epochs', type=int, default=20)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
-    parser.add_argument('--ft_batch_size', type=int, default=512)
+    parser.add_argument('--ft_batch_size', type=int, default=256)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--accumulation_steps', type=int, default=4)
@@ -999,8 +1010,13 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
-    assert args.algorithm in ['REDQ', 'PGR', 'PGRrnd', 'SER', 'Ours']
+    assert args.algorithm in ['REDQ', 'PGR', 'PGRrnd', 'SER', 'Ours', 'SAC']
     run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_{args.algorithm}"
+    if args.algorithm == 'SAC':
+        args.disable_diffusion = True
+        args.synther = False
+        args.rnd = False
+        args.rtb = False
     if args.algorithm == 'REDQ':
         args.disable_diffusion = True
         args.synther = False
