@@ -21,21 +21,27 @@ If you don't have MuJoCo installed, follow the instructions here: https://github
 ## Running Instructions
 
 ```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1'
+python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed '(...)' --algorithm '(...)'
 ```
 
 ```bash
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25'
+python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed '(...)' --algorithm '(...)'
 ```
 
 ```bash
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25'
+python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed '(...)' --algorithm '(...)'
 ```
 
 ## Running Instructions(1)
 
-scripts for baselines (REDQ, SER, PGR, PGR-rnd) and our methods
+scripts for baselines (SAC, REDQ, SER, PGR, PGR-rnd) and our methods in DMCsuite
 
+Baseline.0: SAC
+```bash
+python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm SAC
+python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
+python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
+```
 Baseline.1: REDQ
 ```bash
 python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm REDQ
@@ -69,7 +75,44 @@ python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files co
 
 ## Running Instructions(2)
 
-scripts for baselines (REDQ, SER, PGR, PGR-rnd) and our methods in Maze
+scripts for baselines (SAC, REDQ, SER, PGR, PGR-rnd) and our methods in Mujoco
+
+Baseline.0: SAC
+```bash
+python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
+python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
+python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
+```
+Baseline.1: REDQ
+```bash
+python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
+python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
+python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
+```
+Baseline.2: SER
+```bash
+python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
+python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
+python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
+```
+Baseline.3: PGR
+```bash
+python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
+python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
+python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
+```
+Baseline.4: PGR-rnd
+```bash
+python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
+python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
+python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
+```
+Ours: ??
+```bash
+python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
+python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
+python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
+```
 
 ## <a name="Citing"></a>Citing PGR
 
