@@ -325,6 +325,9 @@ def redq_sac(
                 backprop_model = diffusion_trainer.model.to(device)
                 backprop_model.train()  # Set to training mode for fine-tuning
                 
+                # 
+                print(backprop_model.sigmas)
+                
                 pre_trained_model = copy.deepcopy(backprop_model).to(device)
                 pre_trained_model.eval()  # Freeze pre-trained model
                 
@@ -332,6 +335,11 @@ def redq_sac(
                 
                 
                 sigmas = backprop_model.sample_schedule(backprop_model.diffusion_steps).to(device)
+                backprop_model.beta_t = backprop_model.beta_t.to(device)
+                backprop_model.alpha_t = backprop_model.alpha_t.to(device)
+                backprop_model.oneover_sqrta = backprop_model.oneover_sqrta.to(device)
+                backprop_model.sqrtmab = backprop_model.sqrtmab.to(device)
+                backprop_model.mab_over_sqrtmab_inv = backprop_model.mab_over_sqrtmab_inv.to(device)
                 
                 # Setup optimizer and log partition function
                 optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
@@ -371,6 +379,7 @@ def redq_sac(
                 accumulation_steps = args.accumulation_steps
                 
                 for epoch in range(args.backprop_epochs):
+                    # print(f'Epoch')
                     # epoch_loss = 0.0
                     # epoch_log_z = 0.0
                     # epoch_reward = 0.0
@@ -384,6 +393,7 @@ def redq_sac(
                     
                     
                     for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
+                        print('Processing batch ', batch_idx)
                         obs = obs.to(device)
                         next_obs = next_obs.to(device)
                         act = act.to(device)
@@ -408,6 +418,7 @@ def redq_sac(
                             
                             
                         # On-policy Training 
+                        print('Starting on-policy training step...')
                         if global_step % args.sample_freq == 0:
                             optimizer.zero_grad()
                             optimizer_z.zero_grad()
@@ -416,8 +427,8 @@ def redq_sac(
                             # x, logpf_pi, logpf_p = backprop_model.sample_rtb(batch_size = args.gfn_batch_size, num_sample_steps=backprop_model.diffusion_steps, cond=None)
                             normal_dist = torch.distributions.Normal(torch.zeros((args.gfn_batch_size, *backprop_model.event_shape),device=device), torch.ones((args.gfn_batch_size, *backprop_model.event_shape), device=device))
                             x = normal_dist.sample()
-                            t = torch.zeros((args.gfn_batch_size,), device=x.device)
-                            dt = 1/ backprop_model.diffusion_steps
+                            # t = torch.zeros((args.gfn_batch_size,), device=x.device)
+                            # dt = 1/ backprop_model.diffusion_steps
                             
                             logpf_pi = normal_dist.log_prob(x).sum(1)
                             logpf_p = normal_dist.log_prob(x).sum(1)
@@ -428,8 +439,9 @@ def redq_sac(
                             for i in range(backprop_model.diffusion_steps):
                                 for j in range(extra_steps):
                                     # q_epsilon, bc_epsilon = self(s, x, t)
-                                    q_epsilon = backprop_model.score_fn(x, sigmas[i])
-                                    bc_epsilon = pre_trained_model.score_fn(x, sigmas[i])
+                                    q_epsilon = backprop_model.score_fn(x, sigmas[i].item())
+                                    with torch.no_grad():
+                                        bc_epsilon = pre_trained_model.score_fn(x, sigmas[i].item())
                                     
                                     pflogvars = np.log(torch.sqrt(backprop_model.beta_t[i]).cpu().numpy()) * 2
                                     pflogvars_sample = pflogvars
@@ -437,6 +449,8 @@ def redq_sac(
                                     epsilon = q_epsilon + bc_epsilon
                                     new_x = backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon.detach()) + torch.sqrt(backprop_model.beta_t[i]) * torch.randn_like(x)
 
+                                    # print(i)
+                                    # pdb.set_trace()
                                     pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(x))
                                     logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
 
@@ -446,10 +460,10 @@ def redq_sac(
                                     x = new_x
                                     if i < backprop_model.diffusion_steps-1:
                                         break 
-                                t = t + dt
+                                # t = t + dt
                                 
                             
-                            
+                            # pdb.set_trace()
                             
                             # caution: may not be correct
                             # need to debug
@@ -471,7 +485,7 @@ def redq_sac(
                             # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
                             # loss = 0.5*((args.alpha*logpf_p + logC - args.alpha*logpf_pi - logr.detach())**2).mean()
                             # detach()?
-                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - logr.detach())**2).mean()
+                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
                             
                             loss.backward()
                             optimizer.step()
@@ -486,15 +500,17 @@ def redq_sac(
                             # logZSample = logC.mean().item()
                             # loss = logZSample = backprop_model.compute_loss()
                            
-                    
+
+                        # pdb.set_trace()
                     
                     
                         # Off-policy Training
+                        print('Starting off-policy training step...')
                         x1_repeat = x1_normalized.repeat_interleave(args.gfn_batch_size, dim=0) 
                         # batch size
                         bs = x1_repeat.shape[0]
-                        t = torch.zeros((bs,), device=x1_repeat.device)
-                        dt = 1/backprop_model.diffusion_steps
+                        # t = torch.zeros((bs,), device=x1_repeat.device)
+                        # dt = 1/backprop_model.diffusion_steps
                         
                         logpf_pi = torch.zeros((bs,), device=x1_repeat.device)
                         logpf_p = torch.zeros((bs,), device=x1_repeat.device)
@@ -502,16 +518,19 @@ def redq_sac(
                         logr = rewards_norm
                         logr = logr.repeat_interleave(args.gfn_batch_size, dim=0)
                         
+                        
+                        
                         for i in range(backprop_model.diffusion_steps-1, -1, -1):
+                            # pdb.set_trace()
                             # make forward kernel
                             pb_dist = torch.distributions.Normal(torch.sqrt(backprop_model.alpha_t[i])*x1_repeat, torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(x1_repeat))
                             # sample noisy one from the kernel
                             new_x = pb_dist.sample()
                             
                             # right sigma?
-                            q_epsilon = backprop_model.score_fn(new_x, sigma=sigmas[i])
+                            q_epsilon = backprop_model.score_fn(new_x, sigma=sigmas[i].item())
                             with torch.no_grad():
-                                bc_epsilon = pre_trained_model.score_fn(new_x, sigma=sigmas[i])
+                                bc_epsilon = pre_trained_model.score_fn(new_x, sigma=sigmas[i].item())
                             epsilon = q_epsilon + bc_epsilon
                             
                             pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
@@ -532,7 +551,7 @@ def redq_sac(
                         # loss = 0.5*((args.alpha*logpf_p+logC-args.alpha*logpf_pi-logr.detach())**2).mean()
                         
                         # before mean, supposed to get batch_size of loss, vectorized calculation
-                        loss = 0.5*((args.alpha*logpf_p+log_Z-args.alpha*logpf_pi-logr.detach())**2).mean()
+                        loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
                         # return loss, logC.mean().item()
                         
                         optimizer.zero_grad()
@@ -559,8 +578,9 @@ def redq_sac(
                         avg_epoch_loss_on = np.mean(epoch_loss_on)
                         avg_epoch_reward_on = np.mean(epoch_reward_on)
                         avg_epoch_loss_off = np.mean(epoch_loss_off)
+                        print('======================================================================')
                         print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
-                        
+                        print('======================================================================')
                         
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
@@ -787,7 +807,7 @@ def redq_sac(
                 combined_novelty = agent.compute_intrinsic_reward(combined_obs_tensor).cpu().numpy().squeeze()     
             
             
-            cur_epoch = t // steps_per_epoch  
+            cur_epoch = t // steps_per_epoch
             
             # 1. Histogram plotting
             if (args.algorithm == 'PGRrnd' or args.algorithm == 'PGR' or args.algorithm == 'Ours'):
@@ -1212,7 +1232,7 @@ if __name__ == '__main__':
     # parser.add_argument('--finetune', action='store_true', default=False)
     parser.add_argument('--backprop_epochs', type=int, default=20)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
-    parser.add_argument('--ft_batch_size', type=int, default=256)
+    parser.add_argument('--ft_batch_size', type=int, default=128)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--accumulation_steps', type=int, default=4)
@@ -1223,7 +1243,7 @@ if __name__ == '__main__':
     parser.add_argument('--algorithm', type=str, default='REDQ')  # placeholder, not used directly
     
     parser.add_argument('--sample_freq', type=int, default=1)
-    parser.add_argument('--gfn_batch_size', type=int, default=64)
+    parser.add_argument('--gfn_batch_size', type=int, default=16)
     parser.add_argument('--alpha', type=float, default=1.0)
     
     args = parser.parse_args()
