@@ -325,9 +325,6 @@ def redq_sac(
                 backprop_model = diffusion_trainer.model.to(device)
                 backprop_model.train()  # Set to training mode for fine-tuning
                 
-                # 
-                print(backprop_model.sigmas)
-                
                 pre_trained_model = copy.deepcopy(backprop_model).to(device)
                 pre_trained_model.eval()  # Freeze pre-trained model
                 
@@ -485,7 +482,7 @@ def redq_sac(
                             # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
                             # loss = 0.5*((args.alpha*logpf_p + logC - args.alpha*logpf_pi - logr.detach())**2).mean()
                             # detach()?
-                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
+                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi -logr.detach())**2).mean()
                             
                             loss.backward()
                             optimizer.step()
@@ -533,6 +530,8 @@ def redq_sac(
                                 bc_epsilon = pre_trained_model.score_fn(new_x, sigma=sigmas[i].item())
                             epsilon = q_epsilon + bc_epsilon
                             
+                            # 그래 갖고온건데 맞겠지 
+                            # small variance at initial phase: beta_t[large_value]
                             pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
                             logpf_pi += pf_pi_dist.log_prob(x1_repeat).sum(1)
                             
@@ -551,7 +550,7 @@ def redq_sac(
                         # loss = 0.5*((args.alpha*logpf_p+logC-args.alpha*logpf_pi-logr.detach())**2).mean()
                         
                         # before mean, supposed to get batch_size of loss, vectorized calculation
-                        loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
+                        loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - logr.detach())**2).mean()
                         # return loss, logC.mean().item()
                         
                         optimizer.zero_grad()
