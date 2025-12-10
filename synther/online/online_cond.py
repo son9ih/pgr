@@ -37,6 +37,8 @@ import os
 
 from sklearn.manifold import TSNE
 
+from torch.utils.data import TensorDataset, DataLoader
+
 
 @gin.configurable
 def redq_sac(
@@ -317,32 +319,29 @@ def redq_sac(
             
             
             if args.rtb:
-                print(f'Fine-tuning diffusion model with RTB for {args.backprop_epochs} epochs with lr {args.finetune_lr}')
-                
-                # Get pre-trained model and create fine-tuning model
+                print('Setting up for RTB fine-tuning...')
+                # Initialize fine-tuning model
+                # diffusion model이 epsilon을 뱉으면 됨
                 backprop_model = diffusion_trainer.model.to(device)
                 backprop_model.train()  # Set to training mode for fine-tuning
                 
                 pre_trained_model = copy.deepcopy(backprop_model).to(device)
                 pre_trained_model.eval()  # Freeze pre-trained model
                 
+                log_Z = torch.nn.Parameter(torch.tensor(0.0, device=device))
+                
+                
+                sigmas = backprop_model.sample_schedule(backprop_model.diffusion_steps).to(device)
+                
                 # Setup optimizer and log partition function
                 optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
-                log_Z = torch.nn.Parameter(torch.tensor(0.0, device=device))
-                # optimizer.add_param_group({'params': [log_Z]})
                 optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
                 
-                # Get sigma schedule from diffusion model (using ElucidatedDiffusion's sample_schedule)
-                # 50% of actual diffusion steps for efficiency
-                num_rtb_steps = 64  # Number of steps in RTB trajectory
-                sigmas = backprop_model.sample_schedule(num_rtb_steps).to(device)
-                
-                # 1) Compute reward statistics from entire replay buffer for normalization
-                print("Computing reward statistics from entire replay buffer...")
+                # load Data from replay buffer
                 ptr_location = agent.replay_buffer.ptr
                 all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location]).to(device)
                 
-                # Compute rewards in batches to avoid OOM
+                # Compute rewards in batches
                 all_rewards = []
                 batch_size_stat = args.ft_batch_size
                 with torch.no_grad():
@@ -356,9 +355,8 @@ def redq_sac(
                 reward_std = all_rewards.std().item()
                 print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
                 
-                # 2) Create dataset and dataloader for proper epoch iteration
-                from torch.utils.data import TensorDataset, DataLoader
                 
+                # Setup dataloader
                 obs_data = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
                 obs_next_data = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
                 acts_data = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
@@ -368,24 +366,28 @@ def redq_sac(
                 dataset = TensorDataset(obs_data, obs_next_data, acts_data, rews_data, done_data)
                 dataloader = DataLoader(dataset, batch_size=args.ft_batch_size, shuffle=True, drop_last=True)
                 
-                # Training loop with gradient accumulation to reduce GPU memory usage
+                # Training loop
+                global_step = 0
                 accumulation_steps = args.accumulation_steps
+                
                 for epoch in range(args.backprop_epochs):
-                    epoch_loss = 0.0
-                    epoch_log_z = 0.0
-                    epoch_reward = 0.0
-                    epoch_log_ratio = 0.0
-                    num_batches = 0
+                    # epoch_loss = 0.0
+                    # epoch_log_z = 0.0
+                    # epoch_reward = 0.0
+                    # epoch_log_ratio = 0.0
+                    # num_batches = 0
                     
-                    optimizer.zero_grad()
-                    optimizer_z.zero_grad()
+                    epoch_loss_on = []
+                    epoch_reward_on = []
+                    epoch_loss_off = []
+                    
+                    
                     
                     for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
                         obs = obs.to(device)
                         next_obs = next_obs.to(device)
                         act = act.to(device)
                         rew = rew.to(device)
-                        
                         current_batch_size = obs.size(0)
                         
                         # Construct x1 (clean samples): [obs, act, rew, next_obs]
@@ -401,132 +403,344 @@ def redq_sac(
                             rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
                             rewards_norm = rewards_norm * args.beta  # Scale by beta
                         
-                        # Add noise to x1 to get x0 (maximum noise level)
-                        sigma_max = sigmas[0]  # Maximum sigma
-                        noise = torch.randn_like(x1_normalized)
-                        x_t = x1_normalized + sigma_max * noise  # Start from noisy version
                         
-                        log_ratio_sum = torch.zeros(current_batch_size, device=device)
-                        cond = None  # No conditioning
-                        
-                        # Denoise from x_T (noisy) to x_0 (clean), computing likelihood ratio at each step
-                        for i in range(len(sigmas) - 1):
-                            sigma_curr = sigmas[i].item()  # Convert to float
-                            sigma_next = sigmas[i + 1].item()  # Convert to float
                             
-                            # Predict denoised output with both models
-                            with torch.no_grad():
-                                denoised_prior = pre_trained_model.preconditioned_network_forward(x_t, sigma_curr, cond=cond)
                             
-                            denoised_post = backprop_model.preconditioned_network_forward(x_t, sigma_curr, cond=cond)
                             
-                            # Compute score functions: (x_t - denoised) / sigma
-                            # Score is gradient of log p(x_t)
-                            score_prior = (x_t - denoised_prior) / (sigma_curr + 1e-8)
-                            score_post = (x_t - denoised_post) / (sigma_curr + 1e-8)
-                            
-                            # Compute log likelihood ratio for this step
-                            # Using Gaussian transition: p(x_{t-1} | x_t) ∝ exp(-||score||^2 * sigma^2 / 2)
-                            # Log ratio: log p_post - log p_prior
-                            # Squaring these large scores in score**2 causes exponential growth.
-                            step_log_ratio = -0.5 * sigma_curr**2 * (
-                                torch.sum(score_post**2, dim=-1) - torch.sum(score_prior**2, dim=-1)
-                            )
-                            log_ratio_sum = log_ratio_sum + step_log_ratio
-                            
-                            # Update x_t using posterior prediction for next iteration
-                            # Simple Euler-Maruyama update: x_{t-dt} = x_t + (sigma_t - sigma_{t-dt}) * score
-                            x_t = x_t + (sigma_next - sigma_curr) * score_post
-                        
-                        # Compute RTB loss: (log(Z/r(x1)) + Σ log(p_post/p_prior))^2
-                        rtb_loss_per_sample = (log_Z - rewards_norm.squeeze() + log_ratio_sum) ** 2
-                        
-                        # Loss clipping: skip updates when loss is too small (well-fit trajectories)
-                        # Following RTB paper's stabilization method with threshold 0.1
-                        valid_mask = rtb_loss_per_sample > 0.1
-                        
-                        if valid_mask.any():
-                            # Only compute loss for samples above threshold
-                            rtb_loss = rtb_loss_per_sample[valid_mask].mean() / accumulation_steps
-                            
-                            # Backpropagate (accumulate gradients)
-                            rtb_loss.backward()
-                            
-                            # Accumulate statistics (multiply by accumulation_steps to get actual loss)
-                            epoch_loss += rtb_loss.item() * accumulation_steps
-                        else:
-                            # All samples below threshold - skip this batch
-                            epoch_loss += 0.0
-                        epoch_log_z += log_Z.item()
-                        epoch_reward += rewards.mean().item()
-                        epoch_log_ratio += log_ratio_sum.mean().item()
-                        num_batches += 1
-                        
-                        # Perform optimization step every accumulation_steps batches
-                        if (batch_idx + 1) % accumulation_steps == 0:
-                            nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
-                            nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
-                            optimizer.step()
-                            optimizer_z.step()
+                        # On-policy Training 
+                        if global_step % args.sample_freq == 0:
                             optimizer.zero_grad()
                             optimizer_z.zero_grad()
+                            
+                            # Denoising process
+                            # x, logpf_pi, logpf_p = backprop_model.sample_rtb(batch_size = args.gfn_batch_size, num_sample_steps=backprop_model.diffusion_steps, cond=None)
+                            normal_dist = torch.distributions.Normal(torch.zeros((args.gfn_batch_size, *backprop_model.event_shape),device=device), torch.ones((args.gfn_batch_size, *backprop_model.event_shape), device=device))
+                            x = normal_dist.sample()
+                            t = torch.zeros((args.gfn_batch_size,), device=x.device)
+                            dt = 1/ backprop_model.diffusion_steps
+                            
+                            logpf_pi = normal_dist.log_prob(x).sum(1)
+                            logpf_p = normal_dist.log_prob(x).sum(1)
+                            
+                            extra_steps = 1
+                            if False:
+                                extra_steps = 20
+                            for i in range(backprop_model.diffusion_steps):
+                                for j in range(extra_steps):
+                                    # q_epsilon, bc_epsilon = self(s, x, t)
+                                    q_epsilon = backprop_model.score_fn(x, sigmas[i])
+                                    bc_epsilon = pre_trained_model.score_fn(x, sigmas[i])
+                                    
+                                    pflogvars = np.log(torch.sqrt(backprop_model.beta_t[i]).cpu().numpy()) * 2
+                                    pflogvars_sample = pflogvars
+                                    
+                                    epsilon = q_epsilon + bc_epsilon
+                                    new_x = backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon.detach()) + torch.sqrt(backprop_model.beta_t[i]) * torch.randn_like(x)
+
+                                    pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(x))
+                                    logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
+
+                                    pf_p_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(new_x))
+                                    logpf_p += pf_p_dist.log_prob(new_x).sum(1)
+                                
+                                    x = new_x
+                                    if i < backprop_model.diffusion_steps-1:
+                                        break 
+                                t = t + dt
+                                
+                            
+                            
+                            
+                            # caution: may not be correct
+                            # need to debug
+                            # pdb.set_trace()
+                            obs_next_x = x[:, obs_dim + act_dim + 1:]
+                            
+                            # compute reward for sampled x
+                            with torch.no_grad():
+                                rewards_sample = agent.compute_intrinsic_reward(obs_next_x)
+                            # please log 'rewards_sample_mean'
+                            rewards_sample_mean = rewards_sample.mean().item()
+                            rewards_sample_std = rewards_sample.std().item()
+                            rewards_sample_norm = (rewards_sample - rewards_sample_mean) / (rewards_sample_std + 1e-8)
+                            
+                            logr = rewards_sample_norm
+                            
+                            # 수정) we are using parameterized logZ
+                            # logC = (logr + args.alpha*logpf_pi - args.alpha*logpf_p).view(-1, args.gfn_batch_size)
+                            # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
+                            # loss = 0.5*((args.alpha*logpf_p + logC - args.alpha*logpf_pi - logr.detach())**2).mean()
+                            # detach()?
+                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - logr.detach())**2).mean()
+                            
+                            loss.backward()
+                            optimizer.step()
+                            optimizer_z.step()
+                            sample_loss = loss.item()
+                            
+                            
+                            # logging
+                            epoch_reward_on.append(rewards_sample_mean)
+                            epoch_loss_on.append(sample_loss)
+                            
+                            # logZSample = logC.mean().item()
+                            # loss = logZSample = backprop_model.compute_loss()
+                           
                     
-                    # Update remaining accumulated gradients at end of epoch if needed
-                    if num_batches % accumulation_steps != 0:
-                        nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
-                        nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
-                        optimizer.step()
-                        optimizer_z.step()
+                    
+                    
+                        # Off-policy Training
+                        x1_repeat = x1_normalized.repeat_interleave(args.gfn_batch_size, dim=0) 
+                        # batch size
+                        bs = x1_repeat.shape[0]
+                        t = torch.zeros((bs,), device=x1_repeat.device)
+                        dt = 1/backprop_model.diffusion_steps
+                        
+                        logpf_pi = torch.zeros((bs,), device=x1_repeat.device)
+                        logpf_p = torch.zeros((bs,), device=x1_repeat.device)
+                        # compute the reward
+                        logr = rewards_norm
+                        logr = logr.repeat_interleave(args.gfn_batch_size, dim=0)
+                        
+                        for i in range(backprop_model.diffusion_steps-1, -1, -1):
+                            # make forward kernel
+                            pb_dist = torch.distributions.Normal(torch.sqrt(backprop_model.alpha_t[i])*x1_repeat, torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(x1_repeat))
+                            # sample noisy one from the kernel
+                            new_x = pb_dist.sample()
+                            
+                            # right sigma?
+                            q_epsilon = backprop_model.score_fn(new_x, sigma=sigmas[i])
+                            with torch.no_grad():
+                                bc_epsilon = pre_trained_model.score_fn(new_x, sigma=sigmas[i])
+                            epsilon = q_epsilon + bc_epsilon
+                            
+                            pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
+                            logpf_pi += pf_pi_dist.log_prob(x1_repeat).sum(1)
+                            
+                            pf_p_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(new_x))
+                            logpf_p += pf_p_dist.log_prob(x1_repeat).sum(1)
+                            
+                            x1_repeat = new_x
+                        
+                        prior_dist = torch.distributions.Normal(torch.zeros_like(x1_repeat), torch.ones_like(x1_repeat))
+                        logpf_pi += prior_dist.log_prob(x1_repeat).sum(1)
+                        logpf_p += prior_dist.log_prob(x1_repeat).sum(1)
+                        
+                        # 수정) we are using parameterized logZ
+                        # logC = (logr+args.alpha*logpf_pi-args.alpha*logpf_p).view(-1, args.gfn_batch_size)
+                        # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
+                        # loss = 0.5*((args.alpha*logpf_p+logC-args.alpha*logpf_pi-logr.detach())**2).mean()
+                        
+                        # before mean, supposed to get batch_size of loss, vectorized calculation
+                        loss = 0.5*((args.alpha*logpf_p+log_Z-args.alpha*logpf_pi-logr.detach())**2).mean()
+                        # return loss, logC.mean().item()
+                        
                         optimizer.zero_grad()
                         optimizer_z.zero_grad()
+                        
+                        loss.backward()
+                        optimizer.step()
+                        optimizer_z.step()
+                        
+                        batch_loss = loss.item() 
                     
-                    # Print epoch statistics
+                        # logging
+                        epoch_loss_off.append(batch_loss)
+                        
+                        global_step += 1                 
+                            
+                        # Update accumulated gradients
+                        # TODO
+                        
+                    # epoch_loss_on = 0.0
+                    # epoch_reward_on = 0.0
+                    # epoch_loss_off = 0.0
                     if epoch % 1 == 0:
-                        print(f"RTB Epoch {epoch}/{args.backprop_epochs}, "
-                              f"Loss: {epoch_loss/num_batches:.6f}, "
-                              f"log_Z: {epoch_log_z/num_batches:.4f}, "
-                              f"Avg Reward: {epoch_reward/num_batches:.6f}, "
-                              f"Log Ratio: {epoch_log_ratio/num_batches:.4f}, "
-                              f"Batches: {num_batches}, "
-                              f"Accum Steps: {accumulation_steps}")
-                
+                        avg_epoch_loss_on = np.mean(epoch_loss_on)
+                        avg_epoch_reward_on = np.mean(epoch_reward_on)
+                        avg_epoch_loss_off = np.mean(epoch_loss_off)
+                        print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
+                        
+                        
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
                 print('RTB fine-tuning complete. Synced EMA model with fine-tuned weights.')
-            
-            # # Start diffusion fine-tuning
-            # if args.finetune:
-            #     print(f'Fine-tuning diffusion model for {args.backprop_epochs} epochs with lr {args.finetune_lr}')
+                    
+                    
                 
-            #     # backprop_model = diffusion_trainer.ema.ema_model.to(device)
+                
+            
+            
+            # if args.rtb:
+            #     print(f'Fine-tuning diffusion model with RTB for {args.backprop_epochs} epochs with lr {args.finetune_lr}')
+                
+            #     # Get pre-trained model and create fine-tuning model
             #     backprop_model = diffusion_trainer.model.to(device)
-            #     backprop_model.train()  # Set to training mode
+            #     backprop_model.train()  # Set to training mode for fine-tuning
                 
             #     pre_trained_model = copy.deepcopy(backprop_model).to(device)
             #     pre_trained_model.eval()  # Freeze pre-trained model
                 
-            #     # scheduler = DDIMScheduler(num_train_timesteps=diffusion_trainer.train_num_stpes, device=device)
-            #     scheduler = DDIMScheduler(num_train_timesteps=128, device=device)
-            #     scheduler.set_timesteps(num_inference_steps=128)
-                
-            #     # optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
+            #     # Setup optimizer and log partition function
             #     optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
-            #     kl_weight = args.kl_weight
+            #     log_Z = torch.nn.Parameter(torch.tensor(0.0, device=device))
+            #     # optimizer.add_param_group({'params': [log_Z]})
+            #     optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
                 
+            #     # Get sigma schedule from diffusion model (using ElucidatedDiffusion's sample_schedule)
+            #     # 50% of actual diffusion steps for efficiency
+            #     num_rtb_steps = 64  # Number of steps in RTB trajectory
+            #     sigmas = backprop_model.sample_schedule(num_rtb_steps).to(device)
+                
+            #     # 1) Compute reward statistics from entire replay buffer for normalization
+            #     print("Computing reward statistics from entire replay buffer...")
+            #     ptr_location = agent.replay_buffer.ptr
+            #     all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location]).to(device)
+                
+            #     # Compute rewards in batches to avoid OOM
+            #     all_rewards = []
+            #     batch_size_stat = args.ft_batch_size
+            #     with torch.no_grad():
+            #         for i in range(0, ptr_location, batch_size_stat):
+            #             batch_next_obs = all_next_obs[i:i+batch_size_stat]
+            #             batch_rewards = agent.compute_intrinsic_reward(batch_next_obs)
+            #             all_rewards.append(batch_rewards)
+            #         all_rewards = torch.cat(all_rewards, dim=0)
+                
+            #     reward_mean = all_rewards.mean().item()
+            #     reward_std = all_rewards.std().item()
+            #     print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
+                
+            #     # 2) Create dataset and dataloader for proper epoch iteration
+            #     from torch.utils.data import TensorDataset, DataLoader
+                
+            #     obs_data = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
+            #     obs_next_data = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
+            #     acts_data = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
+            #     rews_data = torch.FloatTensor(agent.replay_buffer.rews_buf[:ptr_location])
+            #     done_data = torch.FloatTensor(agent.replay_buffer.done_buf[:ptr_location])
+                
+            #     dataset = TensorDataset(obs_data, obs_next_data, acts_data, rews_data, done_data)
+            #     dataloader = DataLoader(dataset, batch_size=args.ft_batch_size, shuffle=True, drop_last=True)
+                
+            #     # Training loop with gradient accumulation to reduce GPU memory usage
+            #     accumulation_steps = args.accumulation_steps
             #     for epoch in range(args.backprop_epochs):
-            #         loss, reward, kl_div = fine_tune_step(pre_trained_model, backprop_model, scheduler, optimizer, kl_weight, max_grad_norm=1.0,
-            #                                               device=device, compute_reward = agent.compute_intrinsic_reward,
-            #                                               input_dim=diff_dims, batch_size=args.ft_batch_size,
-            #                                               obs_dim=obs_dim, act_dim=act_dim)
-            #         # pdb.set_trace()
-            #         # if epoch % 10 == 0:
-            #         #     print(f"Fine-tuning Epoch {epoch}, Loss: {loss:.4f}, Reward: {reward:.4f}, KL Div: {kl_div:.16f}")
-            #         print(f"Fine-tuning Epoch {epoch}, Loss: {loss:.16f}, Reward: {reward:.16f}, KL Div: {kl_div:.16f}")  
-                
-            #     # After fine-tuning, sync EMA model so sampling uses updated weights
-            #     diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
-            #     print('Synced EMA model with fine-tuned weights for sampling.')
+            #         epoch_loss = 0.0
+            #         epoch_log_z = 0.0
+            #         epoch_reward = 0.0
+            #         epoch_log_ratio = 0.0
+            #         num_batches = 0
+                    
+            #         optimizer.zero_grad()
+            #         optimizer_z.zero_grad()
+                    
+            #         for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
+            #             obs = obs.to(device)
+            #             next_obs = next_obs.to(device)
+            #             act = act.to(device)
+            #             rew = rew.to(device)
                         
+            #             current_batch_size = obs.size(0)
+                        
+            #             # Construct x1 (clean samples): [obs, act, rew, next_obs]
+            #             x1 = torch.cat([obs, act, rew.unsqueeze(-1), next_obs], dim=-1).to(device)
+                        
+            #             # Normalize x1
+            #             x1_normalized = backprop_model.normalizer.normalize(x1)
+                        
+            #             # Compute reward r(x1) using intrinsic reward on next_obs
+            #             with torch.no_grad():
+            #                 rewards = agent.compute_intrinsic_reward(next_obs)  # r(x1)
+            #                 # Normalize rewards using buffer statistics
+            #                 rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
+            #                 rewards_norm = rewards_norm * args.beta  # Scale by beta
+                        
+            #             # Add noise to x1 to get x0 (maximum noise level)
+            #             sigma_max = sigmas[0]  # Maximum sigma
+            #             noise = torch.randn_like(x1_normalized)
+            #             x_t = x1_normalized + sigma_max * noise  # Start from noisy version
+                        
+            #             log_ratio_sum = torch.zeros(current_batch_size, device=device)
+            #             cond = None  # No conditioning
+                        
+            #             # Denoise from x_T (noisy) to x_0 (clean), computing likelihood ratio at each step
+            #             for i in range(len(sigmas) - 1):
+            #                 sigma_curr = sigmas[i].item()  # Convert to float
+            #                 sigma_next = sigmas[i + 1].item()  # Convert to float
+                            
+            #                 # Predict denoised output with both models
+            #                 with torch.no_grad():
+            #                     denoised_prior = pre_trained_model.preconditioned_network_forward(x_t, sigma_curr, cond=cond)
+                            
+            #                 denoised_post = backprop_model.preconditioned_network_forward(x_t, sigma_curr, cond=cond)
+                            
+            #                 # Compute score functions: (x_t - denoised) / sigma
+            #                 # Score is gradient of log p(x_t)
+            #                 score_prior = (x_t - denoised_prior) / (sigma_curr + 1e-8)
+            #                 score_post = (x_t - denoised_post) / (sigma_curr + 1e-8)
+                            
+            #                 # Compute log likelihood ratio for this step
+            #                 # 아래의 식이 문제, 왜 exp() 안에 score
+            #                 # Using Gaussian transition: p(x_{t-1} | x_t) ∝ exp(-||score||^2 * sigma^2 / 2)
+            #                 # Log ratio: log p_post - log p_prior
+            #                 step_log_ratio = -0.5 * sigma_curr**2 * (
+            #                     torch.sum(score_post**2, dim=-1) - torch.sum(score_prior**2, dim=-1)
+            #                 )
+            #                 log_ratio_sum = log_ratio_sum + step_log_ratio
+                            
+            #                 # Update x_t using posterior prediction for next iteration
+            #                 # Simple Euler-Maruyama update: x_{t-dt} = x_t + (sigma_t - sigma_{t-dt}) * score
+            #                 x_t = x_t + (sigma_next - sigma_curr) * score_post
+                        
+            #             # Compute RTB loss: (log(Z/r(x1)) + Σ log(p_post/p_prior))^2
+            #             # Use normalized rewards, divided by accumulation_steps for gradient accumulation
+            #             rtb_loss = (log_Z - rewards_norm.squeeze() + log_ratio_sum) ** 2
+            #             rtb_loss = rtb_loss.mean() / accumulation_steps
+                        
+            #             # Backpropagate (accumulate gradients)
+            #             rtb_loss.backward()
+                        
+            #             # Accumulate statistics (multiply by accumulation_steps to get actual loss)
+            #             epoch_loss += rtb_loss.item() * accumulation_steps
+            #             epoch_log_z += log_Z.item()
+            #             epoch_reward += rewards.mean().item()
+            #             epoch_log_ratio += log_ratio_sum.mean().item()
+            #             num_batches += 1
+                        
+            #             # Perform optimization step every accumulation_steps batches
+            #             if (batch_idx + 1) % accumulation_steps == 0:
+            #                 nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+            #                 nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+            #                 optimizer.step()
+            #                 optimizer_z.step()
+            #                 optimizer.zero_grad()
+            #                 optimizer_z.zero_grad()
+                    
+            #         # Update remaining accumulated gradients at end of epoch if needed
+            #         if num_batches % accumulation_steps != 0:
+            #             nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+            #             nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+            #             optimizer.step()
+            #             optimizer_z.step()
+            #             optimizer.zero_grad()
+            #             optimizer_z.zero_grad()
+                    
+            #         # Print epoch statistics
+            #         if epoch % 1 == 0:
+            #             print(f"RTB Epoch {epoch}/{args.backprop_epochs}, "
+            #                   f"Loss: {epoch_loss/num_batches:.6f}, "
+            #                   f"log_Z: {epoch_log_z/num_batches:.4f}, "
+            #                   f"Avg Reward: {epoch_reward/num_batches:.6f}, "
+            #                   f"Log Ratio: {epoch_log_ratio/num_batches:.4f}, "
+            #                   f"Batches: {num_batches}, "
+            #                   f"Accum Steps: {accumulation_steps}")
+                
+            #     # Sync EMA model with fine-tuned weights
+            #     diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
+            #     print('RTB fine-tuning complete. Synced EMA model with fine-tuned weights.')
+            
+   
 
             # Add samples to agent replay buffer
             generator = CondDiffusionGenerator(args=args, env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
@@ -661,7 +875,7 @@ def redq_sac(
                     
                     
             # 2. T-SNE
-            if args.algorithm != 'REDQ':
+            if args.algorithm != 'REDQ' and args.algorithm != 'SAC':  # only for methods with diffusion model
                 # cur_epoch = t // steps_per_epoch
                     
                 # Prepare t-SNE visualization directory
@@ -1007,6 +1221,10 @@ if __name__ == '__main__':
     parser.add_argument('--disable_diffusion', action='store_true', default=False)
     
     parser.add_argument('--algorithm', type=str, default='REDQ')  # placeholder, not used directly
+    
+    parser.add_argument('--sample_freq', type=int, default=1)
+    parser.add_argument('--gfn_batch_size', type=int, default=64)
+    parser.add_argument('--alpha', type=float, default=1.0)
     
     args = parser.parse_args()
     
