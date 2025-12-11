@@ -104,6 +104,45 @@ def redq_sac(
     
     if args.wandb:
         
+        if args.rtb:
+            
+            wandb.init(
+            project = f'{env_name}',
+            group = f'{run_name.split("_")[-1]}',
+            name = f' {run_name}_epochs{args.backprop_epochs}_alpha{args.alpha}',
+            config={
+                "env_name": env_name,
+                "seed": seed,
+                "epochs": epochs,
+                "steps_per_epoch": steps_per_epoch,
+                "hidden_sizes": hidden_sizes,
+                "replay_size": replay_size,
+                "batch_size": batch_size,
+                "lr": lr,
+                "gamma": gamma,
+                "polyak": polyak,
+                "alpha": alpha,
+                "auto_alpha": auto_alpha,
+                "target_entropy": target_entropy,
+                "start_steps": start_steps,
+                "delay_update_steps": delay_update_steps,
+                "utd_ratio": utd_ratio,
+                "num_Q": num_Q,
+                "num_min": num_min,
+                "q_target_mode": q_target_mode,
+                "policy_update_delay": policy_update_delay,
+                "diffusion_buffer_size": diffusion_buffer_size,
+                "diffusion_sample_ratio": diffusion_sample_ratio,
+                "retrain_diffusion_every": retrain_diffusion_every,
+                "num_samples": num_samples,
+                "disable_diffusion": disable_diffusion,
+                "cfg_dropout": cfg_dropout,
+                "cond_top_frac": cond_top_frac,
+                "cfg_scale": cfg_scale,
+                "cond_hidden_size": cond_hidden_size,
+            })
+            
+        
                     
         # args.results_folder = run_name
 
@@ -332,6 +371,13 @@ def redq_sac(
                 
                 
                 sigmas = backprop_model.sample_schedule(backprop_model.diffusion_steps).to(device)
+                gammas = torch.where(
+                    (sigmas >= backprop_model.S_tmin) & (sigmas <= backprop_model.S_tmax),
+                    min(backprop_model.S_churn / backprop_model.diffusion_steps, math.sqrt(2) - 1),
+                    0.
+                )
+                sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
+                
                 backprop_model.beta_t = backprop_model.beta_t.to(device)
                 backprop_model.alpha_t = backprop_model.alpha_t.to(device)
                 backprop_model.oneover_sqrta = backprop_model.oneover_sqrta.to(device)
@@ -435,10 +481,15 @@ def redq_sac(
                                 extra_steps = 20
                             for i in range(backprop_model.diffusion_steps):
                                 for j in range(extra_steps):
+                                    sigma, sigma_next, gamma = map(lambda t: t.item(),(sigmas_and_gammas[i]))
+                                    sigma_hat = sigma * (1 + gamma)
+                                    
                                     # q_epsilon, bc_epsilon = self(s, x, t)
-                                    q_epsilon = backprop_model.score_fn(x, sigmas[i].item())
+                                    # q_epsilon = backprop_model.score_fn(x, sigmas[i].item())
+                                    q_epsilon = backprop_model.score_fn(x, sigma_hat)
                                     with torch.no_grad():
-                                        bc_epsilon = pre_trained_model.score_fn(x, sigmas[i].item())
+                                        # bc_epsilon = pre_trained_model.score_fn(x, sigmas[i].item())
+                                        bc_epsilon = pre_trained_model.score_fn(x, sigma_hat)
                                     
                                     pflogvars = np.log(torch.sqrt(backprop_model.beta_t[i]).cpu().numpy()) * 2
                                     pflogvars_sample = pflogvars
@@ -465,6 +516,7 @@ def redq_sac(
                             # caution: may not be correct
                             # need to debug
                             # pdb.set_trace()
+                            # Construct x1 (clean samples): [obs, act, rew, next_obs]
                             obs_next_x = x[:, obs_dim + act_dim + 1:]
                             
                             # compute reward for sampled x
@@ -578,7 +630,8 @@ def redq_sac(
                         avg_epoch_reward_on = np.mean(epoch_reward_on)
                         avg_epoch_loss_off = np.mean(epoch_loss_off)
                         print('======================================================================')
-                        print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
+                        # print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
+                        print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
                         print('======================================================================')
                         
                 # Sync EMA model with fine-tuned weights
@@ -1249,6 +1302,7 @@ if __name__ == '__main__':
     
     assert args.algorithm in ['REDQ', 'PGR', 'PGRrnd', 'SER', 'Ours', 'SAC']
     run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_{args.algorithm}"
+    
     if args.algorithm == 'SAC':
         args.disable_diffusion = True
         args.synther = False
@@ -1279,6 +1333,7 @@ if __name__ == '__main__':
         args.synther = True
         args.rnd = True
         args.rtb = True
+        
         
     
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{run_name}'
