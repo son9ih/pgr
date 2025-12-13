@@ -100,6 +100,12 @@ def redq_sac(
     # set seed
     seed = args.seed
     
+    # set domain
+    if args.env in ['quadruped-walk-v0','cheetah-run-v0','reacher-hard-v0']:
+        args.domain = 'dmc'
+    else:
+        args.domain = 'muj'
+    
     disable_diffusion = args.disable_diffusion
     
     if args.wandb:
@@ -278,7 +284,9 @@ def redq_sac(
     else:
         skip_dims = []
 
-    o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+    # o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+    # Because they truncate before 1000, never get to 1000
+    o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0   
 
     # One-time header registration guard for StateEnt to avoid header errors
     # state_ent_header_initialized = False
@@ -308,19 +316,24 @@ def redq_sac(
         # train RND predictor network, once in a epoch
         # if (t + 1) % steps_per_epoch == 0 and args.rnd:
         # if (t + 1) % steps_per_epoch == 0:
-        # When episode ends, t가 max_epi_len에 도달하지 않아도 d = True가 될 수 있어서?
-        if d or (ep_len == max_ep_len):
+        # if d or (ep_len == max_ep_len):
+        if (ep_len == max_ep_len):
+            # print(t)
+            # print(d)
+            # print(ep_len == max_ep_len)
             agent.pred_net.train()
             pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
             agent.pred_net.eval()
-            
             logger.store(PredLoss=pred_loss)
             logger.log_tabular('PredLoss', average_only=True)
 
-        if d or (ep_len == max_ep_len):
+        # if d or (ep_len == max_ep_len):
+        if (ep_len == max_ep_len):
             # store episode return and length to logger
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             # reset environment
+            # o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+            # Because they truncate before 1000, never get to 1000
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
         # Retrain diffusion model periodically, then finetune if specified
@@ -373,16 +386,23 @@ def redq_sac(
                 sigmas = backprop_model.sample_schedule(backprop_model.diffusion_steps).to(device)
                 gammas = torch.where(
                     (sigmas >= backprop_model.S_tmin) & (sigmas <= backprop_model.S_tmax),
-                    min(backprop_model.S_churn / backprop_model.diffusion_steps, math.sqrt(2) - 1),
+                    min(backprop_model.S_churn / backprop_model.num_sample_steps, math.sqrt(2) - 1),
                     0.
                 )
-                sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
+                # sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
                 
-                backprop_model.beta_t = backprop_model.beta_t.to(device)
-                backprop_model.alpha_t = backprop_model.alpha_t.to(device)
-                backprop_model.oneover_sqrta = backprop_model.oneover_sqrta.to(device)
-                backprop_model.sqrtmab = backprop_model.sqrtmab.to(device)
-                backprop_model.mab_over_sqrtmab_inv = backprop_model.mab_over_sqrtmab_inv.to(device)
+                sigma_hats = sigmas * (1 + gammas)
+                
+                # print(f'sigmas: {sigmas}')
+                # print(f'gammas: {gammas}')
+                # print(f'sigma_hats: {sigma_hats}')
+                # pdb.set_trace()
+                
+                # backprop_model.beta_t = backprop_model.beta_t.to(device)
+                # backprop_model.alpha_t = backprop_model.alpha_t.to(device)
+                # backprop_model.oneover_sqrta = backprop_model.oneover_sqrta.to(device)
+                # backprop_model.sqrtmab = backprop_model.sqrtmab.to(device)
+                # backprop_model.mab_over_sqrtmab_inv = backprop_model.mab_over_sqrtmab_inv.to(device)
                 
                 # Setup optimizer and log partition function
                 optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
@@ -392,7 +412,7 @@ def redq_sac(
                 ptr_location = agent.replay_buffer.ptr
                 all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location]).to(device)
                 
-                # Compute rewards in batches
+                # Compute average of total rewards in batch-level computation
                 all_rewards = []
                 batch_size_stat = args.ft_batch_size
                 with torch.no_grad():
@@ -400,14 +420,21 @@ def redq_sac(
                         batch_next_obs = all_next_obs[i:i+batch_size_stat]
                         batch_rewards = agent.compute_intrinsic_reward(batch_next_obs)
                         all_rewards.append(batch_rewards)
+                    # calculate reward of one batch
                     all_rewards = torch.cat(all_rewards, dim=0)
                 
+                # This is average novelty for original buffer
                 reward_mean = all_rewards.mean().item()
                 reward_std = all_rewards.std().item()
                 print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
                 
+                # del, caching
+                del all_rewards, all_next_obs
+                torch.cuda.empty_cache()
+                
                 
                 # Setup dataloader
+                # return unnormalized data
                 obs_data = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
                 obs_next_data = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
                 acts_data = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
@@ -436,6 +463,7 @@ def redq_sac(
                     
                     
                     for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
+                        # unnormalized data
                         print('Processing batch ', batch_idx)
                         obs = obs.to(device)
                         next_obs = next_obs.to(device)
@@ -449,12 +477,11 @@ def redq_sac(
                         # Normalize x1
                         x1_normalized = backprop_model.normalizer.normalize(x1)
                         
-                        # Compute reward r(x1) using intrinsic reward on next_obs
+                    
                         with torch.no_grad():
                             rewards = agent.compute_intrinsic_reward(next_obs)  # r(x1)
-                            # Normalize rewards using buffer statistics
+                            # Normalize rewards using average and std computed from entire buffer
                             rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
-                            rewards_norm = rewards_norm * args.beta  # Scale by beta
                         
                         
                             
@@ -481,15 +508,16 @@ def redq_sac(
                                 extra_steps = 20
                             for i in range(backprop_model.diffusion_steps):
                                 for j in range(extra_steps):
-                                    sigma, sigma_next, gamma = map(lambda t: t.item(),(sigmas_and_gammas[i]))
-                                    sigma_hat = sigma * (1 + gamma)
+                                    # sigma, sigma_next, gamma = map(lambda t: t.item(),(sigmas_and_gammas[i]))
+                                    # sigma_hat = sigma * (1 + gamma)
                                     
                                     # q_epsilon, bc_epsilon = self(s, x, t)
                                     # q_epsilon = backprop_model.score_fn(x, sigmas[i].item())
-                                    q_epsilon = backprop_model.score_fn(x, sigma_hat)
+                                    # q_epsilon = backprop_model.score_fn(x, sigma_hat)
+                                    q_epsilon = backprop_model.score_fn(x, sigma_hats[i].item())
                                     with torch.no_grad():
                                         # bc_epsilon = pre_trained_model.score_fn(x, sigmas[i].item())
-                                        bc_epsilon = pre_trained_model.score_fn(x, sigma_hat)
+                                        bc_epsilon = pre_trained_model.score_fn(x, sigma_hats[i].item()).detach()
                                     
                                     pflogvars = np.log(torch.sqrt(backprop_model.beta_t[i]).cpu().numpy()) * 2
                                     pflogvars_sample = pflogvars
@@ -517,6 +545,8 @@ def redq_sac(
                             # need to debug
                             # pdb.set_trace()
                             # Construct x1 (clean samples): [obs, act, rew, next_obs]
+                            # why don't you unnmormalize x here?
+                            x = backprop_model.normalizer.unnormalize(x)
                             obs_next_x = x[:, obs_dim + act_dim + 1:]
                             
                             # compute reward for sampled x
@@ -534,7 +564,13 @@ def redq_sac(
                             # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
                             # loss = 0.5*((args.alpha*logpf_p + logC - args.alpha*logpf_pi - logr.detach())**2).mean()
                             # detach()?
-                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi -logr.detach())**2).mean()
+                            # print(log_Z.item())
+                            # print(logr[:4])
+                            # print(logpf_pi[:4])
+                            # print(logpf_p[:4])
+                            # print(logpf_p[:4] - logpf_pi[:4])
+                            # print(kyle)
+                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
                             
                             loss.backward()
                             optimizer.step()
@@ -555,7 +591,9 @@ def redq_sac(
                     
                         # Off-policy Training
                         print('Starting off-policy training step...')
-                        x1_repeat = x1_normalized.repeat_interleave(args.gfn_batch_size, dim=0) 
+                        # Batch size becomes (args.ft_batch_size * args.gfn_batch_size) -> gradient exploding
+                        # e.g.) 128 * 16 = 2048
+                        x1_repeat = x1_normalized.repeat_interleave(args.gfn_batch_size, dim=0)
                         # batch size
                         bs = x1_repeat.shape[0]
                         # t = torch.zeros((bs,), device=x1_repeat.device)
@@ -568,8 +606,9 @@ def redq_sac(
                         logr = logr.repeat_interleave(args.gfn_batch_size, dim=0)
                         
                         
-                        
                         for i in range(backprop_model.diffusion_steps-1, -1, -1):
+                            # sigma, sigma_next, gamma = map(lambda t: t.item(),(sigmas_and_gammas[i]))
+                            # sigma_hat = sigma * (1 + gamma)
                             # pdb.set_trace()
                             # make forward kernel
                             pb_dist = torch.distributions.Normal(torch.sqrt(backprop_model.alpha_t[i])*x1_repeat, torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(x1_repeat))
@@ -577,17 +616,27 @@ def redq_sac(
                             new_x = pb_dist.sample()
                             
                             # right sigma?
-                            q_epsilon = backprop_model.score_fn(new_x, sigma=sigmas[i].item())
+                            q_epsilon = backprop_model.score_fn(new_x, sigma=sigma_hats[i].item())
                             with torch.no_grad():
-                                bc_epsilon = pre_trained_model.score_fn(new_x, sigma=sigmas[i].item())
+                                bc_epsilon = pre_trained_model.score_fn(new_x, sigma=sigma_hats[i].item()).detach()
                             epsilon = q_epsilon + bc_epsilon
                             
-                            # 그래 갖고온건데 맞겠지 
+                            # pdb.set_trace()
                             # small variance at initial phase: beta_t[large_value]
+                            print(f'i: {i}')
+                            print(f'torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x): {torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x)}')
+                            print(f':{backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon)}')
+                            print(f':{backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon)}')
                             pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
                             logpf_pi += pf_pi_dist.log_prob(x1_repeat).sum(1)
-                            
-                            pf_p_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(new_x))
+                            # pdb.set_trace()
+                            # 여기서 error 발생
+                            # epsilon이 nan값이라 Normal을 mean argu.를 넣는 부분에서 문제 발생
+                            # bc_epsilon이 아니라, epsilon에서 문제가 생긴걸로 봐서 optimize하다가 문제 발생
+                            # alpha가 너무 커서 loss가 폭발한건가? loss -> nan,
+                            # optimizer.step() -> nan
+                            # model.parameters() -> nan
+                            pf_p_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
                             logpf_p += pf_p_dist.log_prob(x1_repeat).sum(1)
                             
                             x1_repeat = new_x
@@ -596,13 +645,15 @@ def redq_sac(
                         logpf_pi += prior_dist.log_prob(x1_repeat).sum(1)
                         logpf_p += prior_dist.log_prob(x1_repeat).sum(1)
                         
+                        print(f'log_Z item: {log_Z.item()}')
+                        
                         # 수정) we are using parameterized logZ
                         # logC = (logr+args.alpha*logpf_pi-args.alpha*logpf_p).view(-1, args.gfn_batch_size)
                         # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
                         # loss = 0.5*((args.alpha*logpf_p+logC-args.alpha*logpf_pi-logr.detach())**2).mean()
                         
                         # before mean, supposed to get batch_size of loss, vectorized calculation
-                        loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - logr.detach())**2).mean()
+                        loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
                         # return loss, logC.mean().item()
                         
                         optimizer.zero_grad()
@@ -618,9 +669,7 @@ def redq_sac(
                         epoch_loss_off.append(batch_loss)
                         
                         global_step += 1                 
-                            
-                        # Update accumulated gradients
-                        # TODO
+                    
                         
                     # epoch_loss_on = 0.0
                     # epoch_reward_on = 0.0
@@ -1091,163 +1140,6 @@ def get_time_limit(env: gym.Env):
 def linear_beta_schedule(timesteps, start=0.0001, end=0.02):
     return torch.linspace(start, end, timesteps)
 
-class DDIMScheduler:
-    def __init__(self, num_train_timesteps=1000, beta_start=0.0001, beta_end=0.02, device='cpu'):
-        self.num_train_timesteps = num_train_timesteps
-        
-        self.betas = linear_beta_schedule(num_train_timesteps, beta_start, beta_end).to(device)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        
-        self.final_alpha_cumprod = self.alphas_cumprod[0]
-        self.num_inference_steps = None
-        
-    def set_timesteps(self, num_inference_steps):
-        self.num_inference_steps = num_inference_steps
-        self.timesteps = torch.linspace(self.num_train_timesteps - 1, 0, num_inference_steps, dtype=torch.long)
-        
-    def _get_variance(self, timestep, prev_timestep):
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = torch.where(
-            prev_timestep >= 0,
-            self.alphas_cumprod[prev_timestep],
-            self.final_alpha_cumprod
-        )
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
-        
-        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
-        return variance
-    
-def _compute_gaussian_log_prob(x, mean, std):
-    """Compute log probability for Gaussian distribution."""
-    log_scale = torch.log(std)
-    return -((x - mean) ** 2) / (2 * std ** 2) - log_scale - math.log(math.sqrt(2 * math.pi))
-    
-
-    
-def ddim_step_KL(
-    scheduler: DDIMScheduler,
-    model_output: torch.FloatTensor,
-    old_model_output: torch.FloatTensor,
-    timestep: torch.LongTensor,
-    sample: torch.FloatTensor,
-    eta: float = 0.0,
-    generator=None,
-    variance_noise: Optional[torch.FloatTensor] = None,
-) -> Union[Tuple[torch.FloatTensor, torch.FloatTensor], Tuple]:
-    
-    # 1. get previous step value (=t-1)
-    prev_timestep = timestep - scheduler.num_train_timesteps // scheduler.num_inference_steps
-
-    # 2. compute alphas, betas
-    alpha_prod_t = scheduler.alphas_cumprod[timestep]
-    alpha_prod_t_prev = torch.where(
-        prev_timestep >= 0,
-        scheduler.alphas_cumprod[prev_timestep],
-        scheduler.final_alpha_cumprod
-    )
-
-    beta_prod_t = 1 - alpha_prod_t
-
-    # 3. compute predicted original sample from predicted noise
-    pred_original_sample = (sample - beta_prod_t.sqrt().unsqueeze(-1) * model_output) / alpha_prod_t.sqrt().unsqueeze(-1)
-    old_pred_original_sample = (sample - beta_prod_t.sqrt().unsqueeze(-1) * old_model_output) / alpha_prod_t.sqrt().unsqueeze(-1)
-
-    # 4. compute variance
-    variance = scheduler._get_variance(timestep, prev_timestep)
-    std_dev_t = eta * variance.sqrt()
-
-    # 5. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2).sqrt().unsqueeze(-1) * model_output
-    old_pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2).sqrt().unsqueeze(-1) * old_model_output
-
-    # 6. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-    prev_sample_mean = alpha_prod_t_prev.sqrt().unsqueeze(-1) * pred_original_sample + pred_sample_direction
-    old_prev_sample_mean = alpha_prod_t_prev.sqrt().unsqueeze(-1) * old_pred_original_sample + old_pred_sample_direction
-
-    if eta > 0 and timestep[0] > 0:
-        device = model_output.device
-        noise = torch.randn(model_output.shape, generator=generator, device=device, dtype=model_output.dtype)
-        variance = std_dev_t.unsqueeze(-1) * noise
-
-        prev_sample = prev_sample_mean + variance
-        # print((prev_sample_mean - old_prev_sample_mean))
-        kl_terms = (prev_sample_mean - old_prev_sample_mean)**2 / (2 * (std_dev_t**2).unsqueeze(-1))
-        kl_terms = kl_terms.sum(dim=-1)  # Sum over the 2D dimensions
-        # print(kl_terms)
-    else:
-        prev_sample = prev_sample_mean
-        kl_terms = torch.zeros(prev_sample_mean.size(0), device=prev_sample_mean.device)
-
-    # 7. Compute log probability
-    log_prob = _compute_gaussian_log_prob(prev_sample, prev_sample_mean, std_dev_t.unsqueeze(-1)).mean(-1)
-
-    return prev_sample, log_prob, kl_terms
-
-    
-def fine_tune_step(pre_trained_model, fine_tune_model, scheduler, optimizer, kl_weight, max_grad_norm=1.0,
-                   device='cpu', compute_reward=None,
-                   input_dim=10, batch_size=256,
-                   obs_dim: int = None, act_dim: int = None):
-    optimizer.zero_grad()
-
-    kl_loss = 0.0
-
-    # x_prev = torch.randn((256, 2)).to(device)
-    x_prev = torch.randn((batch_size, input_dim)).to(device)
-    # batch_size = x_prev.shape[0]
-    # pdb.set_trace()
-
-    for t in scheduler.timesteps:
-        t = torch.full((batch_size,), t, device=x_prev.device, dtype=torch.long)
-        cond = None
-        
-        alpha_prod_t = scheduler.alphas_cumprod[t]
-        beta_prod_t = 1 - alpha_prod_t
-        sigma_t = torch.sqrt(beta_prod_t/alpha_prod_t)
-        
-        
-        with torch.no_grad():
-            # pre_trained_noise_pred = pre_trained_model(x_prev, t.float() / scheduler.num_train_timesteps)
-            # pre_trained_noise_pred = pre_trained_model(x_prev, t.float() / scheduler.num_train_timesteps, cond)
-            # pre_trained_noise_pred = pre_trained_model.preconditioned_network_forward(x_prev, t.float() / scheduler.num_train_timesteps, cond)
-            denoised_pre = pre_trained_model.preconditioned_network_forward(x_prev, sigma_t, cond)
-    
-        # fine_tune_noise_pred = fine_tune_model(x_prev, t.float() / scheduler.num_train_timesteps)
-        # fine_tune_noise_pred = fine_tune_model(x_prev, t.float() / scheduler.num_train_timesteps, cond)
-        # fine_tune_noise_pred = fine_tune_model.preconditioned_network_forward(x_prev, t.float() / scheduler.num_train_timesteps, cond)
-        denoised_ft = fine_tune_model.preconditioned_network_forward(x_prev, sigma_t, cond)
-        
-        sqrt_alpha = alpha_prod_t.sqrt().unsqueeze(-1)
-        sqrt_beta = beta_prod_t.sqrt().unsqueeze(-1)
-        pre_trained_epsilon = (x_prev - sqrt_alpha * denoised_pre) / sqrt_beta
-        fine_tune_epsilon = (x_prev - sqrt_alpha * denoised_ft) / sqrt_beta
-    
-        # x_prev, _, kl_div = ddim_step_KL(scheduler, fine_tune_noise_pred, pre_trained_noise_pred, t, x_prev, eta=1.0)
-        x_prev, _, kl_div = ddim_step_KL(scheduler, fine_tune_epsilon, pre_trained_epsilon, t, x_prev, eta=1.0)
-        kl_loss += kl_div
-        # pdb.set_trace()
-        
-    # Compute intrinsic reward using only next_state slice from transition vector
-    if obs_dim is None or act_dim is None:
-        raise ValueError('fine_tune_step requires obs_dim and act_dim to slice next_state from x_prev')
-    next_obs_start = obs_dim + act_dim + 1
-    next_obs_end = next_obs_start + obs_dim
-    next_obs = x_prev[:, next_obs_start:next_obs_end]
-    # pdb.set_trace()
-    reward = compute_reward(next_obs)
-    # pdb.set_trace()
-    
-    loss = -reward.mean() * args.reward_coef + kl_weight * kl_loss.mean()
-    
-    loss.backward()
-
-    # Clip gradients and perform optimization step
-    nn.utils.clip_grad_norm_(fine_tune_model.parameters(), max_grad_norm)
-    optimizer.step()
-    
-    return loss.item(), reward.mean().item(), kl_loss.mean().item()
 
 
 
@@ -1284,7 +1176,7 @@ if __name__ == '__main__':
     # parser.add_argument('--finetune', action='store_true', default=False)
     parser.add_argument('--backprop_epochs', type=int, default=20)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
-    parser.add_argument('--ft_batch_size', type=int, default=128)
+    parser.add_argument('--ft_batch_size', type=int, default=256)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--accumulation_steps', type=int, default=4)
@@ -1295,8 +1187,11 @@ if __name__ == '__main__':
     parser.add_argument('--algorithm', type=str, default='REDQ')  # placeholder, not used directly
     
     parser.add_argument('--sample_freq', type=int, default=1)
-    parser.add_argument('--gfn_batch_size', type=int, default=16)
+    # 2 이상으로 해야 버그가 안남
+    parser.add_argument('--gfn_batch_size', type=int, default=2)
     parser.add_argument('--alpha', type=float, default=1.0)
+    
+    parser.add_argument('--domain', type=str, default=None)  # 'dmc' or 'muj'
     
     args = parser.parse_args()
     
@@ -1345,5 +1240,4 @@ if __name__ == '__main__':
 
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
 
-    # args를 한번에 넘기는게 좋음
     redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args, run_name=run_name)
