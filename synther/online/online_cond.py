@@ -94,7 +94,8 @@ def redq_sac(
     print(f"Training using device: {device}")
     # set number of epoch
     if epochs == 'mbpo' or epochs < 0:
-        epochs = mbpo_epoches.get(env_name, 100)
+        # epochs = mbpo_epoches.get(env_name, 100)
+        epochs = 100
     total_steps = steps_per_epoch * epochs + 1
     
     # set seed
@@ -115,7 +116,7 @@ def redq_sac(
             wandb.init(
             project = f'{env_name}',
             group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_epochs{args.backprop_epochs}_alpha{args.alpha}',
+            name = f' {run_name}_epochs{args.backprop_epochs}_alpha{args.alpha}_beta{args.beta}_delta{args.delta}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -429,8 +430,8 @@ def redq_sac(
                 print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
                 
                 # del, caching
-                del all_rewards, all_next_obs
-                torch.cuda.empty_cache()
+                # del all_rewards, all_next_obs
+                # torch.cuda.empty_cache()
                 
                 
                 # Setup dataloader
@@ -487,110 +488,177 @@ def redq_sac(
                             
                             
                             
-                        # On-policy Training 
-                        print('Starting on-policy training step...')
-                        if global_step % args.sample_freq == 0:
-                            optimizer.zero_grad()
-                            optimizer_z.zero_grad()
+                        # # On-policy Training 
+                        # print('Starting on-policy training step...')
+                        # if global_step % args.sample_freq == 0:
+                        #     optimizer.zero_grad()
+                        #     optimizer_z.zero_grad()
                             
-                            # Denoising process
-                            # x, logpf_pi, logpf_p = backprop_model.sample_rtb(batch_size = args.gfn_batch_size, num_sample_steps=backprop_model.diffusion_steps, cond=None)
-                            normal_dist = torch.distributions.Normal(torch.zeros((args.gfn_batch_size, *backprop_model.event_shape),device=device), torch.ones((args.gfn_batch_size, *backprop_model.event_shape), device=device))
-                            x = normal_dist.sample()
-                            # t = torch.zeros((args.gfn_batch_size,), device=x.device)
-                            # dt = 1/ backprop_model.diffusion_steps
+                        #     # Denoising process
+                        #     # x, logpf_pi, logpf_p = backprop_model.sample_rtb(batch_size = args.gfn_batch_size, num_sample_steps=backprop_model.diffusion_steps, cond=None)
+                        #     normal_dist = torch.distributions.Normal(torch.zeros((args.gfn_batch_size, *backprop_model.event_shape),device=device), torch.ones((args.gfn_batch_size, *backprop_model.event_shape), device=device))
+                        #     x = normal_dist.sample()
+                        #     # t = torch.zeros((args.gfn_batch_size,), device=x.device)
+                        #     # dt = 1/ backprop_model.diffusion_steps
                             
-                            logpf_pi = normal_dist.log_prob(x).sum(1)
-                            logpf_p = normal_dist.log_prob(x).sum(1)
+                        #     logpf_pi = normal_dist.log_prob(x).sum(1)
+                        #     logpf_p = normal_dist.log_prob(x).sum(1)
                             
-                            extra_steps = 1
-                            if False:
-                                extra_steps = 20
-                            for i in range(backprop_model.diffusion_steps):
-                                for j in range(extra_steps):
-                                    # sigma, sigma_next, gamma = map(lambda t: t.item(),(sigmas_and_gammas[i]))
-                                    # sigma_hat = sigma * (1 + gamma)
+                        #     extra_steps = 1
+                        #     if False:
+                        #         extra_steps = 20
+                        #     for i in range(backprop_model.diffusion_steps):
+                        #         for j in range(extra_steps):
+                        #             # sigma, sigma_next, gamma = map(lambda t: t.item(),(sigmas_and_gammas[i]))
+                        #             # sigma_hat = sigma * (1 + gamma)
                                     
-                                    # q_epsilon, bc_epsilon = self(s, x, t)
-                                    # q_epsilon = backprop_model.score_fn(x, sigmas[i].item())
-                                    # q_epsilon = backprop_model.score_fn(x, sigma_hat)
-                                    q_epsilon = backprop_model.score_fn(x, sigma_hats[i].item())
-                                    with torch.no_grad():
-                                        # bc_epsilon = pre_trained_model.score_fn(x, sigmas[i].item())
-                                        bc_epsilon = pre_trained_model.score_fn(x, sigma_hats[i].item()).detach()
+                        #             # Check model parameters before forward pass in on-policy training
+                        #             param_has_nan = False
+                        #             for param in backprop_model.parameters():
+                        #                 if torch.isnan(param).any() or torch.isinf(param).any():
+                        #                     param_has_nan = True
+                        #                     break
                                     
-                                    pflogvars = np.log(torch.sqrt(backprop_model.beta_t[i]).cpu().numpy()) * 2
-                                    pflogvars_sample = pflogvars
+                        #             if param_has_nan:
+                        #                 print(f'Warning: Model parameters contain NaN/Inf in on-policy training at step {i}, batch {batch_idx}')
+                        #                 print('Model was corrupted, breaking loop')
+                        #                 break
                                     
-                                    epsilon = q_epsilon + bc_epsilon
-                                    new_x = backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon.detach()) + torch.sqrt(backprop_model.beta_t[i]) * torch.randn_like(x)
+                        #             # q_epsilon, bc_epsilon = self(s, x, t)
+                        #             # q_epsilon = backprop_model.score_fn(x, sigmas[i].item())
+                        #             # q_epsilon = backprop_model.score_fn(x, sigma_hat)
+                        #             q_epsilon = backprop_model.score_fn(x, sigma_hats[i].item())
+                        #             with torch.no_grad():
+                        #                 # bc_epsilon = pre_trained_model.score_fn(x, sigmas[i].item())
+                        #                 bc_epsilon = pre_trained_model.score_fn(x, sigma_hats[i].item()).detach()
+                                    
+                        #             pflogvars = np.log(torch.sqrt(backprop_model.beta_t[i]).cpu().numpy()) * 2
+                        #             pflogvars_sample = pflogvars
+                                    
+                        #             epsilon = q_epsilon + bc_epsilon
+                                    
+                        #             # Check for NaN in epsilon in on-policy training as well
+                        #             if torch.isnan(epsilon).any() or torch.isinf(epsilon).any():
+                        #                 print(f'Warning: NaN/Inf detected in epsilon in on-policy training at step {i}, batch {batch_idx}')
+                        #                 if torch.isnan(q_epsilon).any():
+                        #                     print('q_epsilon contains NaN - model parameters may be corrupted')
+                        #                     # Check which parameters are NaN
+                        #                     for name, param in backprop_model.named_parameters():
+                        #                         if torch.isnan(param).any():
+                        #                             print(f'  Parameter {name} with shape {param.shape} contains NaN')
+                        #                 break
+                                    
+                        #             new_x = backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon.detach()) + torch.sqrt(backprop_model.beta_t[i]) * torch.randn_like(x)
 
-                                    # print(i)
-                                    # pdb.set_trace()
-                                    pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(x))
-                                    logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
+                        #             # print(i)
+                        #             # pdb.set_trace()
+                        #             pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(x))
+                        #             logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
 
-                                    pf_p_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(new_x))
-                                    logpf_p += pf_p_dist.log_prob(new_x).sum(1)
+                        #             pf_p_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(new_x))
+                        #             logpf_p += pf_p_dist.log_prob(new_x).sum(1)
                                 
-                                    x = new_x
-                                    if i < backprop_model.diffusion_steps-1:
-                                        break 
-                                # t = t + dt
+                        #             x = new_x
+                        #             if i < backprop_model.diffusion_steps-1:
+                        #                 break 
+                        #         # t = t + dt
                                 
                             
-                            # pdb.set_trace()
+                        #     # pdb.set_trace()
                             
-                            # caution: may not be correct
-                            # need to debug
-                            # pdb.set_trace()
-                            # Construct x1 (clean samples): [obs, act, rew, next_obs]
-                            # why don't you unnmormalize x here?
-                            x = backprop_model.normalizer.unnormalize(x)
-                            obs_next_x = x[:, obs_dim + act_dim + 1:]
+                        #     # caution: may not be correct
+                        #     # need to debug
+                        #     # pdb.set_trace()
+                        #     # Construct x1 (clean samples): [obs, act, rew, next_obs]
+                        #     # why don't you unnmormalize x here?
+                        #     x = backprop_model.normalizer.unnormalize(x)
+                        #     obs_next_x = x[:, obs_dim + act_dim + 1:]
                             
-                            # compute reward for sampled x
-                            with torch.no_grad():
-                                rewards_sample = agent.compute_intrinsic_reward(obs_next_x)
-                            # please log 'rewards_sample_mean'
-                            rewards_sample_mean = rewards_sample.mean().item()
-                            rewards_sample_std = rewards_sample.std().item()
-                            rewards_sample_norm = (rewards_sample - rewards_sample_mean) / (rewards_sample_std + 1e-8)
+                        #     # compute reward for sampled x
+                        #     with torch.no_grad():
+                        #         rewards_sample = agent.compute_intrinsic_reward(obs_next_x)
+                        #     # # please log 'rewards_sample_mean'
+                        #     # rewards_sample_mean = rewards_sample.mean().item()
+                        #     # rewards_sample_std = rewards_sample.std().item()
+                        #     # rewards_sample_norm = (rewards_sample - rewards_sample_mean) / (rewards_sample_std + 1e-8)
+                        #     rewards_sample_norm = (rewards_sample-reward_mean) / (reward_std + 1e-8)
                             
-                            logr = rewards_sample_norm
+                        #     logr = rewards_sample_norm
                             
-                            # 수정) we are using parameterized logZ
-                            # logC = (logr + args.alpha*logpf_pi - args.alpha*logpf_p).view(-1, args.gfn_batch_size)
-                            # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
-                            # loss = 0.5*((args.alpha*logpf_p + logC - args.alpha*logpf_pi - logr.detach())**2).mean()
-                            # detach()?
-                            # print(log_Z.item())
-                            # print(logr[:4])
-                            # print(logpf_pi[:4])
-                            # print(logpf_p[:4])
-                            # print(logpf_p[:4] - logpf_pi[:4])
-                            # print(kyle)
-                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
+                        #     # 수정) we are using parameterized logZ
+                        #     # logC = (logr + args.alpha*logpf_pi - args.alpha*logpf_p).view(-1, args.gfn_batch_size)
+                        #     # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
+                        #     # loss = 0.5*((args.alpha*logpf_p + logC - args.alpha*logpf_pi - logr.detach())**2).mean()
+                        #     # detach()?
+                        #     # print(log_Z.item())
+                        #     # print(logr[:4])
+                        #     # print(logpf_pi[:4])
+                        #     # print(logpf_p[:4])
+                        #     # print(logpf_p[:4] - logpf_pi[:4])
+                        #     # print(kyle)
+                        #     loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
                             
-                            loss.backward()
-                            optimizer.step()
-                            optimizer_z.step()
-                            sample_loss = loss.item()
+                        #     # Check for NaN/Inf in loss before backward to prevent corrupting model parameters
+                        #     if torch.isnan(loss) or torch.isinf(loss):
+                        #         print(f'Warning: NaN/Inf loss detected in on-policy training at batch {batch_idx}, skipping step')
+                        #         optimizer.zero_grad()
+                        #         optimizer_z.zero_grad()
+                        #         continue
+                            
+                        #     loss.backward()
+                            
+                        #     # Gradient clipping to prevent parameter explosion and NaN weights
+                        #     torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+                        #     torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+                            
+                        #     optimizer.step()
+                        #     optimizer_z.step()
+                            
+                        #     # Check if model parameters became NaN after optimizer step
+                        #     has_nan = False
+                        #     for param in backprop_model.parameters():
+                        #         if torch.isnan(param).any():
+                        #             print(f'Warning: Model parameters contain NaN after on-policy training step at batch {batch_idx}')
+                        #             has_nan = True
+                        #             break
+                        #     if has_nan:
+                        #         print('Model parameters corrupted, skipping remaining training steps for this batch')
+                        #         optimizer.zero_grad()
+                        #         optimizer_z.zero_grad()
+                        #         continue
+                            
+                        #     sample_loss = loss.item()
                             
                             
-                            # logging
-                            epoch_reward_on.append(rewards_sample_mean)
-                            epoch_loss_on.append(sample_loss)
+                        #     # logging
+                        #     # This is normalized reward, prior is of course normal(0,1)
+                        #     epoch_reward_on.append(rewards_sample_norm.mean().item())
+                        #     epoch_loss_on.append(sample_loss)
                             
-                            # logZSample = logC.mean().item()
-                            # loss = logZSample = backprop_model.compute_loss()
+                        #     # logZSample = logC.mean().item()
+                        #     # loss = logZSample = backprop_model.compute_loss()
                            
 
                         # pdb.set_trace()
                     
                     
                         # Off-policy Training
-                        print('Starting off-policy training step...')
+                        # print('Starting off-policy training step...')
+                        
+                        # Check if model parameters are corrupted BEFORE starting off-policy training
+                        model_has_nan = False
+                        for param in backprop_model.parameters():
+                            if torch.isnan(param).any() or torch.isinf(param).any():
+                                print(f'Warning: Model parameters contain NaN/Inf before off-policy training at batch {batch_idx}')
+                                print('Model was corrupted during on-policy training, skipping off-policy step')
+                                model_has_nan = True
+                                break
+                        
+                        if model_has_nan:
+                            optimizer.zero_grad()
+                            optimizer_z.zero_grad()
+                            continue
+                        
                         # Batch size becomes (args.ft_batch_size * args.gfn_batch_size) -> gradient exploding
                         # e.g.) 128 * 16 = 2048
                         x1_repeat = x1_normalized.repeat_interleave(args.gfn_batch_size, dim=0)
@@ -603,8 +671,11 @@ def redq_sac(
                         logpf_p = torch.zeros((bs,), device=x1_repeat.device)
                         # compute the reward
                         logr = rewards_norm
+                        # logr = rewards
                         logr = logr.repeat_interleave(args.gfn_batch_size, dim=0)
                         
+                        # Flag to track if NaN was detected (model corruption)
+                        nan_detected = False
                         
                         for i in range(backprop_model.diffusion_steps-1, -1, -1):
                             # sigma, sigma_next, gamma = map(lambda t: t.item(),(sigmas_and_gammas[i]))
@@ -615,31 +686,62 @@ def redq_sac(
                             # sample noisy one from the kernel
                             new_x = pb_dist.sample()
                             
+                            # Check model parameters before forward pass (some weights may have become NaN)
+                            param_has_nan = False
+                            for param in backprop_model.parameters():
+                                if torch.isnan(param).any() or torch.isinf(param).any():
+                                    param_has_nan = True
+                                    break
+                            
+                            if param_has_nan:
+                                print(f'Warning: Model parameters contain NaN/Inf at off-policy step {i}, batch {batch_idx}')
+                                print('Model was corrupted, skipping remaining steps')
+                                nan_detected = True
+                                break
+                            
                             # right sigma?
                             q_epsilon = backprop_model.score_fn(new_x, sigma=sigma_hats[i].item())
                             with torch.no_grad():
                                 bc_epsilon = pre_trained_model.score_fn(new_x, sigma=sigma_hats[i].item()).detach()
                             epsilon = q_epsilon + bc_epsilon
                             
-                            # pdb.set_trace()
-                            # small variance at initial phase: beta_t[large_value]
-                            print(f'i: {i}')
-                            print(f'torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x): {torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x)}')
-                            print(f':{backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon)}')
-                            print(f':{backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon)}')
+                            # Check for NaN/Inf in epsilon before using it (prevents crash)
+                            if torch.isnan(epsilon).any() or torch.isinf(epsilon).any():
+                                print(f'Warning: NaN/Inf detected in epsilon at off-policy step {i}, batch {batch_idx}')
+                                # Check which component is NaN
+                                if torch.isnan(q_epsilon).any():
+                                    print('q_epsilon (trainable model) contains NaN - model parameters are corrupted')
+                                    # Double-check model parameters
+                                    for param in backprop_model.parameters():
+                                        if torch.isnan(param).any():
+                                            print(f'Confirmed: Model parameter with shape {param.shape} contains NaN')
+                                elif torch.isnan(bc_epsilon).any():
+                                    print('bc_epsilon (frozen model) contains NaN - unexpected')
+                                # Skip this batch since model is corrupted
+                                nan_detected = True
+                                break
+                            
                             pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
                             logpf_pi += pf_pi_dist.log_prob(x1_repeat).sum(1)
                             # pdb.set_trace()
                             # 여기서 error 발생
                             # epsilon이 nan값이라 Normal을 mean argu.를 넣는 부분에서 문제 발생
                             # bc_epsilon이 아니라, epsilon에서 문제가 생긴걸로 봐서 optimize하다가 문제 발생
-                            # alpha가 너무 커서 loss가 폭발한건가? loss -> nan,
+                            # alpha가 너무 커서 loss가 폭발한건가? loss -> nan
                             # optimizer.step() -> nan
                             # model.parameters() -> nan
+                            # on-policy training 중에 문제 발생
                             pf_p_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
                             logpf_p += pf_p_dist.log_prob(x1_repeat).sum(1)
                             
                             x1_repeat = new_x
+                        
+                        # Skip loss computation if NaN was detected in the diffusion loop (model corrupted)
+                        if nan_detected:
+                            print(f'Skipping off-policy loss computation due to NaN in model output at batch {batch_idx}')
+                            optimizer.zero_grad()
+                            optimizer_z.zero_grad()
+                            continue
                         
                         prior_dist = torch.distributions.Normal(torch.zeros_like(x1_repeat), torch.ones_like(x1_repeat))
                         logpf_pi += prior_dist.log_prob(x1_repeat).sum(1)
@@ -653,13 +755,26 @@ def redq_sac(
                         # loss = 0.5*((args.alpha*logpf_p+logC-args.alpha*logpf_pi-logr.detach())**2).mean()
                         
                         # before mean, supposed to get batch_size of loss, vectorized calculation
+                        # loss = (args.delta**2)*0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*(1/args.delta)*logr.detach())**2).mean()
                         loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
                         # return loss, logC.mean().item()
+                        
+                        # Check for NaN/Inf in loss before backward
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f'Warning: NaN/Inf loss detected in off-policy training at batch {batch_idx}, skipping step')
+                            optimizer.zero_grad()
+                            optimizer_z.zero_grad()
+                            continue
                         
                         optimizer.zero_grad()
                         optimizer_z.zero_grad()
                         
                         loss.backward()
+                        
+                        # Gradient clipping to prevent parameter explosion
+                        torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+                        
                         optimizer.step()
                         optimizer_z.step()
                         
@@ -680,7 +795,7 @@ def redq_sac(
                         avg_epoch_loss_off = np.mean(epoch_loss_off)
                         print('======================================================================')
                         # print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
-                        print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
+                        print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | | Off-policy Loss: {avg_epoch_loss_off:.6f}')
                         print('======================================================================')
                         
                 # Sync EMA model with fine-tuned weights
@@ -1175,7 +1290,7 @@ if __name__ == '__main__':
     # finetune arguments
     # parser.add_argument('--finetune', action='store_true', default=False)
     parser.add_argument('--backprop_epochs', type=int, default=20)
-    parser.add_argument('--finetune_lr', type=float, default=1e-4)
+    parser.add_argument('--finetune_lr', type=float, default=1e-6)
     parser.add_argument('--ft_batch_size', type=int, default=256)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
@@ -1187,9 +1302,13 @@ if __name__ == '__main__':
     parser.add_argument('--algorithm', type=str, default='REDQ')  # placeholder, not used directly
     
     parser.add_argument('--sample_freq', type=int, default=1)
-    # 2 이상으로 해야 버그가 안남
-    parser.add_argument('--gfn_batch_size', type=int, default=2)
+    # 2 이상으로 해야 버그가 안남. 2개의 on-policy sample로 std를 구하려다가 instability 발생?
+    # 잘되면 gfn_batch_size는 8로, ft_batch_size는 128로
+    # 한번 8로 하고 실험
+    # 만약 이걸로 된다면, gfn_batch_size가 왜 오류에 영향을 미치는지 알아야해
+    parser.add_argument('--gfn_batch_size', type=int, default=1)
     parser.add_argument('--alpha', type=float, default=1.0)
+    parser.add_argument('--delta', type=float, default=1.0)
     
     parser.add_argument('--domain', type=str, default=None)  # 'dmc' or 'muj'
     

@@ -94,7 +94,7 @@ class ElucidatedDiffusion(nn.Module):
         beta1 = 0.02
         beta2 = 1e-4
         # careful
-        self.diffusion_steps = 75
+        self.diffusion_steps = 32
         self.beta_t = (beta1 - beta2) * torch.arange(self.diffusion_steps+1, 0, step=-1, dtype=torch.float32) / (self.diffusion_steps) + beta2
         self.alpha_t = 1 - torch.flip(self.beta_t, dims=[0])
         self.log_alpha_t = torch.log(self.alpha_t)
@@ -240,114 +240,6 @@ class ElucidatedDiffusion(nn.Module):
             inputs = inputs.clamp(-1., 1.)
         return self.normalizer.unnormalize(inputs)
     
-        
-    # x, logpf_pi, logpf_p = backprop_model.sample_rtb(batch_size = args.gfn_batch_size, num_sample_steps=backprop_model.diffusion_steps, cond=None)
-    # @torch.no_grad()
-    def sample_rtb(
-            self,
-            batch_size: int = 16,
-            num_sample_steps: Optional[int] = None,
-            clamp: bool = True,
-            cond=None,
-            cfg_scale: float = 1.0,
-            disable_tqdm: bool = False,
-    ):
-
-        num_sample_steps = default(num_sample_steps, self.num_sample_steps)
-        shape = (batch_size, *self.event_shape)
-
-        # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
-        sigmas = self.sample_schedule(num_sample_steps)
-        gammas = torch.where(
-            (sigmas >= self.S_tmin) & (sigmas <= self.S_tmax),
-            min(self.S_churn / num_sample_steps, math.sqrt(2) - 1),
-            0.
-        )
-
-        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
-
-        # inputs are noise at the beginning
-        init_sigma = sigmas[0]
-        inputs = init_sigma * torch.randn(shape, device=self.device)
-        if cond is not None:
-            cond = torch.from_numpy(cond).float().to(self.device)
-            cond = self.cond_normalizer.normalize(cond)
-            
-            
-        # rtb sampling 
-        bs = batch_size
-        normal_dist = torch.distributions.Normal(torch.zeros(bs,*self.event_shape,device=self.device), torch.ones((bs, *self.event_shape), device=self.device))
-        x = normal_dist.sample()
-        t = torch.zeros((bs,),device=self.device)
-        dt = 1/num_sample_steps
-        
-        logpf_pi = normal_dist.log_prob(x).sum(1)
-        logpf_p = normal_dist.log_prob(x).sum(1)
-        
-        extra_steps = 1
-        if False:
-            extra_steps = 20
-        for i in range(num_sample_steps):
-            for j in range(extra_steps):
-                # q_epsilon, bc_epsilon = self(s, x, t)
-                # sigmas의 index가 0일때 제일 큰 sigma value가 온다
-                q_epsilon, bc_epsilon = self.score_fn(x, sigmas[num_sample_steps - i])
-                pflogvars = np.log(torch.sqrt(self.bc_net.beta_t[i]).cpu().numpy()) * 2
-                pflogvars_sample = pflogvars
-                
-                epsilon = q_epsilon + bc_epsilon
-                new_x = self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x)
-
-                pf_pi_dist = torch.distributions.Normal(self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(self.bc_net.beta_t[i])*torch.ones_like(x))
-                logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
-
-                pf_p_dist = torch.distributions.Normal(self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(self.bc_net.beta_t[i])*torch.ones_like(new_x))
-                logpf_p += pf_p_dist.log_prob(new_x).sum(1)
-            
-                x = new_x
-                if i < self.diffusion_steps-1:
-                    break 
-            t = t + dt
-            
-        
-
-        # # gradually denoise
-        # for sigma, sigma_next, gamma in tqdm(sigmas_and_gammas, desc='sampling time step', mininterval=1,
-        #                                      disable=disable_tqdm):
-        #     sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
-
-        #     eps = self.S_noise * torch.randn(shape, device=self.device)  # stochastic sampling
-
-        #     sigma_hat = sigma + gamma * sigma
-        #     inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
-
-        #     # denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
-        #     # w/ cond
-        #     cond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
-        #     # w/o cond
-        #     uncond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=None)
-        #     # do cfg
-        #     denoised_over_sigma = uncond_denoised_over_sigma + cfg_scale * (cond_denoised_over_sigma - uncond_denoised_over_sigma)
-
-        #     inputs_next = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma
-
-        #     # second order correction, if not the last timestep
-        #     if sigma_next != 0:
-        #         if cfg_scale == 0.0:
-        #             denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
-        #         else:
-        #             denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
-        #         inputs_next = inputs_hat + 0.5 * (sigma_next - sigma_hat) * (
-        #                 denoised_over_sigma + denoised_prime_over_sigma)
-
-        #     inputs = inputs_next
-
-        if clamp:
-            inputs = inputs.clamp(-1., 1.)
-        return self.normalizer.unnormalize(inputs), logpf_pi, logpf_p 
-    
-        # return x, logpf_pi, logpf_p 
-            
 
     # This is known as 'denoised_over_sigma' in the lucidrains repo.
     def score_fn(
