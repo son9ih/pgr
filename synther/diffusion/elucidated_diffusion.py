@@ -19,6 +19,8 @@ from tqdm import tqdm
 
 from torch import Tensor
 
+import pdb
+
 
 # helpers
 def exists(val):
@@ -79,14 +81,17 @@ class ElucidatedDiffusion(nn.Module):
         self.rho = rho
         self.P_mean = P_mean
         self.P_std = P_std
-        self.num_sample_steps = num_sample_steps  # otherwise known as N in the paper
+        # self.num_sample_steps = num_sample_steps  # otherwise known as N in the paper
+        self.num_sample_steps = 128
         self.S_churn = S_churn
         self.S_tmin = S_tmin
         self.S_tmax = S_tmax
         self.S_noise = S_noise
         
         
-        self.sigmas = self.sample_schedule(self.num_sample_steps)
+        
+        # self.sigmas = self.sample_schedule(self.num_sample_steps).to(self.device)
+        self.sigmas = self.sample_schedule(self.num_sample_steps).to(self.device)
         
         
         # variable introduced for rtb
@@ -94,8 +99,9 @@ class ElucidatedDiffusion(nn.Module):
         beta1 = 0.02
         beta2 = 1e-4
         # careful
-        self.diffusion_steps = 32
-        self.beta_t = (beta1 - beta2) * torch.arange(self.diffusion_steps+1, 0, step=-1, dtype=torch.float32) / (self.diffusion_steps) + beta2
+        # self.diffusion_steps = 128
+        # self.beta_t = (beta1 - beta2) * torch.arange(self.diffusion_steps+1, 0, step=-1, dtype=torch.float32) / (self.diffusion_steps) + beta2
+        self.beta_t = (beta1 - beta2) * torch.arange(self.num_sample_steps+1, 0, step=-1, dtype=torch.float32) / (self.num_sample_steps) + beta2
         self.alpha_t = 1 - torch.flip(self.beta_t, dims=[0])
         self.log_alpha_t = torch.log(self.alpha_t)
         self.alphabar_t = torch.cumsum(self.log_alpha_t, dim=0).exp()
@@ -250,6 +256,7 @@ class ElucidatedDiffusion(nn.Module):
             cond=None,
     ):
         denoised = self.preconditioned_network_forward(x, sigma, clamp=clamp, cond=cond)
+        # pdb.set_trace()
         denoised_over_sigma = (x - denoised) / sigma
 
         return denoised_over_sigma
