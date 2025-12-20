@@ -73,6 +73,7 @@ def construct_diffusion_model(
     else:
         cond_normalizer = None
 
+    # num_sample_steps는 128
     diffusion_model = ElucidatedDiffusion(
         net=model,
         normalizer=normalizer,
