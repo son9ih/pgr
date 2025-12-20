@@ -54,6 +54,7 @@ class CondDiffusionGenerator:
 
             sampled_outputs = self.diffusion.sample(
                 batch_size=self.sample_batch_size,
+                # num_sample_steps=128,
                 num_sample_steps=self.num_sample_steps,
                 clamp=self.clamp_samples,
                 cond=cond,
