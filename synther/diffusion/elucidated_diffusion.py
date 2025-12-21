@@ -246,6 +246,230 @@ class ElucidatedDiffusion(nn.Module):
             inputs = inputs.clamp(-1., 1.)
         return self.normalizer.unnormalize(inputs)
     
+    
+    def sample_rtb(
+            self,
+            batch_size: int = 16,
+            num_sample_steps: Optional[int] = None,
+            clamp: bool = True,
+            cond=None,
+            cfg_scale: float = 1.0,
+            disable_tqdm: bool = False,
+            logpf_pi=None,
+            logpf_p=None,
+            pre_trained_model=None,
+    ):
+
+        num_sample_steps = default(num_sample_steps, self.num_sample_steps)
+        shape = (batch_size, *self.event_shape)
+
+        # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
+        sigmas = self.sample_schedule(num_sample_steps)
+        gammas = torch.where(
+            (sigmas >= self.S_tmin) & (sigmas <= self.S_tmax),
+            min(self.S_churn / num_sample_steps, math.sqrt(2) - 1),
+            0.
+        )
+
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
+
+        # inputs are noise at the beginning
+        init_sigma = sigmas[0]
+        inputs = init_sigma * torch.randn(shape, device=self.device)
+        if cond is not None:
+            cond = torch.from_numpy(cond).float().to(self.device)
+            cond = self.cond_normalizer.normalize(cond)
+            
+        # pdb.set_trace()
+
+        # gradually denoise
+        # 128 sampling steps
+        for sigma, sigma_next, gamma in tqdm(sigmas_and_gammas, desc='sampling time step', mininterval=1,
+                                             disable=disable_tqdm):
+            sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
+
+            eps = self.S_noise * torch.randn(shape, device=self.device)  # stochastic sampling
+
+            sigma_hat = sigma + gamma * sigma
+            inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
+            
+            
+
+            # denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
+            # w/ cond
+            cond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
+            # w/o cond
+            uncond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=None)
+            # do cfg
+            denoised_over_sigma = uncond_denoised_over_sigma + cfg_scale * (cond_denoised_over_sigma - uncond_denoised_over_sigma)
+    
+            inputs_next = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma
+            
+            
+            
+            # compute next samples from pre-trained model
+            with torch.no_grad():
+                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
+                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
+                denoised_over_sigma_pre = uncond_denoised_over_sigma_pre + cfg_scale * (cond_denoised_over_sigma_pre - uncond_denoised_over_sigma_pre)
+                inputs_next_pre = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma_pre
+                
+                
+            # compute log_prob of both models, and accumulate log_prob
+            std = math.sqrt((sigma_hat**2 - sigma**2)) * self.S_noise
+            pdb.set_trace()
+            
+            
+            pf_p_dist = torch.distributions.Normal(inputs_next, std)
+            pf_pi_dist = torch.distributions.Normal(inputs_next_pre, std)
+            
+            logpf_pi += pf_pi_dist.log_prob(inputs_next).sum(1)
+            logpf_p += pf_p_dist.log_prob(inputs_next).sum(1)
+            
+            
+            
+
+            # second order correction, if not the last timestep
+            if sigma_next != 0:
+                if cfg_scale == 0.0:
+                    denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
+                else:
+                    denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
+                inputs_next = inputs_hat + 0.5 * (sigma_next - sigma_hat) * (
+                        denoised_over_sigma + denoised_prime_over_sigma)
+
+            inputs = inputs_next
+
+        if clamp:
+            inputs = inputs.clamp(-1., 1.)
+            
+        x = self.normalizer.unnormalize(inputs)
+            
+            
+        return x, logpf_pi, logpf_p
+    
+    
+    def sample_rtb_reverse(
+            self,
+            x,
+            batch_size: int = 16,
+            num_sample_steps: Optional[int] = None,
+            clamp: bool = True,
+            cond=None,
+            cfg_scale: float = 1.0,
+            disable_tqdm: bool = False,
+            logpf_pi=None,
+            logpf_p=None,
+            pre_trained_model=None,
+    ):
+
+        num_sample_steps = default(num_sample_steps, self.num_sample_steps)
+        # shape = (batch_size, *self.event_shape)
+        shape = x.shape
+
+        # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
+        sigmas = self.sample_schedule(num_sample_steps)
+        gammas = torch.where(
+            (sigmas >= self.S_tmin) & (sigmas <= self.S_tmax),
+            min(self.S_churn / num_sample_steps, math.sqrt(2) - 1),
+            0.
+        )
+
+        # sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
+        
+        # I want sigmas, gammas, and sigmas_and_gammas to be reversed
+        sigmas = sigmas[::-1]
+        gammas = gammas[::-1]
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
+
+        # inputs are noise at the beginning
+        init_sigma = sigmas[0]
+        # inputs = init_sigma * torch.randn(shape, device=self.device)
+        # pb_dist = torch.distributions.Normal(x, self.sigma_min * torch.ones_like(x))
+        # inputs = pb_dist.sample()
+        
+        if cond is not None:
+            cond = torch.from_numpy(cond).float().to(self.device)
+            cond = self.cond_normalizer.normalize(cond)
+            
+        pb_dist = torch.distributions.Normal(x, self.sigma_min * torch.ones_like(x))
+        inputs = pb_dist.sample()
+        
+
+        # gradually denoise
+        # 128 sampling steps
+        for sigma, sigma_next, gamma in tqdm(sigmas_and_gammas, desc='noising time step', mininterval=1,
+                                             disable=disable_tqdm):
+            sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
+
+            eps = self.S_noise * torch.randn(shape, device=self.device)  # stochastic sampling
+
+            sigma_hat = sigma + gamma * sigma
+            
+            
+            
+            inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
+            
+            
+
+            # denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
+            # w/ cond
+            cond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
+            # w/o cond
+            uncond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=None)
+            # do cfg
+            denoised_over_sigma = uncond_denoised_over_sigma + cfg_scale * (cond_denoised_over_sigma - uncond_denoised_over_sigma)
+    
+    
+            inputs_next = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma
+            
+            
+            
+            # compute next samples from pre-trained model
+            with torch.no_grad():
+                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
+                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
+                denoised_over_sigma_pre = uncond_denoised_over_sigma_pre + cfg_scale * (cond_denoised_over_sigma_pre - uncond_denoised_over_sigma_pre)
+                inputs_next_pre = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma_pre
+                
+                
+            # compute log_prob of both models, and accumulate log_prob
+            std = math.sqrt((sigma_hat**2 - sigma**2)) * self.S_noise
+            pf_p_dist = torch.distributions.Normal(inputs_next, std)
+            pf_pi_dist = torch.distributions.Normal(inputs_next_pre, std)
+            
+            logpf_pi += pf_pi_dist.log_prob(inputs_next).sum(1)
+            logpf_p += pf_p_dist.log_prob(inputs_next).sum(1)
+            
+            
+            
+
+            # second order correction, if not the last timestep
+            if sigma_next != 0:
+                if cfg_scale == 0.0:
+                    denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
+                else:
+                    denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
+                inputs_next = inputs_hat + 0.5 * (sigma_next - sigma_hat) * (
+                        denoised_over_sigma + denoised_prime_over_sigma)
+                
+                
+
+            # x = inputs_next
+            print(f'sigma_next: {sigma_next}, sigma: {sigma}')
+            
+            pb_dist = torch.distributions.Normal(inputs_next, (math.sqrt(sigma_next**2 - sigma**2)) * torch.ones_like(inputs_next))
+            inputs = pb_dist.sample()
+            
+            
+
+        # if clamp:
+        #     inputs = inputs.clamp(-1., 1.)
+            
+        # x = self.normalizer.unnormalize(inputs)
+            
+            
+        return logpf_pi, logpf_p
 
     # This is known as 'denoised_over_sigma' in the lucidrains repo.
     def score_fn(
