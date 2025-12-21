@@ -522,6 +522,9 @@ def redq_sac(
                 global_step = 0
                 accumulation_steps = args.accumulation_steps
                 
+                print('Running RTB fine-tuning...')
+                print(f'Total batches: {len(dataloader)}')
+                
                 for epoch in range(args.backprop_epochs):
                     # print(f'Epoch')
                     # epoch_loss = 0.0
@@ -536,9 +539,13 @@ def redq_sac(
                     
                     
                     
+                    
                     for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
+                        # on_policy_reward_norm_list = []   
                         # unnormalized data
-                        print('Processing batch ', batch_idx)
+                        # print('Processing batch ', batch_idx)
+                        # print the number of total batches
+                        # print(f'Total batches: {len(dataloader)}')
                         obs = obs.to(device)
                         next_obs = next_obs.to(device)
                         act = act.to(device)
@@ -559,7 +566,7 @@ def redq_sac(
                         
                             
                         # On-policy Training
-                        print('Starting on-policy training step...')
+                        # print('Starting on-policy training step...')
                         if global_step % args.sample_freq == 0:
                             optimizer.zero_grad()
                             optimizer_z.zero_grad()
@@ -677,6 +684,7 @@ def redq_sac(
                             rewards_sample_norm = (rewards_sample-reward_mean) / (reward_std + 1e-8)
                             
                             logr = rewards_sample_norm
+                            # on_policy_reward_norm_list.append(rewards_sample_norm.mean().item())
                             
                             # 수정) we are using parameterized logZ
                             # logC = (logr + args.alpha*logpf_pi - args.alpha*logpf_p).view(-1, args.gfn_batch_size)
@@ -715,6 +723,9 @@ def redq_sac(
                                 continue
                             
                             sample_loss = loss.item()
+                            # print(f'[on-policy] sample_loss: {sample_loss}, batch_size: {args.gfn_batch_size}')
+                            # 아직까지 optimizer의 parameter는 오염되지 않음
+                            # pdb.set_trace()
                             
                             
                             # logging
@@ -731,7 +742,7 @@ def redq_sac(
                     
                     
                         # Off-policy Training
-                        print('Starting off-policy training step...')
+                        # print('Starting off-policy training step...')
                         
                         # Check if model parameters are corrupted BEFORE starting off-policy training
                         model_has_nan = False
@@ -840,7 +851,7 @@ def redq_sac(
                         # logpf_pi += prior_dist.log_prob(x1_repeat).sum(1)
                         # logpf_p += prior_dist.log_prob(x1_repeat).sum(1)
                         
-                        print(f'log_Z item: {log_Z.item()}')
+                        # print(f'log_Z item: {log_Z.item()}')
                         
                         # 수정) we are using parameterized logZ
                         # logC = (logr+args.alpha*logpf_pi-args.alpha*logpf_p).view(-1, args.gfn_batch_size)
@@ -889,6 +900,7 @@ def redq_sac(
                         print('======================================================================')
                         # print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
                         print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
+                        print(f'log_Z item: {log_Z.item()}')
                         print('======================================================================')
                         
                 # Sync EMA model with fine-tuned weights
@@ -1399,7 +1411,7 @@ if __name__ == '__main__':
     # finetune arguments
     parser.add_argument('--finetune', action='store_true', default=False)
     parser.add_argument('--backprop_epochs', type=int, default=10)
-    parser.add_argument('--finetune_lr', type=float, default=1e-5)
+    parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--reward_coef', type=float, default=1.0)
     parser.add_argument('--ft_batch_size', type=int, default=128)
     parser.add_argument('--rtb', action='store_true', default=False)
