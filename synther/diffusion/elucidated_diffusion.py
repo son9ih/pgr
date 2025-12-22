@@ -142,6 +142,7 @@ class ElucidatedDiffusion(nn.Module):
         return 1 * (sigma ** 2 + self.sigma_data ** 2) ** -0.5
 
     def c_noise(self, sigma):
+        # preconditioned network forward에서 sigma가 0이면 nan 값이 발생
         return log(sigma) * 0.25
 
     # preconditioned network output, equation (7) in the paper
@@ -254,7 +255,7 @@ class ElucidatedDiffusion(nn.Module):
             clamp: bool = True,
             cond=None,
             cfg_scale: float = 1.0,
-            disable_tqdm: bool = False,
+            disable_tqdm: bool = True,
             logpf_pi=None,
             logpf_p=None,
             pre_trained_model=None,
@@ -293,8 +294,8 @@ class ElucidatedDiffusion(nn.Module):
             sigma_hat = sigma + gamma * sigma
             inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
             
-            
-
+            # verify whether sigma_hat is 0 or not
+            # print(f'sigma_hat: {sigma_hat}')
             # denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
             # w/ cond
             cond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
@@ -309,26 +310,25 @@ class ElucidatedDiffusion(nn.Module):
             
             # compute next samples from pre-trained model
             with torch.no_grad():
-                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
-                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
+                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_hat, clamp=clamp, cond=cond)
+                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_hat, clamp=clamp, cond=None)
                 denoised_over_sigma_pre = uncond_denoised_over_sigma_pre + cfg_scale * (cond_denoised_over_sigma_pre - uncond_denoised_over_sigma_pre)
                 inputs_next_pre = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma_pre
                 
                 
             # compute log_prob of both models, and accumulate log_prob
             std = math.sqrt((sigma_hat**2 - sigma**2)) * self.S_noise
-            pdb.set_trace()
+            if std != 0:
+                # pdb.set_trace()
+                
+                pf_p_dist = torch.distributions.Normal(inputs_next, std)
+                pf_pi_dist = torch.distributions.Normal(inputs_next_pre, std)
+                
+                logpf_pi += pf_pi_dist.log_prob(inputs_next).sum(1)
+                logpf_p += pf_p_dist.log_prob(inputs_next).sum(1)
             
             
-            pf_p_dist = torch.distributions.Normal(inputs_next, std)
-            pf_pi_dist = torch.distributions.Normal(inputs_next_pre, std)
-            
-            logpf_pi += pf_pi_dist.log_prob(inputs_next).sum(1)
-            logpf_p += pf_p_dist.log_prob(inputs_next).sum(1)
-            
-            
-            
-
+            # print(f'sigma_next: {sigma_next}')
             # second order correction, if not the last timestep
             if sigma_next != 0:
                 if cfg_scale == 0.0:
@@ -339,6 +339,8 @@ class ElucidatedDiffusion(nn.Module):
                         denoised_over_sigma + denoised_prime_over_sigma)
 
             inputs = inputs_next
+            # print(f'inputs: {inputs}')
+            # pdb.set_trace()
 
         if clamp:
             inputs = inputs.clamp(-1., 1.)
@@ -357,7 +359,7 @@ class ElucidatedDiffusion(nn.Module):
             clamp: bool = True,
             cond=None,
             cfg_scale: float = 1.0,
-            disable_tqdm: bool = False,
+            disable_tqdm: bool = True,
             logpf_pi=None,
             logpf_p=None,
             pre_trained_model=None,
@@ -376,10 +378,15 @@ class ElucidatedDiffusion(nn.Module):
         )
 
         # sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
-        
+        # print(f'sigmas: {sigmas}')
+        # print(f'gammas: {gammas}')
+        # pdb.set_trace()
         # I want sigmas, gammas, and sigmas_and_gammas to be reversed
-        sigmas = sigmas[::-1]
-        gammas = gammas[::-1]
+        # sigmas = sigmas[::-1]
+        # gammas = gammas[::-1]
+        sigmas = torch.flip(sigmas, dims=[0])
+        gammas = torch.flip(gammas, dims=[0])
+        # pdb.set_trace()
         sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
 
         # inputs are noise at the beginning
@@ -401,15 +408,23 @@ class ElucidatedDiffusion(nn.Module):
         for sigma, sigma_next, gamma in tqdm(sigmas_and_gammas, desc='noising time step', mininterval=1,
                                              disable=disable_tqdm):
             sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
+            
+            
 
             eps = self.S_noise * torch.randn(shape, device=self.device)  # stochastic sampling
 
             sigma_hat = sigma + gamma * sigma
+            # print(f'sigma: {sigma}, sigma_next: {sigma_next}, sigma_hat: {sigma_hat}, gamma: {gamma}')
+            if sigma_hat == 0:
+                continue
+            # pdb.set_trace()
             
             
-            
+            # print(f'inputs: {inputs}')
             inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
-            
+            # print(f'inputs_hat: {inputs_hat}')
+        
+            # if sigma_hat != 0:
             
 
             # denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
@@ -420,43 +435,50 @@ class ElucidatedDiffusion(nn.Module):
             # do cfg
             denoised_over_sigma = uncond_denoised_over_sigma + cfg_scale * (cond_denoised_over_sigma - uncond_denoised_over_sigma)
     
-    
+            # pdb.set_trace()
             inputs_next = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma
-            
+            # print(f'inputs_next: {inputs_next}')
             
             
             # compute next samples from pre-trained model
             with torch.no_grad():
-                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
-                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
+                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_hat, clamp=clamp, cond=cond)
+                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_hat, clamp=clamp, cond=None)
                 denoised_over_sigma_pre = uncond_denoised_over_sigma_pre + cfg_scale * (cond_denoised_over_sigma_pre - uncond_denoised_over_sigma_pre)
                 inputs_next_pre = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma_pre
                 
                 
             # compute log_prob of both models, and accumulate log_prob
             std = math.sqrt((sigma_hat**2 - sigma**2)) * self.S_noise
-            pf_p_dist = torch.distributions.Normal(inputs_next, std)
-            pf_pi_dist = torch.distributions.Normal(inputs_next_pre, std)
-            
-            logpf_pi += pf_pi_dist.log_prob(inputs_next).sum(1)
-            logpf_p += pf_p_dist.log_prob(inputs_next).sum(1)
+            if std != 0:
+                # print(f'std: {std}')
+                pf_p_dist = torch.distributions.Normal(inputs_next, std)
+                pf_pi_dist = torch.distributions.Normal(inputs_next_pre, std)
+                
+                logpf_pi += pf_pi_dist.log_prob(inputs_next).sum(1)
+                logpf_p += pf_p_dist.log_prob(inputs_next).sum(1)
             
             
             
 
             # second order correction, if not the last timestep
             if sigma_next != 0:
+                # print('second order correction')
                 if cfg_scale == 0.0:
                     denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
                 else:
                     denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
                 inputs_next = inputs_hat + 0.5 * (sigma_next - sigma_hat) * (
                         denoised_over_sigma + denoised_prime_over_sigma)
+                # print(f'inputs_next after second order correction: {inputs_next}')
+                
                 
                 
 
             # x = inputs_next
-            print(f'sigma_next: {sigma_next}, sigma: {sigma}')
+            # print(f'sigma_next: {sigma_next}, sigma: {sigma}')
+            
+            # pdb.set_trace()
             
             pb_dist = torch.distributions.Normal(inputs_next, (math.sqrt(sigma_next**2 - sigma**2)) * torch.ones_like(inputs_next))
             inputs = pb_dist.sample()
