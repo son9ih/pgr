@@ -565,77 +565,97 @@ def redq_sac(
                             rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
                         
                             
-                        # On-policy Training
+                        # On-policy Training with Gradient Accumulation
                         print('Starting on-policy training step...')
                         if global_step % args.sample_freq == 0:
+                            # Gradient accumulation: split batch into chunks
+                            chunk_size = args.ft_batch_size // accumulation_steps
+                            if chunk_size == 0:
+                                chunk_size = args.ft_batch_size
+                                num_chunks = 1
+                            else:
+                                num_chunks = accumulation_steps
+                            
+                            # Initialize accumulators
+                            accumulated_loss = 0.0
+                            accumulated_reward = 0.0
+                            nan_detected = False
+                            
+                            # Zero gradients at the start of accumulation
                             optimizer.zero_grad()
                             optimizer_z.zero_grad()
                             
-                            # Denoising process
-                            # x, logpf_pi, logpf_p = backprop_model.sample_rtb(batch_size = args.gfn_batch_size, num_sample_steps=backprop_model.diffusion_steps, cond=None)
-                            # normal_dist = torch.distributions.Normal(torch.zeros((args.gfn_batch_size, *backprop_model.event_shape),device=device), torch.ones((args.gfn_batch_size, *backprop_model.event_shape), device=device))
-                            # normal_dist = torch.distributions.Normal(torch.zeros((args.gfn_batch_size, *backprop_model.event_shape),device=device), backprop_model.sigma_max * torch.ones((args.gfn_batch_size, *backprop_model.event_shape), device=device))
-                            normal_dist = torch.distributions.Normal(torch.zeros((args.ft_batch_size, *backprop_model.event_shape),device=device), backprop_model.sigma_max * torch.ones((args.ft_batch_size, *backprop_model.event_shape), device=device))
-                            x = normal_dist.sample()
-                            # t = torch.zeros((args.gfn_batch_size,), device=x.device)
-                            # dt = 1/ backprop_model.diffusion_steps
-                            
-                            logpf_pi = normal_dist.log_prob(x).sum(1)
-                            logpf_p = normal_dist.log_prob(x).sum(1)
-                            
-                            # extra_steps = 1
-                            # if False:
-                            #     extra_steps = 20
+                            # Process each chunk
+                            for chunk_idx in range(num_chunks):
+                                # Check model parameters before forward pass
+                                param_has_nan = False
+                                for param in backprop_model.parameters():
+                                    if torch.isnan(param).any() or torch.isinf(param).any():
+                                        param_has_nan = True
+                                        break
                                 
-                            # x, logpf_pi, logpf_p = backprop_model.sample_rtb(batch_size = args.gfn_batch_size, cond=None, logpf_pi=logpf_pi, logpf_p=logpf_p, pre_trained_model=pre_trained_model)
+                                if param_has_nan:
+                                    print(f'Warning: Model parameters contain NaN/Inf at on-policy chunk {chunk_idx}, batch {batch_idx}')
+                                    nan_detected = True
+                                    break
                                 
-                            x, logpf_pi, logpf_p = backprop_model.sample_rtb(batch_size = args.ft_batch_size, cond=None, logpf_pi=logpf_pi, logpf_p=logpf_p, pre_trained_model=pre_trained_model)
+                                # Denoising process for this chunk
+                                normal_dist = torch.distributions.Normal(
+                                    torch.zeros((chunk_size, *backprop_model.event_shape), device=device), 
+                                    backprop_model.sigma_max * torch.ones((chunk_size, *backprop_model.event_shape), device=device)
+                                )
+                                x_chunk = normal_dist.sample()
+                                
+                                logpf_pi_chunk = normal_dist.log_prob(x_chunk).sum(1)
+                                logpf_p_chunk = normal_dist.log_prob(x_chunk).sum(1)
+                                
+                                # Forward pass for this chunk
+                                x_chunk, logpf_pi_chunk, logpf_p_chunk = backprop_model.sample_rtb(
+                                    batch_size=chunk_size, 
+                                    cond=None, 
+                                    logpf_pi=logpf_pi_chunk, 
+                                    logpf_p=logpf_p_chunk, 
+                                    pre_trained_model=pre_trained_model
+                                )
+                                
+                                # Extract obs_next_x from chunk
+                                _, _, _, obs_next_x_chunk = split_diffusion_samples(x_chunk, env)
+                                
+                                # Compute reward for sampled x chunk
+                                with torch.no_grad():
+                                    rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk)
+                                rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
+                                
+                                logr_chunk = rewards_sample_norm_chunk
+                                
+                                # Compute loss for this chunk (scaled by 1/accumulation_steps to maintain effective learning rate)
+                                loss_chunk = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2).mean() / accumulation_steps
+                                
+                                # Check for NaN/Inf in loss
+                                if torch.isnan(loss_chunk) or torch.isinf(loss_chunk):
+                                    print(f'Warning: NaN/Inf loss detected in on-policy chunk {chunk_idx}, batch {batch_idx}, skipping chunk')
+                                    nan_detected = True
+                                    break
+                                
+                                # Backward pass (accumulate gradients)
+                                loss_chunk.backward()
+                                
+                                # Accumulate loss and reward for logging
+                                accumulated_loss += loss_chunk.item() * accumulation_steps
+                                accumulated_reward += rewards_sample_norm_chunk.mean().item()
                             
-                            
-                           
-                            # caution: may not be correct
-                            # need to debug
-                            # pdb.set_trace()
-                            # Construct x1 (clean samples): [obs, act, rew, next_obs]
-                            # why don't you unnmormalize x here?
-                            # x = backprop_model.normalizer.unnormalize(x)
-                            # 이렇게 수동으로 index하지 말고 utils.split_diffusion_samples() 사용하기
-                            # obs_next_x = x[:, obs_dim + act_dim + 1:]
-                            # obs_next_x = utils.split_diffusion_samples(x, obs_dim, act_dim)
-                            _, _, _, obs_next_x = split_diffusion_samples(x, env)
-                            
-                            # compute reward for sampled x
-                            with torch.no_grad():
-                                rewards_sample = agent.compute_intrinsic_reward(obs_next_x)
-                            # # please log 'rewards_sample_mean'
-                            # rewards_sample_mean = rewards_sample.mean().item()
-                            # rewards_sample_std = rewards_sample.std().item()
-                            # rewards_sample_norm = (rewards_sample - rewards_sample_mean) / (rewards_sample_std + 1e-8)
-                            rewards_sample_norm = (rewards_sample-reward_mean) / (reward_std + 1e-8)
-                            
-                            logr = rewards_sample_norm
-                            # on_policy_reward_norm_list.append(rewards_sample_norm.mean().item())
-                            
-                            # 수정) we are using parameterized logZ
-                            # logC = (logr + args.alpha*logpf_pi - args.alpha*logpf_p).view(-1, args.gfn_batch_size)
-                            # logC = logC.mean(1).repeat_interleave(args.gfn_batch_size, 0).detach()
-                            # loss = 0.5*((args.alpha*logpf_p + logC - args.alpha*logpf_pi - logr.detach())**2).mean()
-                            # detach()?
-                            loss = 0.5*((args.alpha*logpf_p + log_Z - args.alpha*logpf_pi - args.beta*logr.detach())**2).mean()
-                            
-                            # Check for NaN/Inf in loss before backward to prevent corrupting model parameters
-                            if torch.isnan(loss) or torch.isinf(loss):
-                                print(f'Warning: NaN/Inf loss detected in on-policy training at batch {batch_idx}, skipping step')
+                            # Skip optimizer step if NaN was detected
+                            if nan_detected:
+                                print(f'Skipping on-policy optimizer step due to NaN in model output at batch {batch_idx}')
                                 optimizer.zero_grad()
                                 optimizer_z.zero_grad()
                                 continue
-                            
-                            loss.backward()
                             
                             # Gradient clipping to prevent parameter explosion and NaN weights
                             torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
                             torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
                             
+                            # Update optimizer after accumulating gradients from all chunks
                             optimizer.step()
                             optimizer_z.step()
                             
@@ -652,15 +672,13 @@ def redq_sac(
                                 optimizer_z.zero_grad()
                                 continue
                             
-                            sample_loss = loss.item()
-                            # print(f'[on-policy] sample_loss: {sample_loss}, batch_size: {args.gfn_batch_size}')
-                            # 아직까지 optimizer의 parameter는 오염되지 않음
-                            # pdb.set_trace()
-                            
+                            # Average loss and reward for logging
+                            sample_loss = accumulated_loss / num_chunks if num_chunks > 0 else accumulated_loss
+                            avg_reward = accumulated_reward / num_chunks if num_chunks > 0 else accumulated_reward
                             
                             # logging
                             # This is normalized reward, prior is of course normal(0,1)
-                            epoch_reward_on.append(rewards_sample_norm.mean().item())
+                            epoch_reward_on.append(avg_reward)
                             epoch_loss_on.append(sample_loss)
                             
                             # logZSample = logC.mean().item()
