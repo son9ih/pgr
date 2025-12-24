@@ -498,19 +498,40 @@ def redq_sac(
                     # calculate reward of one batch
                     all_rewards = torch.cat(all_rewards, dim=0)
                 
-                # This is average novelty for original buffer
-                reward_mean = all_rewards.mean().item()
-                reward_std = all_rewards.std().item()
-                print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
+                # 12/24: 상위 10% intrinsic reward를 제외하고 평균/표준편차 계산
+                # all_rewards는 replay buffer 순서와 동일한 순서로 정렬되어 있음
+                rewards_flat = all_rewards.view(-1)
+                num_total = rewards_flat.numel()
+                # 상위 10%에 해당하는 개수
+                num_top = int(max(0, num_total * 0.1))
+                has_top10 = num_top > 0
+                if has_top10:
+                    topk_vals, topk_idx = torch.topk(rewards_flat, num_top, largest=True)
+                    valid_mask = torch.ones_like(rewards_flat, dtype=torch.bool)
+                    valid_mask[topk_idx] = False
+                    # 상위 10% reward 중 가장 낮은 값 (즉, 90퍼센타일 수준) 저장
+                    top10_threshold = topk_vals.min().item()
+                else:
+                    valid_mask = torch.ones_like(rewards_flat, dtype=torch.bool)
+                    top10_threshold = None
+                
+                # 상위 10%를 제외한 reward들만 사용
+                filtered_rewards = rewards_flat[valid_mask]
+                reward_mean = filtered_rewards.mean().item()
+                reward_std = filtered_rewards.std().item()
+                print(f"Reward statistics (excluding top 10%) - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
+                
+                # 이후 샘플링에서 사용할, 상위 10%를 제외한 인덱스 (replay buffer 기준)
+                valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).cpu().numpy()
                 
                 # 12/23: weighted sampling
                 # black magic
-                w = all_rewards.squeeze().detach()
-                w = torch.clamp(w,max=torch.quantile(w,0.99))
-                priority_alpha = getattr(args, "amplify", 1.0)
-                print(f'priority_alpha: {priority_alpha}')
-                w = w.pow(priority_alpha)
-                weights_cpu = w.to("cpu")
+                # w = all_rewards.squeeze().detach()
+                # w = torch.clamp(w,max=torch.quantile(w,0.99))
+                # priority_alpha = getattr(args, "amplify", 1.0)
+                # print(f'priority_alpha: {priority_alpha}')
+                # w = w.pow(priority_alpha)
+                # weights_cpu = w.to("cpu")
                 
                 # print(f'w: {w}')
                 # print(f'w.shape: {w.shape}')
@@ -556,26 +577,44 @@ def redq_sac(
                     
                     
                     # sampler = WeightedRandomSampler(weights_cpu, num_samples=len(w), replacement=True)
-                    sampler = WeightedRandomSampler(weights_cpu, num_samples=args.ft_batch_size, replacement=True)
-                    idx = torch.tensor(list(sampler), dtype=torch.long, device=device)
-                    idx_cpu = idx.cpu().numpy()
+                    # sampler = WeightedRandomSampler(weights_cpu, num_samples=args.ft_batch_size, replacement=True)
+                    # idx = torch.tensor(list(sampler), dtype=torch.long, device=device)
+                    # idx_cpu = idx.cpu().numpy()
                     # print(f'idx_cpu: {idx_cpu}')
                     # print(f'idx_cpu.shape: {idx_cpu.shape}')
                     
                     # Build tensors directly from replay buffer using sampled indices
-                    obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[idx_cpu], device=device, dtype=torch.float32)
-                    obs_next_tensor = torch.tensor(agent.replay_buffer.obs2_buf[idx_cpu], device=device, dtype=torch.float32)
-                    acts_tensor = torch.tensor(agent.replay_buffer.acts_buf[idx_cpu], device=device, dtype=torch.float32)
-                    rews_tensor = torch.tensor(agent.replay_buffer.rews_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
-                    done_tensor = torch.tensor(agent.replay_buffer.done_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
+                    # obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[idx_cpu], device=device, dtype=torch.float32)
+                    # obs_next_tensor = torch.tensor(agent.replay_buffer.obs2_buf[idx_cpu], device=device, dtype=torch.float32)
+                    # acts_tensor = torch.tensor(agent.replay_buffer.acts_buf[idx_cpu], device=device, dtype=torch.float32)
+                    # rews_tensor = torch.tensor(agent.replay_buffer.rews_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
+                    # done_tensor = torch.tensor(agent.replay_buffer.done_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
                     
-                    # uniform_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
-                    weighted_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
+                    
+                    # 상위 10% intrinsic reward를 제외한 인덱스에서만 균등 샘플링
+                    assert len(valid_indices) > 0, "No valid indices available after filtering top 10% rewards."
+                    replace_flag = len(valid_indices) < args.ft_batch_size
+                    sampled_idx = np.random.choice(valid_indices, size=args.ft_batch_size, replace=replace_flag)
+                    
+                    obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[sampled_idx],
+                                              device=device, dtype=torch.float32)
+                    obs_next_tensor = torch.tensor(agent.replay_buffer.obs2_buf[sampled_idx],
+                                                   device=device, dtype=torch.float32)
+                    acts_tensor = torch.tensor(agent.replay_buffer.acts_buf[sampled_idx],
+                                               device=device, dtype=torch.float32)
+                    rews_tensor = torch.tensor(agent.replay_buffer.rews_buf[sampled_idx],
+                                               device=device, dtype=torch.float32).unsqueeze(-1)
+                    done_tensor = torch.tensor(agent.replay_buffer.done_buf[sampled_idx],
+                                               device=device, dtype=torch.float32).unsqueeze(-1)
+                    
+                    uniform_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
+                    # weighted_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
                     
                     
                     
                     # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
-                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(weighted_sample_data):
+                    # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(weighted_sample_data):
+                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(uniform_sample_data):
                         # on_policy_reward_norm_list = []   
                         # unnormalized data
                         # print('Processing batch ', batch_idx)
@@ -660,6 +699,9 @@ def redq_sac(
                                 # Compute reward for sampled x chunk
                                 with torch.no_grad():
                                     rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk)
+                                    # 앞에서 계산한 상위 10% reward의 최소값(top10_threshold)을 상한으로 clip
+                                    if has_top10 and top10_threshold is not None:
+                                        rewards_sample_chunk = torch.clamp(rewards_sample_chunk, max=top10_threshold)
                                 rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
                                 
                                 logr_chunk = rewards_sample_norm_chunk
@@ -959,14 +1001,14 @@ def redq_sac(
             # Sample real and diffusion observations
             with torch.no_grad():
                 # Sample real data from replay buffer
-                real_obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=5000)
-                diffusion_obs_tensor, _, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
+                real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
+                diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
-                real_novelty = agent.compute_intrinsic_reward(real_obs_tensor).cpu().numpy().squeeze()
-                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
+                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor).cpu().numpy().squeeze()
+                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor).cpu().numpy().squeeze()
                 # Combined 10k observations and novelty
-                combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
-                combined_novelty = agent.compute_intrinsic_reward(combined_obs_tensor).cpu().numpy().squeeze()     
+                combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
+                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor).cpu().numpy().squeeze()     
             
             
             cur_epoch = t // steps_per_epoch
@@ -1007,9 +1049,11 @@ def redq_sac(
                 y_max = max(1, int(np.ceil(y_max * 1.05)))
                 
                 # Compute mean values
-                real_mean = float(real_novelty.mean())
+                # real_mean = float(real_novelty.mean())
+                # 12/24: 상위 10% reward를 제외한 평균 reward 사용, 즉 Stdnormalizer의 mean 사용
+                real_mean = reward_mean
                 diffusion_mean = float(diffusion_novelty.mean())
-                combined_mean = float(combined_novelty.mean())
+                # combined_mean = float(combined_novelty.mean())
                 
                 print(f'Real novelty mean: {real_mean:.7f}')
                 print(f'Diffusion novelty mean: {diffusion_mean:.7f}')
@@ -1031,7 +1075,7 @@ def redq_sac(
                 axes[1].set_ylabel('Count')
 
                 axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
-                axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
+                # axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
                 axes[2].set_title('Combined (10k) Novelty')
                 axes[2].set_xlabel('Novelty')
                 axes[2].set_ylabel('Count')
