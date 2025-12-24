@@ -39,6 +39,7 @@ from sklearn.manifold import TSNE
 
 from torch.utils.data import TensorDataset, DataLoader
 # from utils import split_diffusion_samples
+from torch.utils.data import WeightedRandomSampler
 
 
 @gin.configurable
@@ -502,6 +503,19 @@ def redq_sac(
                 reward_std = all_rewards.std().item()
                 print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
                 
+                # 12/23: weighted sampling
+                # black magic
+                w = all_rewards.squeeze().detach()
+                w = torch.clamp(w,max=torch.quantile(w,0.99))
+                priority_alpha = getattr(args, "amplify", 1.0)
+                print(f'priority_alpha: {priority_alpha}')
+                w = w.pow(priority_alpha)
+                weights_cpu = w.to("cpu")
+                
+                # print(f'w: {w}')
+                # print(f'w.shape: {w.shape}')
+                
+                
                 # del, caching
                 # del all_rewards, all_next_obs
                 # torch.cuda.empty_cache()
@@ -539,15 +553,29 @@ def redq_sac(
                     epoch_reward_on = []
                     epoch_loss_off = []
                     
-                    # Instead of dataloader, uniformly sample batch from original buffer
-                    uniform_sample_data = []
-                    # obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor = agent.sample_real_data(batch_size=args.ft_batch_size)
-                    uniform_sample_data.append(agent.sample_real_data(batch_size=args.ft_batch_size))
+                    
+                    
+                    # sampler = WeightedRandomSampler(weights_cpu, num_samples=len(w), replacement=True)
+                    sampler = WeightedRandomSampler(weights_cpu, num_samples=args.ft_batch_size, replacement=True)
+                    idx = torch.tensor(list(sampler), dtype=torch.long, device=device)
+                    idx_cpu = idx.cpu().numpy()
+                    # print(f'idx_cpu: {idx_cpu}')
+                    # print(f'idx_cpu.shape: {idx_cpu.shape}')
+                    
+                    # Build tensors directly from replay buffer using sampled indices
+                    obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[idx_cpu], device=device, dtype=torch.float32)
+                    obs_next_tensor = torch.tensor(agent.replay_buffer.obs2_buf[idx_cpu], device=device, dtype=torch.float32)
+                    acts_tensor = torch.tensor(agent.replay_buffer.acts_buf[idx_cpu], device=device, dtype=torch.float32)
+                    rews_tensor = torch.tensor(agent.replay_buffer.rews_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
+                    done_tensor = torch.tensor(agent.replay_buffer.done_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
+                    
+                    # uniform_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
+                    weighted_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
                     
                     
                     
                     # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
-                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(uniform_sample_data):
+                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(weighted_sample_data):
                         # on_policy_reward_norm_list = []   
                         # unnormalized data
                         # print('Processing batch ', batch_idx)
@@ -622,7 +650,7 @@ def redq_sac(
                                     batch_size=chunk_size, 
                                     cond=None, 
                                     logpf_pi=logpf_pi_chunk, 
-                                    logpf_p=logpf_p_chunk, 
+                                    logpf_p=logpf_p_chunk,
                                     pre_trained_model=pre_trained_model
                                 )
                                 
@@ -635,7 +663,8 @@ def redq_sac(
                                 rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
                                 
                                 logr_chunk = rewards_sample_norm_chunk
-                                
+                                # logr_chunk = rewards_sample_chunk
+                                # logr_chunk = rewards_sample_chunk.log()
                                 # Compute loss for this chunk (scaled by 1/accumulation_steps to maintain effective learning rate)
                                 loss_chunk = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2).mean() / accumulation_steps
                                 
@@ -726,6 +755,7 @@ def redq_sac(
                         
                         # compute the reward
                         logr = rewards_norm
+                        # logr = rewards.log()
                         # logr = rewards
                         # logr = logr.repeat_interleave(args.gfn_batch_size, dim=0)
                         
@@ -960,7 +990,7 @@ def redq_sac(
                 # bins = np.linspace(x_min, x_max, num_bins + 1)
                 # Build shared bins/ranges using the widest x-range across the three arrays
                 x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
-                x_max = float(np.percentile(combined_novelty, 98))  # Top 2% threshold
+                x_max = float(np.percentile(combined_novelty, 95))  # Top 5% threshold
                 if x_min == x_max:
                     # avoid zero-width bins if all values are identical
                     x_min -= 1e-8
@@ -1396,7 +1426,7 @@ if __name__ == '__main__':
     # finetune arguments
     parser.add_argument('--finetune', action='store_true', default=False)
     parser.add_argument('--backprop_epochs', type=int, default=10)
-    parser.add_argument('--backprop_iters', type=int, default=20)
+    parser.add_argument('--backprop_iters', type=int, default=10)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--reward_coef', type=float, default=1.0)
     parser.add_argument('--ft_batch_size', type=int, default=1024)
@@ -1415,6 +1445,8 @@ if __name__ == '__main__':
     parser.add_argument('--delta', type=float, default=1.0)
     
     parser.add_argument('--domain', type=str, default=None)  # 'dmc' or 'muj'
+    
+    parser.add_argument('--amplify', type=float, default=1.0)
     
     args = parser.parse_args()
     
