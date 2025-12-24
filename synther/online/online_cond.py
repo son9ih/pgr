@@ -444,6 +444,9 @@ def redq_sac(
             
             if args.rtb:
                 print('Setting up for RTB fine-tuning...')
+                # Calculate current epoch for logging
+                cur_epoch = (t // steps_per_epoch)
+                
                 # Initialize fine-tuning model
                 # diffusion model이 epsilon을 뱉으면 됨
                 backprop_model = diffusion_trainer.model.to(device)
@@ -559,6 +562,9 @@ def redq_sac(
                 
                 print('Running RTB fine-tuning...')
                 # print(f'Total batches: {len(dataloader)}')
+                
+                # Initialize wandb table for RTB fine-tuning logs (with epoch info to avoid overwriting)
+                rtb_log_table = wandb.Table(columns=["Epoch", "Iter", "On-policy Loss", "On-policy Reward", "Off-policy Loss", "log_Z"])
                 
                 # for epoch in range(args.backprop_epochs):
                 for iter in range(args.backprop_iters):
@@ -960,6 +966,20 @@ def redq_sac(
                         print(f'log_Z item: {log_Z.item()}')
                         print('======================================================================')
                         
+                        # Add data to wandb table with epoch information
+                        rtb_log_table.add_data(
+                            cur_epoch,
+                            iter + 1,
+                            f"{avg_epoch_loss_on:.6f}",
+                            f"{avg_epoch_reward_on:.6f}",
+                            f"{avg_epoch_loss_off:.6f}",
+                            f"{log_Z.item():.6f}"
+                        )
+                        
+                        # Log table at the last iteration (with epoch-specific key to avoid overwriting)
+                        if iter == args.backprop_iters - 1:
+                            wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
+                        
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
                 print('RTB fine-tuning complete. Synced EMA model with fine-tuned weights.')
@@ -1049,11 +1069,11 @@ def redq_sac(
                 y_max = max(1, int(np.ceil(y_max * 1.05)))
                 
                 # Compute mean values
-                # real_mean = float(real_novelty.mean())
+                real_mean = float(real_novelty.mean())
                 # 12/24: 상위 10% reward를 제외한 평균 reward 사용, 즉 Stdnormalizer의 mean 사용
-                real_mean = reward_mean
+                # real_mean = reward_mean
                 diffusion_mean = float(diffusion_novelty.mean())
-                # combined_mean = float(combined_novelty.mean())
+                combined_mean = float(combined_novelty.mean())
                 
                 print(f'Real novelty mean: {real_mean:.7f}')
                 print(f'Diffusion novelty mean: {diffusion_mean:.7f}')
@@ -1075,7 +1095,7 @@ def redq_sac(
                 axes[1].set_ylabel('Count')
 
                 axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
-                # axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
+                axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
                 axes[2].set_title('Combined (10k) Novelty')
                 axes[2].set_xlabel('Novelty')
                 axes[2].set_ylabel('Count')
