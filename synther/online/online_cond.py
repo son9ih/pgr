@@ -117,7 +117,7 @@ def redq_sac(
             wandb.init(
             project = f'{env_name}',
             group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_ft_batch_size{args.ft_batch_size}_epochs{args.backprop_epochs}_alpha{args.alpha}_beta{args.beta}',
+            name = f' {run_name}_ft_batch_size{args.ft_batch_size}_iters{args.backprop_iters}_beta{args.beta}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -456,16 +456,16 @@ def redq_sac(
                 
                 # sigmas = backprop_model.sample_schedule(backprop_model.diffusion_steps).to(device)
                 # sigmas의 크기는 diffusion model init할 때의 sample_schedule의 크기
-                sigmas = backprop_model.sigmas.to(device)
+                # sigmas = backprop_model.sigmas.to(device)
                 # print(f'length of sigmas: {sigmas.shape}')
-                gammas = torch.where(
-                    (sigmas >= backprop_model.S_tmin) & (sigmas <= backprop_model.S_tmax),
-                    min(backprop_model.S_churn / backprop_model.num_sample_steps, math.sqrt(2) - 1),
-                    0.
-                )
+                # gammas = torch.where(
+                #     (sigmas >= backprop_model.S_tmin) & (sigmas <= backprop_model.S_tmax),
+                #     min(backprop_model.S_churn / backprop_model.num_sample_steps, math.sqrt(2) - 1),
+                #     0.
+                # )
                 # sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
                 
-                sigma_hats = sigmas * (1 + gammas)
+                # sigma_hats = sigmas * (1 + gammas)
                 
                 # print(f'sigmas: {sigmas}')
                 # print(f'gammas: {gammas}')
@@ -509,23 +509,24 @@ def redq_sac(
                 
                 # Setup dataloader
                 # return unnormalized data
-                obs_data = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
-                obs_next_data = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
-                acts_data = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
-                rews_data = torch.FloatTensor(agent.replay_buffer.rews_buf[:ptr_location])
-                done_data = torch.FloatTensor(agent.replay_buffer.done_buf[:ptr_location])
+                # obs_data = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
+                # obs_next_data = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
+                # acts_data = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
+                # rews_data = torch.FloatTensor(agent.replay_buffer.rews_buf[:ptr_location])
+                # done_data = torch.FloatTensor(agent.replay_buffer.done_buf[:ptr_location])
                 
-                dataset = TensorDataset(obs_data, obs_next_data, acts_data, rews_data, done_data)
-                dataloader = DataLoader(dataset, batch_size=args.ft_batch_size, shuffle=True, drop_last=True)
+                # dataset = TensorDataset(obs_data, obs_next_data, acts_data, rews_data, done_data)
+                # dataloader = DataLoader(dataset, batch_size=args.ft_batch_size, shuffle=True, drop_last=True)
                 
                 # Training loop
                 global_step = 0
                 accumulation_steps = args.accumulation_steps
                 
                 print('Running RTB fine-tuning...')
-                print(f'Total batches: {len(dataloader)}')
+                # print(f'Total batches: {len(dataloader)}')
                 
-                for epoch in range(args.backprop_epochs):
+                # for epoch in range(args.backprop_epochs):
+                for iter in range(args.backprop_iters):
                     # print(f'Epoch')
                     # epoch_loss = 0.0
                     # epoch_log_z = 0.0
@@ -533,14 +534,20 @@ def redq_sac(
                     # epoch_log_ratio = 0.0
                     # num_batches = 0
                     
+                    # Actually not a epoch, but iteration
                     epoch_loss_on = []
                     epoch_reward_on = []
                     epoch_loss_off = []
                     
+                    # Instead of dataloader, uniformly sample batch from original buffer
+                    uniform_sample_data = []
+                    # obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor = agent.sample_real_data(batch_size=args.ft_batch_size)
+                    uniform_sample_data.append(agent.sample_real_data(batch_size=args.ft_batch_size))
                     
                     
                     
-                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
+                    # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
+                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(uniform_sample_data):
                         # on_policy_reward_norm_list = []   
                         # unnormalized data
                         # print('Processing batch ', batch_idx)
@@ -553,12 +560,13 @@ def redq_sac(
                         current_batch_size = obs.size(0)
                         
                         # Construct x1 (clean samples): [obs, act, rew, next_obs]
-                        x1 = torch.cat([obs, act, rew.unsqueeze(-1), next_obs], dim=-1).to(device)
+                        # pdb.set_trace()
+                        # x1 = torch.cat([obs, act, rew.unsqueeze(-1), next_obs], dim=-1).to(device)
+                        x1 = torch.cat([obs, act, rew, next_obs], dim=-1).to(device)
                         
+                        # This is preparation for off-policy training
                         # Normalize x1
                         x1_normalized = backprop_model.normalizer.normalize(x1)
-                        
-                    
                         with torch.no_grad():
                             rewards = agent.compute_intrinsic_reward(next_obs)  # r(x1)
                             # Normalize rewards using average and std computed from entire buffer
@@ -566,7 +574,7 @@ def redq_sac(
                         
                             
                         # On-policy Training with Gradient Accumulation
-                        print('Starting on-policy training step...')
+                        # print('Starting on-policy training step...')
                         if global_step % args.sample_freq == 0:
                             # Gradient accumulation: split batch into chunks
                             chunk_size = args.ft_batch_size // accumulation_steps
@@ -690,7 +698,7 @@ def redq_sac(
                     
                     
                         # Off-policy Training
-                        print('Starting off-policy training step...')
+                        # print('Starting off-policy training step...')
                         
                         # Check if model parameters are corrupted BEFORE starting off-policy training
                         model_has_nan = False
@@ -870,13 +878,13 @@ def redq_sac(
                     # epoch_loss_on = 0.0
                     # epoch_reward_on = 0.0
                     # epoch_loss_off = 0.0
-                    if epoch % 1 == 0:
+                    if iter % 1 == 0:
                         avg_epoch_loss_on = np.mean(epoch_loss_on)
                         avg_epoch_reward_on = np.mean(epoch_reward_on)
                         avg_epoch_loss_off = np.mean(epoch_loss_off)
                         print('======================================================================')
                         # print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
-                        print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
+                        print(f'RTB Fine-tuning Iter {iter + 1}/{args.backprop_iters} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
                         print(f'log_Z item: {log_Z.item()}')
                         print('======================================================================')
                         
@@ -1388,6 +1396,7 @@ if __name__ == '__main__':
     # finetune arguments
     parser.add_argument('--finetune', action='store_true', default=False)
     parser.add_argument('--backprop_epochs', type=int, default=10)
+    parser.add_argument('--backprop_iters', type=int, default=20)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--reward_coef', type=float, default=1.0)
     parser.add_argument('--ft_batch_size', type=int, default=1024)
