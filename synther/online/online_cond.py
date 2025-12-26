@@ -118,7 +118,7 @@ def redq_sac(
             wandb.init(
             project = f'{env_name}',
             group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_ft_batch_size{args.ft_batch_size}_iters{args.backprop_iters}_beta{args.beta}',
+            name = f' {run_name}_ftLr{args.finetune_lr}_ft_batch_size{args.ft_batch_size}_iters{args.backprop_iters}_beta{args.beta}_amplify{args.amplify}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -366,6 +366,11 @@ def redq_sac(
             agent.pred_net.eval()
             logger.store(PredLoss=pred_loss)
             logger.log_tabular('PredLoss', average_only=True)
+            
+            
+            # TODO: save .ckpt of agent.pred_net then, load it to agent.temp_net after 5 epochs
+            if (t + 1) % args.target_rnd_every == 0:
+                pass
 
         # if d or (ep_len == max_ep_len):
         if (ep_len == max_ep_len):
@@ -527,17 +532,22 @@ def redq_sac(
                 # 이후 샘플링에서 사용할, 상위 10%를 제외한 인덱스 (replay buffer 기준)
                 valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).cpu().numpy()
                 
-                # 12/23: weighted sampling
-                # black magic
-                # w = all_rewards.squeeze().detach()
-                # w = torch.clamp(w,max=torch.quantile(w,0.99))
-                # priority_alpha = getattr(args, "amplify", 1.0)
-                # print(f'priority_alpha: {priority_alpha}')
-                # w = w.pow(priority_alpha)
-                # weights_cpu = w.to("cpu")
-                
-                # print(f'w: {w}')
-                # print(f'w.shape: {w.shape}')
+                # Weighted sampling을 위한 weights 계산 (valid_indices 내에서만)
+                if not args.uniform:
+                    # valid_indices에 해당하는 rewards만 추출
+                    valid_rewards = rewards_flat[valid_mask].detach()  # shape: [len(valid_indices)]
+                    
+                    # Optional: reward를 clamp하여 극단값 제한 (이전 코드 참고)
+                    # valid_rewards = torch.clamp(valid_rewards, max=torch.quantile(valid_rewards, 0.99))
+                    
+                    # priority_alpha를 사용하여 weights 계산 (높은 reward를 더 많이 샘플링)
+                    priority_alpha = getattr(args, "amplify", 1.0)
+                    valid_weights = valid_rewards.pow(priority_alpha)
+                    
+                    # CPU로 이동 (WeightedRandomSampler는 CPU tensor 필요)
+                    valid_weights_cpu = valid_weights.to("cpu")
+                else:
+                    valid_weights_cpu = None
                 
                 
                 # del, caching
@@ -564,7 +574,8 @@ def redq_sac(
                 # print(f'Total batches: {len(dataloader)}')
                 
                 # Initialize wandb table for RTB fine-tuning logs (with epoch info to avoid overwriting)
-                rtb_log_table = wandb.Table(columns=["Epoch", "Iter", "On-policy Loss", "On-policy Reward", "Off-policy Loss", "log_Z"])
+                if args.wandb:
+                    rtb_log_table = wandb.Table(columns=["Epoch", "Iter", "On-policy Loss", "On-policy Reward", "Off-policy Loss", "log_Z"])
                 
                 # for epoch in range(args.backprop_epochs):
                 for iter in range(args.backprop_iters):
@@ -597,10 +608,26 @@ def redq_sac(
                     # done_tensor = torch.tensor(agent.replay_buffer.done_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
                     
                     
-                    # 상위 10% intrinsic reward를 제외한 인덱스에서만 균등 샘플링
+                    # 상위 10% intrinsic reward를 제외한 인덱스에서 샘플링 (uniform 또는 weighted)
                     assert len(valid_indices) > 0, "No valid indices available after filtering top 10% rewards."
-                    replace_flag = len(valid_indices) < args.ft_batch_size
-                    sampled_idx = np.random.choice(valid_indices, size=args.ft_batch_size, replace=replace_flag)
+                    
+                    if args.uniform:
+                        # Uniform sampling
+                        replace_flag = len(valid_indices) < args.ft_batch_size
+                        sampled_idx = np.random.choice(valid_indices, size=args.ft_batch_size, replace=replace_flag)
+                    else:
+                        # Weighted sampling using WeightedRandomSampler
+                        # valid_indices 내에서 weighted sampling
+                        replace_flag = len(valid_indices) < args.ft_batch_size
+                        sampler = WeightedRandomSampler(
+                            weights=valid_weights_cpu,
+                            num_samples=args.ft_batch_size,
+                            replacement=replace_flag
+                        )
+                        # WeightedRandomSampler는 인덱스를 반환 (0부터 len(valid_indices)-1까지)
+                        # 이를 valid_indices로 매핑해야 함
+                        sampled_valid_idx = torch.tensor(list(sampler), dtype=torch.long)
+                        sampled_idx = valid_indices[sampled_valid_idx.numpy()]
                     
                     obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[sampled_idx],
                                               device=device, dtype=torch.float32)
@@ -707,6 +734,7 @@ def redq_sac(
                                     rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk)
                                     # 앞에서 계산한 상위 10% reward의 최소값(top10_threshold)을 상한으로 clip
                                     if has_top10 and top10_threshold is not None:
+                                        print(f'number of clipped rewards: {torch.sum(rewards_sample_chunk > top10_threshold).item()} among {rewards_sample_chunk.shape[0]} rewards')
                                         rewards_sample_chunk = torch.clamp(rewards_sample_chunk, max=top10_threshold)
                                 rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
                                 
@@ -967,18 +995,19 @@ def redq_sac(
                         print('======================================================================')
                         
                         # Add data to wandb table with epoch information
-                        rtb_log_table.add_data(
-                            cur_epoch,
-                            iter + 1,
-                            f"{avg_epoch_loss_on:.6f}",
-                            f"{avg_epoch_reward_on:.6f}",
-                            f"{avg_epoch_loss_off:.6f}",
-                            f"{log_Z.item():.6f}"
-                        )
+                        if args.wandb:
+                            rtb_log_table.add_data(
+                                cur_epoch,
+                                iter + 1,
+                                f"{avg_epoch_loss_on:.6f}",
+                                f"{avg_epoch_reward_on:.6f}",
+                                f"{avg_epoch_loss_off:.6f}",
+                                f"{log_Z.item():.6f}"
+                            )
                         
                         # Log table at the last iteration (with epoch-specific key to avoid overwriting)
-                        if iter == args.backprop_iters - 1:
-                            wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
+                            if iter == args.backprop_iters - 1:
+                                wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
                         
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
@@ -1117,6 +1146,61 @@ def redq_sac(
                 fig.savefig(out_path)
                 plt.close(fig)
                 print(f'Saved novelty histogram to {out_path}')
+                
+                # =============================================================================
+                # Full replay buffer novelty histogram
+                # =============================================================================
+                print('Computing novelty for full replay buffer...')
+                ptr_location = agent.replay_buffer.ptr
+                all_next_obs = agent.replay_buffer.obs2_buf[:ptr_location]
+                
+                # Compute novelty in batches to avoid memory issues
+                batch_size_novelty = 5000
+                all_novelty_list = []
+                with torch.no_grad():
+                    for i in range(0, ptr_location, batch_size_novelty):
+                        batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
+                        batch_novelty = agent.compute_intrinsic_reward(batch_next_obs).cpu().numpy().squeeze()
+                        all_novelty_list.append(batch_novelty)
+                
+                all_novelty = np.concatenate(all_novelty_list)
+                
+                # Build bins for full buffer histogram
+                x_min_full = float(all_novelty.min())
+                x_max_full = float(np.percentile(all_novelty, 100))  # Top 5% threshold
+                if x_min_full == x_max_full:
+                    x_min_full -= 1e-8
+                    x_max_full += 1e-8
+                num_bins_full = 100
+                bins_full = np.linspace(x_min_full, x_max_full, num_bins_full + 1)
+                
+                # Compute mean
+                all_mean = float(all_novelty.mean())
+                print(f'Full replay buffer novelty mean: {all_mean:.7f}')
+                print(f'Full replay buffer size: {ptr_location}')
+                
+                # Create histogram figure for full replay buffer
+                fig_full, ax_full = plt.subplots(figsize=(8, 6))
+                ax_full.hist(all_novelty, bins=bins_full, color='tab:purple', alpha=0.8)
+                ax_full.axvline(all_mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {all_mean:.7f}')
+                ax_full.set_title(f'Full Replay Buffer Novelty (Epoch {cur_epoch})')
+                ax_full.set_xlabel('Novelty')
+                ax_full.set_ylabel('Count')
+                ax_full.legend()
+                ax_full.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+                # Log to wandb
+                if args.wandb:
+                    wandb.log({
+                        'images/full_replay_buffer_novelty_hist': wandb.Image(fig_full, caption=f'Epoch {cur_epoch}')
+                    }, step=cur_epoch)
+                
+                # Save to disk
+                out_path_full = os.path.join(out_dir, f'full_replay_buffer_novelty_hist_epoch{cur_epoch:04d}.png')
+                fig_full.savefig(out_path_full)
+                plt.close(fig_full)
+                print(f'Saved full replay buffer novelty histogram to {out_path_full}')
                     
                     
                     
@@ -1489,15 +1573,16 @@ if __name__ == '__main__':
     
     # finetune arguments
     parser.add_argument('--finetune', action='store_true', default=False)
-    parser.add_argument('--backprop_epochs', type=int, default=10)
-    parser.add_argument('--backprop_iters', type=int, default=10)
-    parser.add_argument('--finetune_lr', type=float, default=1e-4)
+    parser.add_argument('--backprop_epochs', type=int, default=100)
+    parser.add_argument('--backprop_iters', type=int, default=100)
+    parser.add_argument('--finetune_lr', type=float, default=5e-5)
     parser.add_argument('--reward_coef', type=float, default=1.0)
     parser.add_argument('--ft_batch_size', type=int, default=1024)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--kl_weight', type=float, default=10.0)
     parser.add_argument('--accumulation_steps', type=int, default=4)
+    parser.add_argument('--uniform', action='store_true', default=False, help='Use uniform sampling for off-policy data (default: False, i.e., weighted sampling). Set --uniform for uniform sampling.')
     
     # REDQ
     parser.add_argument('--disable_diffusion', action='store_true', default=False)
@@ -1511,6 +1596,8 @@ if __name__ == '__main__':
     parser.add_argument('--domain', type=str, default=None)  # 'dmc' or 'muj'
     
     parser.add_argument('--amplify', type=float, default=1.0)
+    
+    parser.add_argument('--target_rnd_every', type=int, default=5000)
     
     args = parser.parse_args()
     
