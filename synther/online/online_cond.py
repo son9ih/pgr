@@ -400,20 +400,21 @@ def redq_sac(
             
             
             # Save .ckpt of agent.pred_net every 5 epochs (5000 steps), then load previous checkpoint to agent.temp_net
-            if (t + 1) % args.target_rnd_every == 0 and args.target_rnd_every > 0:
-                # Save current pred_net checkpoint
-                # print(f'Saving pred_net checkpoint at step {t+1} to {args.results_folder}')
-                checkpoint_path = os.path.join(args.results_folder, f'pred_net_step{t+1}.ckpt')
-                torch.save(agent.pred_net.state_dict(), checkpoint_path)
-                print(f'Saved pred_net checkpoint at step {t+1} to {checkpoint_path}')
-                
-                # Load previous checkpoint into temp_net (if it exists)
-                if prev_checkpoint_path is not None and os.path.exists(prev_checkpoint_path):
-                    agent.temp_net.load_state_dict(torch.load(prev_checkpoint_path, map_location=agent.device))
-                    print(f'Loaded previous checkpoint from {prev_checkpoint_path} into temp_net')
-                
-                # Update previous checkpoint path for next iteration
-                prev_checkpoint_path = checkpoint_path
+            if args.target_rnd_every > 0:
+                if (t + 1) % args.target_rnd_every == 0:
+                    # Save current pred_net checkpoint
+                    # print(f'Saving pred_net checkpoint at step {t+1} to {args.results_folder}')
+                    checkpoint_path = os.path.join(args.results_folder, f'pred_net_step{t+1}.ckpt')
+                    torch.save(agent.pred_net.state_dict(), checkpoint_path)
+                    print(f'Saved pred_net checkpoint at step {t+1} to {checkpoint_path}')
+                    
+                    # Load previous checkpoint into temp_net (if it exists)
+                    if prev_checkpoint_path is not None and os.path.exists(prev_checkpoint_path):
+                        agent.temp_net.load_state_dict(torch.load(prev_checkpoint_path, map_location=agent.device))
+                        print(f'Loaded previous checkpoint from {prev_checkpoint_path} into temp_net')
+                    
+                    # Update previous checkpoint path for next iteration
+                    prev_checkpoint_path = checkpoint_path
 
         # if d or (ep_len == max_ep_len):
         if (ep_len == max_ep_len):
@@ -556,44 +557,47 @@ def redq_sac(
                 # all_rewards는 replay buffer 순서와 동일한 순서로 정렬되어 있음
                 rewards_flat = all_rewards.view(-1)
                 num_total = rewards_flat.numel()
-                # 상위 10%에 해당하는 개수
-                num_top = int(max(0, num_total * 0.1))
-                has_top10 = num_top > 0
-                if has_top10:
+                # 상위 일정 비율에 해당하는 개수
+                num_top = int(max(0, num_total * args.top_reward_exclude_ratio))
+                use_top_reward_threshold = num_top > 0
+                if use_top_reward_threshold:
                     topk_vals, topk_idx = torch.topk(rewards_flat, num_top, largest=True)
                     valid_mask = torch.ones_like(rewards_flat, dtype=torch.bool)
                     valid_mask[topk_idx] = False
                     # 상위 10% reward 중 가장 낮은 값 (즉, 90퍼센타일 수준) 저장
-                    top10_threshold = topk_vals.min().item()
+                    topk_threshold = topk_vals.min().item()
+                    # 상한을 넘는 reward 값을 상한까지 clip (weight 계산 전에 수행)
+                    num_clipped = torch.sum(rewards_flat > topk_threshold).item()
+                    if num_clipped > 0:
+                        print(f'number of clipped rewards in off-policy data: {num_clipped} among {rewards_flat.shape[0]} rewards')
+                    rewards_flat = torch.clamp(rewards_flat, max=topk_threshold)
                 else:
                     valid_mask = torch.ones_like(rewards_flat, dtype=torch.bool)
-                    top10_threshold = None
+                    topk_threshold = None
                 
-                # 상위 10%를 제외한 reward들만 사용
+                # 상위 args.top_reward_exclude_ratio*100%를 제외한 reward들만 사용 (통계 계산용)
                 filtered_rewards = rewards_flat[valid_mask]
                 reward_mean = filtered_rewards.mean().item()
                 reward_std = filtered_rewards.std().item()
-                print(f"Reward statistics (excluding top 10%) - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
+                print(f"Reward statistics (excluding top {args.top_reward_exclude_ratio*100}%) - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
                 
-                # 이후 샘플링에서 사용할, 상위 10%를 제외한 인덱스 (replay buffer 기준)
-                valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).cpu().numpy()
+                # 모든 데이터를 포함하되, clip된 reward를 바탕으로 weight 계산
+                # 전체 인덱스 (replay buffer 기준)
+                all_indices = np.arange(ptr_location)
                 
-                # Weighted sampling을 위한 weights 계산 (valid_indices 내에서만)
+                # Weighted sampling을 위한 weights 계산 (모든 데이터에 대해 clip된 rewards_flat 사용)
                 if not args.uniform:
-                    # valid_indices에 해당하는 rewards만 추출
-                    valid_rewards = rewards_flat[valid_mask].detach()  # shape: [len(valid_indices)]
+                    # clip된 전체 rewards를 사용하여 weights 계산
+                    clipped_rewards = rewards_flat.detach()  # shape: [ptr_location]
                     
-                    # Optional: reward를 clamp하여 극단값 제한 (이전 코드 참고)
-                    # valid_rewards = torch.clamp(valid_rewards, max=torch.quantile(valid_rewards, 0.99))
-                    
-                    # priority_alpha를 사용하여 weights 계산 (높은 reward를 더 많이 샘플링)
+                    # priority_alpha를 사용하여 weights 계산 (높은 reward의 transition을 더 많이 샘플링)
                     priority_alpha = getattr(args, "amplify", 1.0)
-                    valid_weights = valid_rewards.pow(priority_alpha)
+                    all_weights = clipped_rewards.pow(priority_alpha)
                     
                     # CPU로 이동 (WeightedRandomSampler는 CPU tensor 필요)
-                    valid_weights_cpu = valid_weights.to("cpu")
+                    all_weights_cpu = all_weights.to("cpu")
                 else:
-                    valid_weights_cpu = None
+                    all_weights_cpu = None
                 
                 
                 # del, caching
@@ -654,26 +658,26 @@ def redq_sac(
                     # done_tensor = torch.tensor(agent.replay_buffer.done_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
                     
                     
-                    # 상위 10% intrinsic reward를 제외한 인덱스에서 샘플링 (uniform 또는 weighted)
-                    assert len(valid_indices) > 0, "No valid indices available after filtering top 10% rewards."
+                    # 모든 데이터에서 샘플링 (uniform 또는 weighted)
+                    assert len(all_indices) > 0, "No indices available in replay buffer."
                     
                     if args.uniform:
                         # Uniform sampling
-                        replace_flag = len(valid_indices) < args.ft_batch_size
-                        sampled_idx = np.random.choice(valid_indices, size=args.ft_batch_size, replace=replace_flag)
+                        replace_flag = len(all_indices) < args.ft_batch_size
+                        sampled_idx = np.random.choice(all_indices, size=args.ft_batch_size, replace=replace_flag)
                     else:
                         # Weighted sampling using WeightedRandomSampler
-                        # valid_indices 내에서 weighted sampling
-                        replace_flag = len(valid_indices) < args.ft_batch_size
+                        # clip된 reward를 바탕으로 계산된 weights를 사용하여 전체 데이터에서 샘플링
+                        replace_flag = len(all_indices) < args.ft_batch_size
                         sampler = WeightedRandomSampler(
-                            weights=valid_weights_cpu,
+                            weights=all_weights_cpu,
                             num_samples=args.ft_batch_size,
                             replacement=replace_flag
                         )
-                        # WeightedRandomSampler는 인덱스를 반환 (0부터 len(valid_indices)-1까지)
-                        # 이를 valid_indices로 매핑해야 함
-                        sampled_valid_idx = torch.tensor(list(sampler), dtype=torch.long)
-                        sampled_idx = valid_indices[sampled_valid_idx.numpy()]
+                        # WeightedRandomSampler는 인덱스를 반환 (0부터 len(all_indices)-1까지)
+                        # 이를 all_indices로 매핑
+                        sampled_idx_tensor = torch.tensor(list(sampler), dtype=torch.long)
+                        sampled_idx = all_indices[sampled_idx_tensor.numpy()]
                     
                     obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[sampled_idx],
                                               device=device, dtype=torch.float32)
@@ -686,14 +690,14 @@ def redq_sac(
                     done_tensor = torch.tensor(agent.replay_buffer.done_buf[sampled_idx],
                                                device=device, dtype=torch.float32).unsqueeze(-1)
                     
-                    uniform_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
+                    off_policy_data_batch = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
                     # weighted_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
                     
                     
                     
                     # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
                     # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(weighted_sample_data):
-                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(uniform_sample_data):
+                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(off_policy_data_batch):
                         # on_policy_reward_norm_list = []   
                         # unnormalized data
                         # print('Processing batch ', batch_idx)
@@ -784,17 +788,20 @@ def redq_sac(
                                         rewards_sample_chunk = agent.compute_intrinsic_reward_temp(obs_next_x_chunk)
                                     else:
                                         rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk)
-                                    # 앞에서 계산한 상위 10% reward의 최소값(top10_threshold)을 상한으로 clip
-                                    if has_top10 and top10_threshold is not None:
-                                        print(f'number of clipped rewards: {torch.sum(rewards_sample_chunk > top10_threshold).item()} among {rewards_sample_chunk.shape[0]} rewards')
-                                        rewards_sample_chunk = torch.clamp(rewards_sample_chunk, max=top10_threshold)
+                                    # 상한을 넘는 novelty 값을 상한까지 clip
+                                    if use_top_reward_threshold and topk_threshold is not None:
+                                        num_clipped = torch.sum(rewards_sample_chunk > topk_threshold).item()
+                                        if num_clipped > 0:
+                                            print(f'number of clipped rewards: {num_clipped} among {rewards_sample_chunk.shape[0]} rewards')
+                                        rewards_sample_chunk = torch.clamp(rewards_sample_chunk, max=topk_threshold)
                                 rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
                                 
                                 logr_chunk = rewards_sample_norm_chunk
                                 # logr_chunk = rewards_sample_chunk
                                 # logr_chunk = rewards_sample_chunk.log()
                                 # Compute loss for this chunk (scaled by 1/accumulation_steps to maintain effective learning rate)
-                                loss_chunk = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2).mean() / accumulation_steps
+                                loss_values = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2)
+                                loss_chunk = loss_values.mean() / accumulation_steps
                                 
                                 # Check for NaN/Inf in loss
                                 if torch.isnan(loss_chunk) or torch.isinf(loss_chunk):
@@ -938,62 +945,6 @@ def redq_sac(
                             )
                         
                         
-                        
-                        
-                        # for i in range(backprop_model.num_sample_steps-1, -1, -1):
-                        #     # sigma, sigma_next, gamma = map(lambda t: t.item(),(sigmas_and_gammas[i]))
-                        #     # sigma_hat = sigma * (1 + gamma)
-                        #     # pdb.set_trace()
-                        #     # make forward kernel
-                        #     pb_dist = torch.distributions.Normal(torch.sqrt(backprop_model.alpha_t[i])*x1_repeat, torch.sqrt(backprop_model.beta_t[i])*torch.ones_like(x1_repeat))
-                        #     # sample noisy one from the kernel
-                        #     new_x = pb_dist.sample()
-                            
-                        #     # Check model parameters before forward pass (some weights may have become NaN)
-                        #     param_has_nan = False
-                        #     for param in backprop_model.parameters():
-                        #         if torch.isnan(param).any() or torch.isinf(param).any():
-                        #             param_has_nan = True
-                        #             break
-                            
-                        #     if param_has_nan:
-                        #         print(f'Warning: Model parameters contain NaN/Inf at off-policy step {i}, batch {batch_idx}')
-                        #         print('Model was corrupted, skipping remaining steps')
-                        #         nan_detected = True
-                        #         break
-                            
-                        #     # right sigma?
-                        #     q_epsilon = backprop_model.score_fn(new_x, sigma=sigma_hats[i].item())
-                        #     with torch.no_grad():
-                        #         bc_epsilon = pre_trained_model.score_fn(new_x, sigma=sigma_hats[i].item()).detach()
-                        #     epsilon = q_epsilon + bc_epsilon
-                            
-                        #     # Check for NaN/Inf in epsilon before using it (prevents crash)
-                        #     if torch.isnan(epsilon).any() or torch.isinf(epsilon).any():
-                        #         print(f'Warning: NaN/Inf detected in epsilon at off-policy step {i}, batch {batch_idx}')
-                        #         # Check which component is NaN
-                        #         if torch.isnan(q_epsilon).any():
-                        #             print('q_epsilon (trainable model) contains NaN - model parameters are corrupted')
-                        #             # Double-check model parameters
-                        #             for param in backprop_model.parameters():
-                        #                 if torch.isnan(param).any():
-                        #                     print(f'Confirmed: Model parameter with shape {param.shape} contains NaN')
-                        #         elif torch.isnan(bc_epsilon).any():
-                        #             print('bc_epsilon (frozen model) contains NaN - unexpected')
-                        #         # Skip this batch since model is corrupted
-                        #         nan_detected = True
-                        #         break
-                            
-                            
-                            
-                        #     pf_pi_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * bc_epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
-                        #     logpf_pi += pf_pi_dist.log_prob(x1_repeat).sum(1)
-                        #     # pdb.set_trace()
-                        #     pf_p_dist = torch.distributions.Normal(backprop_model.oneover_sqrta[i] * (new_x - backprop_model.mab_over_sqrtmab_inv[i] * epsilon), torch.sqrt(backprop_model.beta_t[i]) * torch.ones_like(new_x))
-                        #     logpf_p += pf_p_dist.log_prob(x1_repeat).sum(1)
-                            
-                        #     x1_repeat = new_x
-                        
                             # Compute loss for this chunk (scaled by 1/accumulation_steps to maintain effective learning rate)
                             loss_chunk = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2).mean() / accumulation_steps
                             
@@ -1064,6 +1015,11 @@ def redq_sac(
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
                 print('RTB fine-tuning complete. Synced EMA model with fine-tuned weights.')
+                
+                # Store topk_threshold for later use in novelty computation
+                if use_top_reward_threshold and topk_threshold is not None:
+                    # Store as attribute for later use
+                    agent.topk_threshold = topk_threshold
    
 
             # Add samples to agent replay buffer
@@ -1106,19 +1062,31 @@ def redq_sac(
                 diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
                 if args.target_rnd_every > 0:
-                    real_novelty = agent.compute_intrinsic_reward_temp(real_next_obs_tensor).cpu().numpy().squeeze()
+                    real_novelty_tensor = agent.compute_intrinsic_reward_temp(real_next_obs_tensor)
                 else:
-                    real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor).cpu().numpy().squeeze()
+                    real_novelty_tensor = agent.compute_intrinsic_reward(real_next_obs_tensor)
                 if args.target_rnd_every > 0:
-                    diffusion_novelty = agent.compute_intrinsic_reward_temp(diffusion_next_obs_tensor).cpu().numpy().squeeze()
+                    diffusion_novelty_tensor = agent.compute_intrinsic_reward_temp(diffusion_next_obs_tensor)
                 else:
-                    diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor).cpu().numpy().squeeze()
+                    diffusion_novelty_tensor = agent.compute_intrinsic_reward(diffusion_next_obs_tensor)
                 # Combined 10k observations and novelty
                 combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
                 if args.target_rnd_every > 0:
-                    combined_novelty = agent.compute_intrinsic_reward_temp(combined_next_obs_tensor).cpu().numpy().squeeze()
+                    combined_novelty_tensor = agent.compute_intrinsic_reward_temp(combined_next_obs_tensor)
                 else:
-                    combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor).cpu().numpy().squeeze()     
+                    combined_novelty_tensor = agent.compute_intrinsic_reward(combined_next_obs_tensor)
+                
+                # Clip novelty values to topk_threshold if available
+                topk_threshold = getattr(agent, 'topk_threshold', None)
+                if topk_threshold is not None:
+                    real_novelty_tensor = torch.clamp(real_novelty_tensor, max=topk_threshold)
+                    diffusion_novelty_tensor = torch.clamp(diffusion_novelty_tensor, max=topk_threshold)
+                    combined_novelty_tensor = torch.clamp(combined_novelty_tensor, max=topk_threshold)
+                
+                # Convert to numpy
+                real_novelty = real_novelty_tensor.cpu().numpy().squeeze()
+                diffusion_novelty = diffusion_novelty_tensor.cpu().numpy().squeeze()
+                combined_novelty = combined_novelty_tensor.cpu().numpy().squeeze()     
             
             
             cur_epoch = t // steps_per_epoch
@@ -1165,27 +1133,38 @@ def redq_sac(
                 diffusion_mean = float(diffusion_novelty.mean())
                 combined_mean = float(combined_novelty.mean())
                 
+                # TODO: compute median values of real, diffusion and combined novelty
+                real_median = float(np.median(real_novelty))
+                diffusion_median = float(np.median(diffusion_novelty))
+                combined_median = float(np.median(combined_novelty))
+                
                 print(f'Real novelty mean: {real_mean:.7f}')
                 print(f'Diffusion novelty mean: {diffusion_mean:.7f}')
                 print(f'Combined novelty mean: {combined_mean:.7f}')
+                
+                print(f'Real novelty median: {real_median:.7f}')
+                print(f'Diffusion novelty median: {diffusion_median:.7f}')
 
 
                 # Plot and save combined histogram figure with shared axes
                 fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
                 axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
                 axes[0].axvline(real_mean, color='red', linestyle='--', linewidth=2)
+                axes[0].axvline(real_median, color='blue', linestyle='--', linewidth=2)
                 axes[0].set_title('Real Obs Novelty')
                 axes[0].set_xlabel('Novelty')
                 axes[0].set_ylabel('Count')
 
                 axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
                 axes[1].axvline(diffusion_mean, color='red', linestyle='--', linewidth=2)
+                axes[1].axvline(diffusion_median, color='blue', linestyle='--', linewidth=2)
                 axes[1].set_title('Diffusion Obs Novelty')
                 axes[1].set_xlabel('Novelty')
                 axes[1].set_ylabel('Count')
 
                 axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
                 axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
+                axes[2].axvline(combined_median, color='blue', linestyle='--', linewidth=2)
                 axes[2].set_title('Combined (10k) Novelty')
                 axes[2].set_xlabel('Novelty')
                 axes[2].set_ylabel('Count')
@@ -1243,14 +1222,28 @@ def redq_sac(
                 print(f'Full replay buffer novelty mean: {all_mean:.7f}')
                 print(f'Full replay buffer size: {ptr_location}')
                 
+                # Compute percentiles (90, 80, 70, 60, 50, 40, 30, 20, 10)
+                percentiles = [90, 80, 70, 60, 50, 40, 30, 20, 10]
+                percentile_values = {p: float(np.percentile(all_novelty, p)) for p in percentiles}
+                for p, val in percentile_values.items():
+                    print(f'Full replay buffer novelty {p}th percentile: {val:.7f}')
+                
                 # Create histogram figure for full replay buffer
                 fig_full, ax_full = plt.subplots(figsize=(8, 6))
                 ax_full.hist(all_novelty, bins=bins_full, color='tab:purple', alpha=0.8)
                 ax_full.axvline(all_mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {all_mean:.7f}')
+                
+                # Add vertical lines for percentiles
+                colors = plt.cm.viridis(np.linspace(0, 1, len(percentiles)))
+                for i, p in enumerate(percentiles):
+                    val = percentile_values[p]
+                    ax_full.axvline(val, color=colors[i], linestyle=':', linewidth=1.5, 
+                                   label=f'{p}th percentile: {val:.7f}', alpha=0.8)
+                
                 ax_full.set_title(f'Full Replay Buffer Novelty (Epoch {cur_epoch})')
                 ax_full.set_xlabel('Novelty')
                 ax_full.set_ylabel('Count')
-                ax_full.legend()
+                ax_full.legend(loc='best', fontsize=8)
                 ax_full.grid(True, alpha=0.3)
                 plt.tight_layout()
                 
@@ -1661,7 +1654,10 @@ if __name__ == '__main__':
     
     parser.add_argument('--amplify', type=float, default=1.0)
     
-    parser.add_argument('--target_rnd_every', type=int, default=5000)
+    parser.add_argument('--target_rnd_every', type=int, default=0)
+    
+    parser.add_argument('--top_reward_exclude_ratio', type=float, default=0.3, 
+                        help='Ratio of top rewards to exclude when computing reward statistics and threshold (default: 0.3)')
     
     args = parser.parse_args()
     
