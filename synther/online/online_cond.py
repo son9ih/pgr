@@ -149,6 +149,16 @@ def redq_sac(
                 "cond_top_frac": cond_top_frac,
                 "cfg_scale": cfg_scale,
                 "cond_hidden_size": cond_hidden_size,
+                "beta": args.beta,
+                "backprop_iters": args.backprop_iters,
+                "amplify": args.amplify,
+                "finetune_lr": args.finetune_lr,
+                "ft_batch_size": args.ft_batch_size,
+                "accumulation_steps": args.accumulation_steps,
+                "uniform": args.uniform,
+                "target_rnd_every": args.target_rnd_every,
+                "finetune_lr": args.finetune_lr,
+                
             })
         
         elif args.finetune:
@@ -186,6 +196,15 @@ def redq_sac(
                 "cond_top_frac": cond_top_frac,
                 "cfg_scale": cfg_scale,
                 "cond_hidden_size": cond_hidden_size,
+                "beta": args.beta,
+                "backprop_iters": args.backprop_iters,
+                "amplify": args.amplify,
+                "finetune_lr": args.finetune_lr,
+                "ft_batch_size": args.ft_batch_size,
+                "accumulation_steps": args.accumulation_steps,
+                "uniform": args.uniform,
+                "target_rnd_every": args.target_rnd_every,
+                "finetune_lr": args.finetune_lr,
             })
             
         else:
@@ -226,6 +245,15 @@ def redq_sac(
                     "cond_top_frac": cond_top_frac,
                     "cfg_scale": cfg_scale,
                     "cond_hidden_size": cond_hidden_size,
+                    "beta": args.beta,
+                    "backprop_iters": args.backprop_iters,
+                    "amplify": args.amplify,
+                    "finetune_lr": args.finetune_lr,
+                    "ft_batch_size": args.ft_batch_size,
+                    "accumulation_steps": args.accumulation_steps,
+                    "uniform": args.uniform,
+                    "target_rnd_every": args.target_rnd_every,
+                    "finetune_lr": args.finetune_lr,
                 }
             )
         print(f'Initialized wandb with run name {run_name}')
@@ -331,6 +359,9 @@ def redq_sac(
     # One-time header registration guard for StateEnt to avoid header errors
     # state_ent_header_initialized = False
 
+    # Track previous checkpoint path for loading into temp_net
+    prev_checkpoint_path = None
+
     for t in range(total_steps):
         # get action from agent
         a = agent.get_exploration_action(o, env)
@@ -368,9 +399,21 @@ def redq_sac(
             logger.log_tabular('PredLoss', average_only=True)
             
             
-            # TODO: save .ckpt of agent.pred_net then, load it to agent.temp_net after 5 epochs
-            if (t + 1) % args.target_rnd_every == 0:
-                pass
+            # Save .ckpt of agent.pred_net every 5 epochs (5000 steps), then load previous checkpoint to agent.temp_net
+            if (t + 1) % args.target_rnd_every == 0 and args.target_rnd_every > 0:
+                # Save current pred_net checkpoint
+                # print(f'Saving pred_net checkpoint at step {t+1} to {args.results_folder}')
+                checkpoint_path = os.path.join(args.results_folder, f'pred_net_step{t+1}.ckpt')
+                torch.save(agent.pred_net.state_dict(), checkpoint_path)
+                print(f'Saved pred_net checkpoint at step {t+1} to {checkpoint_path}')
+                
+                # Load previous checkpoint into temp_net (if it exists)
+                if prev_checkpoint_path is not None and os.path.exists(prev_checkpoint_path):
+                    agent.temp_net.load_state_dict(torch.load(prev_checkpoint_path, map_location=agent.device))
+                    print(f'Loaded previous checkpoint from {prev_checkpoint_path} into temp_net')
+                
+                # Update previous checkpoint path for next iteration
+                prev_checkpoint_path = checkpoint_path
 
         # if d or (ep_len == max_ep_len):
         if (ep_len == max_ep_len):
@@ -501,7 +544,10 @@ def redq_sac(
                 with torch.no_grad():
                     for i in range(0, ptr_location, batch_size_stat):
                         batch_next_obs = all_next_obs[i:i+batch_size_stat]
-                        batch_rewards = agent.compute_intrinsic_reward(batch_next_obs)
+                        if args.target_rnd_every > 0:
+                            batch_rewards = agent.compute_intrinsic_reward_temp(batch_next_obs)
+                        else:
+                            batch_rewards = agent.compute_intrinsic_reward(batch_next_obs)
                         all_rewards.append(batch_rewards)
                     # calculate reward of one batch
                     all_rewards = torch.cat(all_rewards, dim=0)
@@ -668,7 +714,10 @@ def redq_sac(
                         # Normalize x1
                         x1_normalized = backprop_model.normalizer.normalize(x1)
                         with torch.no_grad():
-                            rewards = agent.compute_intrinsic_reward(next_obs)  # r(x1)
+                            if args.target_rnd_every > 0:
+                                rewards = agent.compute_intrinsic_reward_temp(next_obs)  # r(x1)
+                            else:
+                                rewards = agent.compute_intrinsic_reward(next_obs)  # r(x1)
                             # Normalize rewards using average and std computed from entire buffer
                             rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
                         
@@ -731,7 +780,10 @@ def redq_sac(
                                 
                                 # Compute reward for sampled x chunk
                                 with torch.no_grad():
-                                    rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk)
+                                    if args.target_rnd_every > 0:
+                                        rewards_sample_chunk = agent.compute_intrinsic_reward_temp(obs_next_x_chunk)
+                                    else:
+                                        rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk)
                                     # 앞에서 계산한 상위 10% reward의 최소값(top10_threshold)을 상한으로 clip
                                     if has_top10 and top10_threshold is not None:
                                         print(f'number of clipped rewards: {torch.sum(rewards_sample_chunk > top10_threshold).item()} among {rewards_sample_chunk.shape[0]} rewards')
@@ -1053,11 +1105,20 @@ def redq_sac(
                 real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
                 diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
-                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor).cpu().numpy().squeeze()
-                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor).cpu().numpy().squeeze()
+                if args.target_rnd_every > 0:
+                    real_novelty = agent.compute_intrinsic_reward_temp(real_next_obs_tensor).cpu().numpy().squeeze()
+                else:
+                    real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor).cpu().numpy().squeeze()
+                if args.target_rnd_every > 0:
+                    diffusion_novelty = agent.compute_intrinsic_reward_temp(diffusion_next_obs_tensor).cpu().numpy().squeeze()
+                else:
+                    diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor).cpu().numpy().squeeze()
                 # Combined 10k observations and novelty
                 combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
-                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor).cpu().numpy().squeeze()     
+                if args.target_rnd_every > 0:
+                    combined_novelty = agent.compute_intrinsic_reward_temp(combined_next_obs_tensor).cpu().numpy().squeeze()
+                else:
+                    combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor).cpu().numpy().squeeze()     
             
             
             cur_epoch = t // steps_per_epoch
@@ -1160,7 +1221,10 @@ def redq_sac(
                 with torch.no_grad():
                     for i in range(0, ptr_location, batch_size_novelty):
                         batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
-                        batch_novelty = agent.compute_intrinsic_reward(batch_next_obs).cpu().numpy().squeeze()
+                        if args.target_rnd_every > 0:
+                            batch_novelty = agent.compute_intrinsic_reward_temp(batch_next_obs).cpu().numpy().squeeze()
+                        else:
+                            batch_novelty = agent.compute_intrinsic_reward(batch_next_obs).cpu().numpy().squeeze()
                         all_novelty_list.append(batch_novelty)
                 
                 all_novelty = np.concatenate(all_novelty_list)
