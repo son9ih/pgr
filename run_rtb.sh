@@ -14,9 +14,62 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 # sample_freq: frequency of training Off-policy compared to On-policy when doing RTB
 # ================================
 
-CUDA_VISIBLE_DEVICES=5 python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc2.gin \
- --seed 0 --algorithm Ours --wandb \
- --finetune_lr 1e-4 --beta 5.0 --backprop_iters 100 --amplify 1.0 --target_rnd_every 1000 --sample_freq 1 --top_reward_exclude_ratio 0.25 &
+# 기본 코드
+CUDA_VISIBLE_DEVICES=5 python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin \
+    --seed 0 --algorithm Ours --wandb \
+    --finetune_lr 1e-4 --beta 1.0 --backprop_iters 100 --amplify 2.0 --target_rnd_every 0 --sample_freq 1 --top_reward_exclude_ratio 0.2 &
+
+
+
+#!/bin/bash
+
+# 사용 가능한 GPU 번호 배열
+GPUS=(0 1 2 3 4 5)
+NUM_GPUS=${#GPUS[@]}
+GPU_IDX=0
+
+for beta in 1.0; do
+    for sample_freq in 1 2 4; do
+        for top_reward_exclude_ratio in 0.1 0.2; do
+            
+            # 현재 할당할 GPU 선택
+            CURRENT_GPU=${GPUS[$GPU_IDX]}
+            
+            echo "Running on GPU $CURRENT_GPU: sample_freq=$sample_freq, exclude_ratio=$top_reward_exclude_ratio"
+            
+            # 프로세스 실행
+            CUDA_VISIBLE_DEVICES=$CURRENT_GPU python synther/online/online_cond.py \
+                --env reacher-hard-v0 \
+                --gin_config_files config/online/sac_cond_synther_dmc.gin \
+                --seed 0 --algorithm Ours --wandb \
+                --finetune_lr 1e-4 --beta $beta --backprop_iters 200 \
+                --amplify 1.0 --target_rnd_every 0 \
+                --sample_freq $sample_freq \
+                --top_reward_exclude_ratio $top_reward_exclude_ratio &
+            
+            # GPU 인덱스 업데이트 및 동기화 제어
+            ((GPU_IDX++))
+            
+            # 만약 모든 GPU(0-5)를 다 썼다면, 실행 중인 프로세스가 끝날 때까지 대기
+            if [ $GPU_IDX -eq $NUM_GPUS ]; then
+                wait
+                GPU_IDX=0
+                echo "Batch finished, moving to next set of GPUs..."
+            fi
+            
+            sleep 2
+        done
+    done
+done
+
+# 남은 모든 프로세스가 종료될 때까지 대기
+wait
+echo "All experiments completed."
+
+
+# CUDA_VISIBLE_DEVICES=5 python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin \
+#         --seed 0 --algorithm Ours --wandb \
+#         --finetune_lr 1e-4 --beta 5.0 --backprop_iters 100 --amplify 2.0 --target_rnd_every 0 --sample_freq 1 --top_reward_exclude_ratio 0.25 &
 
 
 # 일반코드

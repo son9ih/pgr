@@ -118,7 +118,7 @@ def redq_sac(
             wandb.init(
             project = f'{env_name}',
             group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_ftLr{args.finetune_lr}_ft_batch_size{args.ft_batch_size}_iters{args.backprop_iters}_beta{args.beta}_amplify{args.amplify}',
+            name = f' {run_name}_ftLr{args.finetune_lr}_ft_batch_size{args.ft_batch_size}_iters{args.backprop_iters}_beta{args.beta}_amplify{args.amplify}_sample_freq{args.sample_freq}_exclude_ratio{args.top_reward_exclude_ratio}_uniform{args.uniform}_target_rnd_every{args.target_rnd_every}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -158,7 +158,9 @@ def redq_sac(
                 "uniform": args.uniform,
                 "target_rnd_every": args.target_rnd_every,
                 "finetune_lr": args.finetune_lr,
-                
+                "top_reward_exclude_ratio": args.top_reward_exclude_ratio,
+                "sample_freq": args.sample_freq,
+                "gin_config_files": args.gin_config_files,
             })
         
         elif args.finetune:
@@ -1197,13 +1199,21 @@ def redq_sac(
                 # Compute novelty in batches to avoid memory issues
                 batch_size_novelty = 5000
                 all_novelty_list = []
+                topk_threshold = getattr(agent, 'topk_threshold', None)
                 with torch.no_grad():
                     for i in range(0, ptr_location, batch_size_novelty):
                         batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
                         if args.target_rnd_every > 0:
-                            batch_novelty = agent.compute_intrinsic_reward_temp(batch_next_obs).cpu().numpy().squeeze()
+                            batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
                         else:
-                            batch_novelty = agent.compute_intrinsic_reward(batch_next_obs).cpu().numpy().squeeze()
+                            batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs)
+                        
+                        # Clip novelty values to topk_threshold if available
+                        if topk_threshold is not None:
+                            print(f'Clipping novelty values to topk_threshold, drawing full-batch histogram: {topk_threshold}')
+                            batch_novelty_tensor = torch.clamp(batch_novelty_tensor, max=topk_threshold)
+                        
+                        batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
                         all_novelty_list.append(batch_novelty)
                 
                 all_novelty = np.concatenate(all_novelty_list)
