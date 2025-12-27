@@ -32,6 +32,10 @@ class REDQRLPDCondAgent(REDQSACAgent):
         # self.pred_net_target = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
         self.fix_net = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
         
+        # target rnd every
+        # if self.target_rnd_every > 0:
+        self.temp_net = Predictor(input_size=self.obs_dim, normalize=False).to(self.device)
+        
         self.pred_optimizer = torch.optim.Adam(self.pred_net.parameters(), lr=1e-4)
     
     def get_current_num_data(self):
@@ -54,6 +58,18 @@ class REDQRLPDCondAgent(REDQSACAgent):
     def compute_intrinsic_reward(self, next_obs):
         # assert
         pred_next_feature = self.pred_net(next_obs)
+        with torch.no_grad():
+            fix_next_feature = self.fix_net(next_obs)
+        fix_next_feature = fix_next_feature.detach()
+        intrinsic_reward = (fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0
+        
+        return intrinsic_reward
+    
+    # compute intrinsic reward using temp_net as frozen predictor,
+    # This is used to compute novelty as appropriate reward function for RTB
+    def compute_intrinsic_reward_temp(self, next_obs):
+        self.temp_net.eval()
+        pred_next_feature = self.temp_net(next_obs)
         with torch.no_grad():
             fix_next_feature = self.fix_net(next_obs)
         fix_next_feature = fix_next_feature.detach()
@@ -187,7 +203,7 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
     def train_pred_net(self, batch_size, mask=True, update_proportion=0.25):
         if self.pred_optimizer is not None:
-            obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor = self.sample_real_data_recent(batch_size=batch_size)
+            _, obs_next_tensor, _, _, _ = self.sample_real_data_recent(batch_size=batch_size)
             self.pred_optimizer.zero_grad()
             pred_loss = self.compute_intrinsic_reward(obs_next_tensor) # .mean()
             if mask:
