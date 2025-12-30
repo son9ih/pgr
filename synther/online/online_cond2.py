@@ -518,7 +518,9 @@ def redq_sac(
                 rewards_flat = all_rewards.view(-1)
                 num_total = rewards_flat.numel()
                 # 상위 10%에 해당하는 개수
-                num_top = int(max(0, num_total * 0.1))
+                # num_top = int(max(0, num_total * 0.1))
+                num_top = int(max(0, num_total * args.top_reward_exclude_ratio))
+                print(f'num_top: {num_top}')
                 has_top10 = num_top > 0
                 if has_top10:
                     topk_vals, topk_idx = torch.topk(rewards_flat, num_top, largest=True)
@@ -534,7 +536,7 @@ def redq_sac(
                 filtered_rewards = rewards_flat[valid_mask]
                 reward_mean = filtered_rewards.mean().item()
                 reward_std = filtered_rewards.std().item()
-                print(f"Reward statistics (excluding top 10%) - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
+                print(f"Reward statistics (excluding top {args.top_reward_exclude_ratio*100}%) - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
 
                 # 이후 샘플링에서 사용할, 상위 10%를 제외한 인덱스 (replay buffer 기준)
                 valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).cpu().numpy()
@@ -990,7 +992,8 @@ def redq_sac(
                         
                         # Log table at the last iteration (with epoch-specific key to avoid overwriting)
                         if iter == args.backprop_iters - 1:
-                            wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
+                            # wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
+                            pass
                         
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
@@ -1084,11 +1087,15 @@ def redq_sac(
                 # real_mean = float(real_novelty.mean())
                 real_mean = float(real_novelty.mean())
                 # 12/24: 상위 10% reward를 제외한 평균 reward 사용, 즉 Stdnormalizer의 mean 사용
-                real_mean = reward_mean
+                # real_mean = reward_mean
                 # real_mean = reward_mean
                 diffusion_mean = float(diffusion_novelty.mean())
                 # combined_mean = float(combined_novelty.mean())
                 combined_mean = float(combined_novelty.mean())
+                
+                real_median = float(np.median(real_novelty))
+                diffusion_median = float(np.median(diffusion_novelty))
+                combined_median = float(np.median(combined_novelty))
 
                 print(f'Real novelty mean: {real_mean:.7f}')
                 print(f'Diffusion novelty mean: {diffusion_mean:.7f}')
@@ -1099,12 +1106,14 @@ def redq_sac(
                 fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
                 axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
                 axes[0].axvline(real_mean, color='red', linestyle='--', linewidth=2)
+                axes[0].axvline(real_median, color='blue', linestyle='--', linewidth=2)
                 axes[0].set_title('Real Obs Novelty')
                 axes[0].set_xlabel('Novelty')
                 axes[0].set_ylabel('Count')
 
                 axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
                 axes[1].axvline(diffusion_mean, color='red', linestyle='--', linewidth=2)
+                axes[1].axvline(diffusion_median, color='blue', linestyle='--', linewidth=2)
                 axes[1].set_title('Diffusion Obs Novelty')
                 axes[1].set_xlabel('Novelty')
                 axes[1].set_ylabel('Count')
@@ -1112,6 +1121,7 @@ def redq_sac(
                 axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
                 # axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
                 axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
+                axes[2].axvline(combined_median, color='blue', linestyle='--', linewidth=2)
                 axes[2].set_title('Combined (10k) Novelty')
                 axes[2].set_xlabel('Novelty')
                 axes[2].set_ylabel('Count')
@@ -1133,6 +1143,88 @@ def redq_sac(
                 fig.savefig(out_path)
                 plt.close(fig)
                 print(f'Saved novelty histogram to {out_path}')
+                
+                # =============================================================================
+                # Full replay buffer novelty histogram
+                # =============================================================================
+                print('Computing novelty for full replay buffer...')
+                ptr_location = agent.replay_buffer.ptr
+                all_next_obs = agent.replay_buffer.obs2_buf[:ptr_location]
+                
+                # Compute novelty in batches to avoid memory issues
+                batch_size_novelty = 5000
+                all_novelty_list = []
+                # topk_threshold = getattr(agent, 'topk_threshold', None)
+                with torch.no_grad():
+                    for i in range(0, ptr_location, batch_size_novelty):
+                        batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
+                        # if args.target_rnd_every > 0:
+                        #     batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
+                        # else:
+                        
+                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square)
+                        
+                        # # Clip novelty values to topk_threshold if available
+                        # if topk_threshold is not None:
+                        #     print(f'Clipping novelty values to topk_threshold, drawing full-batch histogram: {topk_threshold}')
+                        #     batch_novelty_tensor = torch.clamp(batch_novelty_tensor, max=topk_threshold)
+                        
+                        batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
+                        all_novelty_list.append(batch_novelty)
+                
+                all_novelty = np.concatenate(all_novelty_list)
+                
+                # Build bins for full buffer histogram
+                x_min_full = float(all_novelty.min())
+                x_max_full = float(np.percentile(all_novelty, 100))  # Top 5% threshold
+                if x_min_full == x_max_full:
+                    x_min_full -= 1e-8
+                    x_max_full += 1e-8
+                num_bins_full = 100
+                bins_full = np.linspace(x_min_full, x_max_full, num_bins_full + 1)
+                
+                # Compute mean
+                all_mean = float(all_novelty.mean())
+                print(f'Full replay buffer novelty mean: {all_mean:.7f}')
+                print(f'Full replay buffer size: {ptr_location}')
+                
+                # Compute percentiles (90, 80, 70, 60, 50, 40, 30, 20, 10)
+                # 5% percentile is also included
+                percentiles = [90, 80, 70, 60, 50, 40, 30, 20, 10, 5]
+                percentile_values = {p: float(np.percentile(all_novelty, p)) for p in percentiles}
+                for p, val in percentile_values.items():
+                    print(f'Full replay buffer novelty {p}th percentile: {val:.7f}')
+                
+                # Create histogram figure for full replay buffer
+                fig_full, ax_full = plt.subplots(figsize=(8, 6))
+                ax_full.hist(all_novelty, bins=bins_full, color='tab:purple', alpha=0.8)
+                ax_full.axvline(all_mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {all_mean:.7f}')
+                
+                # Add vertical lines for percentiles
+                colors = plt.cm.viridis(np.linspace(0, 1, len(percentiles)))
+                for i, p in enumerate(percentiles):
+                    val = percentile_values[p]
+                    ax_full.axvline(val, color=colors[i], linestyle=':', linewidth=1.5, 
+                                   label=f'{p}th percentile: {val:.7f}', alpha=0.8)
+                
+                ax_full.set_title(f'Full Replay Buffer Novelty (Epoch {cur_epoch})')
+                ax_full.set_xlabel('Novelty')
+                ax_full.set_ylabel('Count')
+                ax_full.legend(loc='best', fontsize=8)
+                ax_full.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+                # Log to wandb
+                if args.wandb:
+                    wandb.log({
+                        'images/full_replay_buffer_novelty_hist': wandb.Image(fig_full, caption=f'Epoch {cur_epoch}')
+                    }, step=cur_epoch)
+                
+                # Save to disk
+                out_path_full = os.path.join(out_dir, f'full_replay_buffer_novelty_hist_epoch{cur_epoch:04d}.png')
+                fig_full.savefig(out_path_full)
+                plt.close(fig_full)
+                print(f'Saved full replay buffer novelty histogram to {out_path_full}')
 
 
 
@@ -1529,6 +1621,9 @@ if __name__ == '__main__':
     parser.add_argument('--amplify', type=float, default=1.0)
     
     parser.add_argument('--square', action='store_true', default=False)
+    
+    parser.add_argument('--top_reward_exclude_ratio', type=float, default=0.0, 
+                        help='Ratio of top rewards to exclude when computing reward statistics and threshold (default: 0.3)')
 
     args = parser.parse_args()
 
