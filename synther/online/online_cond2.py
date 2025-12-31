@@ -663,7 +663,7 @@ def redq_sac(
                         # On-policy Training with Gradient Accumulation
                         # print('Starting on-policy training step...')
                         # sample frequency를 1000으로 놓으면, on-policy training은 안하게 됨
-                        if global_step % args.sample_freq == 0:
+                        if (global_step % args.sample_freq == 0) and (args.backprop_iters > args.sample_freq):
                             # Gradient accumulation: split batch into chunks
                             chunk_size = args.ft_batch_size // accumulation_steps
                             if chunk_size == 0:
