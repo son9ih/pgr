@@ -508,7 +508,7 @@ def redq_sac(
                 with torch.no_grad():
                     for i in range(0, ptr_location, batch_size_stat):
                         batch_next_obs = all_next_obs[i:i+batch_size_stat]
-                        batch_rewards = agent.compute_intrinsic_reward(batch_next_obs, square=args.square)
+                        batch_rewards = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
                         all_rewards.append(batch_rewards)
                     # calculate reward of one batch
                     all_rewards = torch.cat(all_rewards, dim=0)
@@ -655,13 +655,14 @@ def redq_sac(
                         # Normalize x1
                         x1_normalized = backprop_model.normalizer.normalize(x1)
                         with torch.no_grad():
-                            rewards = agent.compute_intrinsic_reward(next_obs, square=args.square)  # r(x1)
+                            rewards = agent.compute_intrinsic_reward(next_obs, square=args.square,pow_reward=args.pow_reward)  # r(x1)
                             # Normalize rewards using average and std computed from entire buffer
                             rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
 
 
                         # On-policy Training with Gradient Accumulation
                         # print('Starting on-policy training step...')
+                        # sample frequency를 1000으로 놓으면, on-policy training은 안하게 됨
                         if global_step % args.sample_freq == 0:
                             # Gradient accumulation: split batch into chunks
                             chunk_size = args.ft_batch_size // accumulation_steps
@@ -718,7 +719,7 @@ def redq_sac(
 
                                 # Compute reward for sampled x chunk
                                 with torch.no_grad():
-                                    rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk, square=args.square)
+                                    rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk, square=args.square, pow_reward=args.pow_reward)
                                     # 앞에서 계산한 상위 10% reward의 최소값(top10_threshold)을 상한으로 clip
                                     if has_top10 and top10_threshold is not None:
                                         rewards_sample_chunk = torch.clamp(rewards_sample_chunk, max=top10_threshold)
@@ -992,8 +993,8 @@ def redq_sac(
                         
                         # Log table at the last iteration (with epoch-specific key to avoid overwriting)
                         if iter == args.backprop_iters - 1:
-                            # wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
-                            pass
+                            wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
+                            # pass
                         
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
@@ -1039,11 +1040,11 @@ def redq_sac(
                 real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
                 diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
-                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, square=args.square).cpu().numpy().squeeze()
-                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, square=args.square).cpu().numpy().squeeze()
+                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()
+                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()
                 # Combined 10k observations and novelty
                 combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
-                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, square=args.square).cpu().numpy().squeeze()     
+                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()     
 
 
             cur_epoch = t // steps_per_epoch
@@ -1162,7 +1163,7 @@ def redq_sac(
                         #     batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
                         # else:
                         
-                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square)
+                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
                         
                         # # Clip novelty values to topk_threshold if available
                         # if topk_threshold is not None:
@@ -1624,6 +1625,8 @@ if __name__ == '__main__':
     
     parser.add_argument('--top_reward_exclude_ratio', type=float, default=0.0, 
                         help='Ratio of top rewards to exclude when computing reward statistics and threshold (default: 0.3)')
+    
+    parser.add_argument('--pow_reward', type=float, default=1.0)
 
     args = parser.parse_args()
 
