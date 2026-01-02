@@ -292,7 +292,9 @@ class ElucidatedDiffusion(nn.Module):
             eps = self.S_noise * torch.randn(shape, device=self.device)  # stochastic sampling
 
             sigma_hat = sigma + gamma * sigma
-            inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
+            # inputs_hat: denoised sample made by 
+            # inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps -> original disorder
+            inputs_hat = inputs
             
             # verify whether sigma_hat is 0 or not
             # print(f'sigma_hat: {sigma_hat}')
@@ -310,8 +312,8 @@ class ElucidatedDiffusion(nn.Module):
             
             # compute next samples from pre-trained model
             with torch.no_grad():
-                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_hat, clamp=clamp, cond=cond)
-                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_hat, clamp=clamp, cond=None)
+                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
+                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=None)
                 denoised_over_sigma_pre = uncond_denoised_over_sigma_pre + cfg_scale * (cond_denoised_over_sigma_pre - uncond_denoised_over_sigma_pre)
                 inputs_next_pre = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma_pre
                 
@@ -324,6 +326,7 @@ class ElucidatedDiffusion(nn.Module):
                 pf_p_dist = torch.distributions.Normal(inputs_next, std)
                 pf_pi_dist = torch.distributions.Normal(inputs_next_pre, std)
                 
+                # gradients are kept in here
                 logpf_pi += pf_pi_dist.log_prob(inputs_next).sum(1)
                 logpf_p += pf_p_dist.log_prob(inputs_next).sum(1)
             
@@ -421,6 +424,7 @@ class ElucidatedDiffusion(nn.Module):
             
             
             # print(f'inputs: {inputs}')
+            # 원본에서 noise sample을 만드는 과정
             inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
             # print(f'inputs_hat: {inputs_hat}')
         
@@ -436,15 +440,19 @@ class ElucidatedDiffusion(nn.Module):
             denoised_over_sigma = uncond_denoised_over_sigma + cfg_scale * (cond_denoised_over_sigma - uncond_denoised_over_sigma)
     
             # pdb.set_trace()
+            # sample made by backprop model
             inputs_next = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma
             # print(f'inputs_next: {inputs_next}')
             
             
             # compute next samples from pre-trained model
             with torch.no_grad():
-                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_hat, clamp=clamp, cond=cond)
-                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_next, sigma_hat, clamp=clamp, cond=None)
+                # main disorder
+                cond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
+                # main disorder
+                uncond_denoised_over_sigma_pre = pre_trained_model.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=None)
                 denoised_over_sigma_pre = uncond_denoised_over_sigma_pre + cfg_scale * (cond_denoised_over_sigma_pre - uncond_denoised_over_sigma_pre)
+                # sample made by pre-trained model
                 inputs_next_pre = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma_pre
                 
                 
@@ -452,11 +460,13 @@ class ElucidatedDiffusion(nn.Module):
             std = math.sqrt((sigma_hat**2 - sigma**2)) * self.S_noise
             if std != 0:
                 # print(f'std: {std}')
+                # gradients are kept in here, mean parameter is return of neural network
                 pf_p_dist = torch.distributions.Normal(inputs_next, std)
                 pf_pi_dist = torch.distributions.Normal(inputs_next_pre, std)
                 
-                logpf_pi += pf_pi_dist.log_prob(inputs_next).sum(1)
-                logpf_p += pf_p_dist.log_prob(inputs_next).sum(1)
+                # log-likelihood evaluation of what makes inputs_hat for diffusion-made posterior
+                logpf_p += pf_p_dist.log_prob(inputs).sum(1)
+                logpf_pi += pf_pi_dist.log_prob(inputs).sum(1)
             
             
             
@@ -480,6 +490,7 @@ class ElucidatedDiffusion(nn.Module):
             
             # pdb.set_trace()
             
+            # forward kernel
             pb_dist = torch.distributions.Normal(inputs_next, (math.sqrt(sigma_next**2 - sigma**2)) * torch.ones_like(inputs_next))
             inputs = pb_dist.sample()
             
@@ -867,7 +878,7 @@ class REDQCondTrainer(Trainer):
             if j % 1000 == 0:
                 print(f'[{j}/{num_steps}] loss: {loss:.4f}')
         
-        self.save_final(cond_distri, curr_epoch, num_steps)
+        # self.save_final(cond_distri, curr_epoch, num_steps)
         
         return cond_distri
     
@@ -903,7 +914,7 @@ class REDQCondTrainer(Trainer):
             if j % 1000 == 0:
                 print(f'[{j}/{num_steps}] loss: {loss:.4f}')
         
-        self.save_final(cond_distri, curr_epoch, num_steps)
+        # self.save_final(cond_distri, curr_epoch, num_steps)
         
         return cond_distri
     
