@@ -1,0 +1,1534 @@
+import warnings
+
+warnings.filterwarnings("ignore")
+
+import sys
+sys.path.append('.')
+import time
+
+import dmcgym
+import gin
+import gym
+import numpy as np
+import torch
+from gym.wrappers.flatten_observation import FlattenObservation
+from redq.algos.core import mbpo_epoches, test_agent
+from redq.utils.bias_utils import log_bias_evaluation
+from redq.utils.logx import EpochLogger
+from redq.utils.run_utils import setup_logger_kwargs
+from synther.diffusion.elucidated_diffusion import REDQCondTrainer
+from synther.diffusion.diffusion_generator import CondDiffusionGenerator
+from synther.diffusion.utils import construct_diffusion_model, split_diffusion_samples
+from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
+
+import wandb
+from synther.online.utils import PBE, RMS, compute_intr_reward
+import pdb
+
+import copy
+import torch.optim as optim
+import torch.nn as nn
+from typing import Optional, Tuple, Union
+import math
+import pdb
+
+import matplotlib.pyplot as plt
+import os
+
+from sklearn.manifold import TSNE
+
+from torch.utils.data import TensorDataset, DataLoader
+# from utils import split_diffusion_samples
+from torch.utils.data import WeightedRandomSampler
+
+# 1/2: import diffusion model
+from synther.diffusion.diffusion import DiffusionModel
+
+
+@gin.configurable
+def redq_sac(
+        env_name,
+        seed=3,
+        epochs=-1,
+        steps_per_epoch=1000,
+        max_ep_len=1000,
+        n_evals_per_epoch=1,
+        logger_kwargs=dict(),
+        # following are agent related hyperparameters
+        hidden_sizes=(256, 256),
+        replay_size=int(1e6),
+        batch_size=256,
+        lr=3e-4,
+        gamma=0.99,
+        polyak=0.995,
+        alpha=0.2,
+        auto_alpha=True,
+        target_entropy='mbpo',
+        start_steps=5000,
+        delay_update_steps='auto',
+        utd_ratio=20,
+        num_Q=10,
+        num_min=2,
+        q_target_mode='min',
+        policy_update_delay=20,
+        diffusion_buffer_size=int(1e6),
+        diffusion_sample_ratio=0.5,
+        # diffusion hyperparameters
+        retrain_diffusion_every=10_000,
+        num_samples=100_000,
+        diffusion_start=0,
+        disable_diffusion=True,
+        print_buffer_stats=True,
+        skip_reward_norm=True,
+        model_terminals=False,
+        # conditional generation hyperparameters
+        cfg_dropout=0.25,
+        cond_top_frac=0.05,
+        cfg_scale=1.0,
+        cond_hidden_size=128,
+        # following are bias evaluation related
+        evaluate_bias=True,
+        n_mc_eval=1000,
+        n_mc_cutoff=350,
+        reseed_each_epoch=True,
+        args=None,
+        run_name=None,
+):
+    # use gpu if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training using device: {device}")
+    # set number of epoch
+    if epochs == 'mbpo' or epochs < 0:
+        # epochs = mbpo_epoches.get(env_name, 100)
+        epochs = 100
+    total_steps = steps_per_epoch * epochs + 1
+
+    # set seed
+    seed = args.seed
+
+    # set domain
+    if args.env in ['quadruped-walk-v0','cheetah-run-v0','reacher-hard-v0']:
+        args.domain = 'dmc'
+    else:
+        args.domain = 'muj'
+
+    disable_diffusion = args.disable_diffusion
+
+    if args.wandb:
+
+        if args.rtb:
+
+            wandb.init(
+            project = f'{env_name}',
+            group = f'{run_name.split("_")[-1]}',
+            name = f' {run_name}_iters{args.backprop_iters}_beta{args.beta}_square{args.square}_pow_reward{args.pow_reward}_top_reward_exclude_ratio{args.top_reward_exclude_ratio}',
+            config={
+                "env_name": env_name,
+                "seed": seed,
+                "epochs": epochs,
+                "steps_per_epoch": steps_per_epoch,
+                "hidden_sizes": hidden_sizes,
+                "replay_size": replay_size,
+                "batch_size": batch_size,
+                "lr": lr,
+                "gamma": gamma,
+                "polyak": polyak,
+                "alpha": alpha,
+                "auto_alpha": auto_alpha,
+                "target_entropy": target_entropy,
+                "start_steps": start_steps,
+                "delay_update_steps": delay_update_steps,
+                "utd_ratio": utd_ratio,
+                "num_Q": num_Q,
+                "num_min": num_min,
+                "q_target_mode": q_target_mode,
+                "policy_update_delay": policy_update_delay,
+                "diffusion_buffer_size": diffusion_buffer_size,
+                "diffusion_sample_ratio": diffusion_sample_ratio,
+                "retrain_diffusion_every": retrain_diffusion_every,
+                "num_samples": num_samples,
+                "disable_diffusion": disable_diffusion,
+                "cfg_dropout": cfg_dropout,
+                "cond_top_frac": cond_top_frac,
+                "cfg_scale": cfg_scale,
+                "cond_hidden_size": cond_hidden_size,
+                "beta": args.beta,
+                "backprop_iters": args.backprop_iters,
+                # "amplify": args.amplify,
+                "finetune_lr": args.finetune_lr,
+                "ft_batch_size": args.ft_batch_size,
+                "accumulation_steps": args.accumulation_steps,
+                # "uniform": args.uniform,
+                # "target_rnd_every": args.target_rnd_every,
+                "finetune_lr": args.finetune_lr,
+                "top_reward_exclude_ratio": args.top_reward_exclude_ratio,
+                "pow_reward": args.pow_reward,
+                # "sample_freq": args.sample_freq,
+                "gin_config_files": args.gin_config_files,
+            })
+
+        elif args.finetune:
+            wandb.init(
+            project = f'{env_name}',
+            group = f'{run_name.split("_")[-1]}',
+            name = f' {run_name}_epochs{args.backprop_epochs}_kl_weight{args.kl_weight}_reward_coef{args.reward_coef}',
+            config={
+                "env_name": env_name,
+                "seed": seed,
+                "epochs": epochs,
+                "steps_per_epoch": steps_per_epoch,
+                "hidden_sizes": hidden_sizes,
+                "replay_size": replay_size,
+                "batch_size": batch_size,
+                "lr": lr,
+                "gamma": gamma,
+                "polyak": polyak,
+                "alpha": alpha,
+                "auto_alpha": auto_alpha,
+                "target_entropy": target_entropy,
+                "start_steps": start_steps,
+                "delay_update_steps": delay_update_steps,
+                "utd_ratio": utd_ratio,
+                "num_Q": num_Q,
+                "num_min": num_min,
+                "q_target_mode": q_target_mode,
+                "policy_update_delay": policy_update_delay,
+                "diffusion_buffer_size": diffusion_buffer_size,
+                "diffusion_sample_ratio": diffusion_sample_ratio,
+                "retrain_diffusion_every": retrain_diffusion_every,
+                "num_samples": num_samples,
+                "disable_diffusion": disable_diffusion,
+                "cfg_dropout": cfg_dropout,
+                "cond_top_frac": cond_top_frac,
+                "cfg_scale": cfg_scale,
+                "cond_hidden_size": cond_hidden_size,
+            })
+
+        else:
+
+        # args.results_folder = run_name
+
+            wandb.init(
+                project = f'{env_name}',
+                group = f'{run_name.split("_")[-1]}',
+                name = run_name,
+                config={
+                    "env_name": env_name,
+                    "seed": seed,
+                    "epochs": epochs,
+                    "steps_per_epoch": steps_per_epoch,
+                    "hidden_sizes": hidden_sizes,
+                    "replay_size": replay_size,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "gamma": gamma,
+                    "polyak": polyak,
+                    "alpha": alpha,
+                    "auto_alpha": auto_alpha,
+                    "target_entropy": target_entropy,
+                    "start_steps": start_steps,
+                    "delay_update_steps": delay_update_steps,
+                    "utd_ratio": utd_ratio,
+                    "num_Q": num_Q,
+                    "num_min": num_min,
+                    "q_target_mode": q_target_mode,
+                    "policy_update_delay": policy_update_delay,
+                    "diffusion_buffer_size": diffusion_buffer_size,
+                    "diffusion_sample_ratio": diffusion_sample_ratio,
+                    "retrain_diffusion_every": retrain_diffusion_every,
+                    "num_samples": num_samples,
+                    "disable_diffusion": disable_diffusion,
+                    "cfg_dropout": cfg_dropout,
+                    "cond_top_frac": cond_top_frac,
+                    "cfg_scale": cfg_scale,
+                    "cond_hidden_size": cond_hidden_size,
+                }
+            )
+        print(f'Initialized wandb with run name {run_name}')
+
+    """set up logger"""
+    logger_kwargs['use_wandb'] = args.wandb
+    logger = EpochLogger(**logger_kwargs)
+    logger.save_config(locals())
+
+    """set up environment and seeding"""
+    env_fn = lambda: wrap_gym(gym.make(env_name))
+    env, test_env, bias_eval_env = env_fn(), env_fn(), env_fn()
+    print(f"Environment: {env_name} | Seed: {seed}")
+    # seed torch and numpy
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # seed environment along with env action space so that everything is properly seeded for reproducibility
+    def seed_all(epoch):
+        seed_shift = epoch * 9999
+        mod_value = 999999
+        env_seed = (seed + seed_shift) % mod_value
+        test_env_seed = (seed + 10000 + seed_shift) % mod_value
+        bias_eval_env_seed = (seed + 20000 + seed_shift) % mod_value
+        torch.manual_seed(env_seed)
+        np.random.seed(env_seed)
+        env.seed(env_seed)
+        env.action_space.np_random.seed(env_seed)
+        test_env.seed(test_env_seed)
+        test_env.action_space.np_random.seed(test_env_seed)
+        bias_eval_env.seed(bias_eval_env_seed)
+        bias_eval_env.action_space.np_random.seed(bias_eval_env_seed)
+
+    # user define seed
+    seed_all(seed)
+
+    """prepare to init agent"""
+    # get obs and action dimensions
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    # if environment has a smaller max episode length, then use the environment's max episode length
+    env_time_limit = get_time_limit(env)
+    max_ep_len = env_time_limit if max_ep_len > env_time_limit else max_ep_len
+    # Action limit for clamping: critically, assumes all dimensions share the same bound!
+    # we need .item() to convert it from numpy float to python float
+    act_limit = env.action_space.high[0].item()
+    # keep track of run time
+    start_time = time.time()
+    # flush logger (optional)
+    sys.stdout.flush()
+    #################################################################################################
+
+    """init agent + buffer and start training"""
+    agent_config = {
+        'env_name': env_name,
+        'cond_hidden_size': cond_hidden_size,
+        'hidden_sizes': hidden_sizes,
+        'replay_size': replay_size,
+        'batch_size': batch_size,
+        'lr': lr,
+        'gamma': gamma,
+        'polyak': polyak,
+        'alpha': alpha,
+        'auto_alpha': auto_alpha,
+        'target_entropy': target_entropy,
+        'start_steps': start_steps,
+        'delay_update_steps': delay_update_steps,
+        'utd_ratio': utd_ratio,
+        'num_Q': num_Q,
+        'num_min': num_min,
+        'q_target_mode': q_target_mode,
+        'policy_update_delay': policy_update_delay,
+    }
+    agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio,
+                              env_name, obs_dim, act_dim, act_limit, device,
+                              hidden_sizes, replay_size, batch_size,lr, gamma, polyak,
+                              alpha, auto_alpha, target_entropy,
+                              start_steps, delay_update_steps,
+                              utd_ratio, num_Q, num_min, q_target_mode,
+                              policy_update_delay,
+                              args.rnd)
+
+    # pbe for state entropy evaluation
+    # if args.state_ent:
+    print('Logging state entropy with PBE')
+    rms = RMS(device=torch.device('cpu'))
+    pbe = PBE(rms, args.knn_clip, args.knn_k, args.knn_avg, args.knn_rms, device=torch.device('cpu'))
+
+    # set up diffusion model
+    diff_dims = obs_dim + act_dim + 1 + obs_dim
+    if model_terminals:
+        diff_dims += 1
+    inputs = torch.zeros((128, diff_dims)).float()
+    if skip_reward_norm:
+        skip_dims = [obs_dim + act_dim]
+    else:
+        skip_dims = []
+
+    # o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+    # Because they truncate before 1000, never get to 1000
+    o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0   
+
+    # One-time header registration guard for StateEnt to avoid header errors
+    # state_ent_header_initialized = False
+
+    for t in range(total_steps):
+        # get action from agent
+        a = agent.get_exploration_action(o, env)
+        # Step the env, get next observation, reward and done signal
+        o2, r, d, _ = env.step(a)
+
+        # Very important: before we let agent store this transition,
+        # Ignore the "done" signal if it comes from hitting the time
+        # horizon (that is, when it's an artificial terminal signal
+        # that isn't based on the agent's state)
+        ep_len += 1
+        d = False if ep_len == max_ep_len else d
+
+
+        # give new data to replay buffer
+        agent.store_data(o, a, r, o2, d)
+        # let agent update
+        agent.train(logger)
+        # set obs to next obs
+        o = o2
+        ep_ret += r
+
+        # train RND predictor network, once in a epoch
+        # if (t + 1) % steps_per_epoch == 0 and args.rnd:
+        # if (t + 1) % steps_per_epoch == 0:
+        # if d or (ep_len == max_ep_len):
+        if (ep_len == max_ep_len):
+            # print(t)
+            # print(d)
+            # print(ep_len == max_ep_len)
+            agent.pred_net.train()
+            pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
+            agent.pred_net.eval()
+            logger.store(PredLoss=pred_loss)
+            logger.log_tabular('PredLoss', average_only=True)
+
+        # if d or (ep_len == max_ep_len):
+        if (ep_len == max_ep_len):
+            # store episode return and length to logger
+            logger.store(EpRet=ep_ret, EpLen=ep_len)
+            # reset environment
+            # o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+            # Because they truncate before 1000, never get to 1000
+            o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+
+        # Retrain diffusion model periodically, then finetune if specified
+        if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
+
+
+            print(f'Retraining diffusion model at step {t + 1}')
+
+            # import ipdb; ipdb.set_trace()
+
+            
+            # +++++++++++ 1. Training +++++++++++
+            
+            # # Train new diffusion model
+            # diffusion_trainer = REDQCondTrainer(
+            #     construct_diffusion_model(
+            #         inputs=inputs,
+            #         skip_dims=skip_dims,
+            #         disable_terminal_norm=model_terminals,
+            #         cond_dim=1,
+            #         cfg_dropout=cfg_dropout,
+            #     ),
+            #     results_folder=args.results_folder,
+            #     model_terminals=model_terminals,
+            #     args=args,
+            # )
+            # diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
+            # if not args.rnd:
+            #     cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
+            #                                                        curr_epoch=(t // steps_per_epoch) + 1)
+            # else:
+            #     cond_distri = diffusion_trainer.train_from_redq_buffer_rnd(agent.replay_buffer, agent, top_frac=cond_top_frac,
+            #                                                        curr_epoch=(t // steps_per_epoch) + 1)
+            # agent.reset_diffusion_buffer()
+            
+            # +++++++++++ 1.1. unconditional diffusion prior training +++++++++++
+            
+            # define prior model and optimizer
+            prior_model = DiffusionModel(x_dim=dim, diffusion_steps=args.diffusion_steps).to(dtype=dtype, device=device)
+            prior_model.dtype=dtype
+            prior_model_optimizer = torch.optim.Adam(prior_model.parameters(), lr=1e-3)
+            
+            # define data normalizer
+            
+            
+            # training loop
+            for epoch in tqdm(range(num_prior_epochs), dynamic_ncols=True):
+                total_loss = 0.0
+                for x, y, in data_loader:
+                    
+                    # normalize data
+                    x = (x - test_function.X_mean) / (test_function.X_std + 1e-7)
+                    x += torch.randn_like(x) * 0.001
+                    
+                    prior_model_optimizer.zero_grad()
+                    loss = prior_model.compute_loss(x)
+                    loss.backward()
+                    prior_model_optimizer.step()
+                    
+                    total_loss += loss.item()
+                # print(f"Round: {round+1}\tEpoch: {epoch+1}\tLoss: {total_loss:.3f}")
+            print(f"Round: {round+1}\tPrior model trained")
+            
+            
+            
+            
+            
+            
+            # +++++++++++ 1.2. conditional diffusion posterior training (RTB fine-tuning) +++++++++++
+            # set up hyperparameters
+            alpha = args.alpha
+            beta = args.beta
+            num_prior_epochs = args.num_prior_epochs
+            num_posterior_epochs = args.num_posterior_epochs
+            
+            
+            # define posterior model and optimizer
+            posterior_model = QFlow(x_dim=dim, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
+            posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=1e-4)
+            
+            # load off-policy data
+            
+            # fine-tuning loop
+            if num_posterior_epochs > 0:
+                for epoch in tqdm(range(num_posterior_epochs), dynamic_ncols=True):
+                    if args.training_posterior == "both":
+                        s1 = random.randint(0, 1)
+                    elif args.training_posterior == "on":
+                        s1 = 0
+                    else: # off
+                        s1 = 1
+                        
+                    if s1 == 0:
+                        # on-policy
+                        loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=train_batch_size)
+                        y = proxy_model_ens.log_reward(x)
+                    else:
+                        # off-policy (reward prioritization)
+                        idx = torch.multinomial(y_weights.squeeze(), train_batch_size, replacement=True)
+                        x = xs[idx]
+                        x += torch.randn_like(x) * 0.01
+                        loss, logZ = posterior_model.compute_loss_with_sample(x, device)
+                        y = proxy_model_ens.log_reward(x)
+                        
+                    xs = torch.cat([xs, x], dim=0)
+                    ys = torch.cat([ys, y], dim=0)
+                    y_weights = torch.softmax(ys, dim=0)
+                    
+                    posterior_model_optimizer.zero_grad()
+                    loss.backward()
+                    posterior_model_optimizer.step()                
+                    # print(f"Round: {round+1}\tEpoch: {epoch+1}\tLoss: {total_loss:.3f}")
+                print(f"Round: {round+1}\tPosterior model trained")    
+            
+            
+            
+            # +++++++++++ training over +++++++++++
+            
+            # +++++++++++ 2. Sampling +++++++++++
+            X_sample_total = []
+            logR_sample_total = []
+            if args.filtering == "True":
+                M = args.num_proposals
+            else: # 
+                M = 1
+                
+            for _ in tqdm(range(M)): #NOTE B * M**2 samples proposal.
+                # Split into batches due to memory constraints
+                X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=batch_size * M, device=device)
+                logpf_pi = posterior_model.compute_marginal_likelihood(X_sample)
+                logr = posterior_model.posterior_log_reward(X_sample).squeeze()
+                logR = logr + logpf_pi * alpha
+                
+                if args.local_search == "True" and args.local_search_epochs > 0:
+                    X_sample_optimizer = torch.optim.Adam([X_sample], lr=1e-2)
+                    for _ in range(args.local_search_epochs):
+                        X_sample.requires_grad_(True)
+                        logr_sample = posterior_model.posterior_log_reward(X_sample).squeeze()
+                        logpf_pi_sample = posterior_model.compute_marginal_likelihood(X_sample)
+                        logR_sample = logr_sample + logpf_pi_sample * alpha
+                        loss = -torch.exp(logR_sample).sum()
+                        # loss = -logR_sample.sum()
+                        
+                        X_sample_optimizer.zero_grad()
+                        loss.backward()
+                        X_sample_optimizer.step()
+                    X_sample = X_sample.detach()
+                    logR_sample = logR_sample.detach()
+                    
+                    X_sample_total.append(X_sample)
+                    logR_sample_total.append(logR_sample)
+                else:
+                    X_sample_total.append(X_sample)
+                    logR_sample_total.append(logR)
+                    
+            X_sample = torch.cat(X_sample_total, dim=0)
+            logR_sample = torch.cat(logR_sample_total, dim=0)
+            
+            print(f'Sampling complete')
+            
+            # unnormalize samples
+            
+                # if actions are not clipped, then clamp them to [-1, 1]
+                
+                
+                
+            # put it in diffusion replay buffer
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+
+            # +++++++++++ RTB fine-tuning +++++++++++
+            if args.rtb:
+                print('Setting up for RTB fine-tuning...')
+                # Calculate current epoch for logging
+                cur_epoch = (t // steps_per_epoch)
+                
+                # Initialize fine-tuning model
+                # diffusion model이 epsilon을 뱉으면 됨
+                backprop_model = diffusion_trainer.model.to(device)
+                backprop_model.train()  # Set to training mode for fine-tuning
+
+                pre_trained_model = copy.deepcopy(backprop_model).to(device)
+                pre_trained_model.eval()  # Freeze pre-trained model
+
+                # Setup optimizer and log partition function
+                optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
+
+                # load Data from replay buffer
+                ptr_location = agent.replay_buffer.ptr
+                all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location]).to(device)
+
+                # Compute average of total rewards in batch-level computation
+                all_rewards = []
+                batch_size_stat = args.ft_batch_size
+                with torch.no_grad():
+                    for i in range(0, ptr_location, batch_size_stat):
+                        batch_next_obs = all_next_obs[i:i+batch_size_stat]
+                        batch_rewards = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
+                        all_rewards.append(batch_rewards)
+                    # calculate reward of one batch
+                    all_rewards = torch.cat(all_rewards, dim=0)
+
+                # all_rewards는 replay buffer 순서와 동일한 순서로 정렬되어 있음
+                rewards_flat = all_rewards.view(-1)
+                num_total = rewards_flat.numel()
+                
+                # (1-args.top_reward_exclude_ratio)와 args.top_reward_exclude_ratio 비율에 해당하는 percentile 계산
+                reward_percentile_95 = torch.quantile(rewards_flat, 1-args.top_reward_exclude_ratio).item()
+                reward_percentile_5 = torch.quantile(rewards_flat, args.top_reward_exclude_ratio).item()
+                
+                # 전체 데이터에서 reward 통계 계산
+                reward_mean = rewards_flat.mean().item()
+                reward_std = rewards_flat.std().item()
+                print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
+                print('===============================================================')
+                print(f"Reward percentiles - 95th: {reward_percentile_95:.7f}, 5th: {reward_percentile_5:.7f}")
+                
+                # normalized 된 reward를 logZ로 두었으니, reward는 10^-2에서 10^2 사이의 값을 대체로 가질 것. 그리고 아래의 reward_mean에 들어가야하는 값은 10^-2에서 10^2 사이의 값의 평균으로 계산되어야 함
+                all_rewards_norm = (all_rewards - reward_mean) / (reward_std + 1e-8)
+                all_rewards_exp = torch.exp(all_rewards_norm)
+                rewards_mean_exp = all_rewards_exp.mean().item()
+                log_Z = torch.nn.Parameter(torch.tensor(math.log(rewards_mean_exp), device=device), requires_grad=True)
+                # optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
+                optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
+
+                # 12/23: weighted sampling
+                # black magic
+                # w = all_rewards.squeeze().detach()
+                # w = torch.clamp(w,max=torch.quantile(w,0.99))
+                # priority_alpha = getattr(args, "amplify", 1.0)
+                # print(f'priority_alpha: {priority_alpha}')
+                # w = w.pow(priority_alpha)
+                # weights_cpu = w.to("cpu")
+
+                # print(f'w: {w}')
+                # print(f'w.shape: {w.shape}')
+
+
+                # del, caching
+                # del all_rewards, all_next_obs
+                # torch.cuda.empty_cache()
+
+
+                # Setup dataloader
+                # return unnormalized data
+                # obs_data = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
+                # obs_next_data = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
+                # acts_data = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
+                # rews_data = torch.FloatTensor(agent.replay_buffer.rews_buf[:ptr_location])
+                # done_data = torch.FloatTensor(agent.replay_buffer.done_buf[:ptr_location])
+
+                # dataset = TensorDataset(obs_data, obs_next_data, acts_data, rews_data, done_data)
+                # dataloader = DataLoader(dataset, batch_size=args.ft_batch_size, shuffle=True, drop_last=True)
+
+                # Training loop
+                global_step = 0
+                accumulation_steps = args.accumulation_steps
+
+                print('Running RTB fine-tuning...')
+                # print(f'Total batches: {len(dataloader)}')
+
+                # Initialize wandb table for RTB fine-tuning logs (with epoch info to avoid overwriting)
+                rtb_log_table = wandb.Table(columns=["Epoch", "Iter", "On-policy Loss", "On-policy Reward", "Off-policy Loss", "log_Z"])
+                
+                # for epoch in range(args.backprop_epochs):
+                for iter in range(args.backprop_iters):
+                    # print(f'Epoch')
+                    # epoch_loss = 0.0
+                    # epoch_log_z = 0.0
+                    # epoch_reward = 0.0
+                    # epoch_log_ratio = 0.0
+                    # num_batches = 0
+
+                    # Actually not a epoch, but iteration
+                    epoch_loss_on = []
+                    epoch_reward_on = []
+                    epoch_loss_off = []
+
+
+
+                    # sampler = WeightedRandomSampler(weights_cpu, num_samples=len(w), replacement=True)
+                    # sampler = WeightedRandomSampler(weights_cpu, num_samples=args.ft_batch_size, replacement=True)
+                    # idx = torch.tensor(list(sampler), dtype=torch.long, device=device)
+                    # idx_cpu = idx.cpu().numpy()
+                    # print(f'idx_cpu: {idx_cpu}')
+                    # print(f'idx_cpu.shape: {idx_cpu.shape}')
+
+                    # Build tensors directly from replay buffer using sampled indices
+                    # obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[idx_cpu], device=device, dtype=torch.float32)
+                    # obs_next_tensor = torch.tensor(agent.replay_buffer.obs2_buf[idx_cpu], device=device, dtype=torch.float32)
+                    # acts_tensor = torch.tensor(agent.replay_buffer.acts_buf[idx_cpu], device=device, dtype=torch.float32)
+                    # rews_tensor = torch.tensor(agent.replay_buffer.rews_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
+                    # done_tensor = torch.tensor(agent.replay_buffer.done_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
+
+
+                    # 전체 buffer에서 균등 샘플링
+                    all_indices = np.arange(ptr_location)
+                    replace_flag = len(all_indices) < args.ft_batch_size
+                    sampled_idx = np.random.choice(all_indices, size=args.ft_batch_size, replace=replace_flag)
+
+                    obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[sampled_idx],
+                                              device=device, dtype=torch.float32)
+                    obs_next_tensor = torch.tensor(agent.replay_buffer.obs2_buf[sampled_idx],
+                                                   device=device, dtype=torch.float32)
+                    acts_tensor = torch.tensor(agent.replay_buffer.acts_buf[sampled_idx],
+                                               device=device, dtype=torch.float32)
+                    rews_tensor = torch.tensor(agent.replay_buffer.rews_buf[sampled_idx],
+                                               device=device, dtype=torch.float32).unsqueeze(-1)
+                    done_tensor = torch.tensor(agent.replay_buffer.done_buf[sampled_idx],
+                                               device=device, dtype=torch.float32).unsqueeze(-1)
+
+                    uniform_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
+                    # weighted_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
+
+
+
+                    # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
+                    # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(weighted_sample_data):
+                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(uniform_sample_data):
+                        # on_policy_reward_norm_list = []   
+                        # unnormalized data
+                        # print('Processing batch ', batch_idx)
+                        # print the number of total batches
+                        # print(f'Total batches: {len(dataloader)}')
+                        obs = obs.to(device)
+                        next_obs = next_obs.to(device)
+                        act = act.to(device)
+                        rew = rew.to(device)
+                        current_batch_size = obs.size(0)
+
+                        # Construct x1 (clean samples): [obs, act, rew, next_obs]
+                        # pdb.set_trace()
+                        # x1 = torch.cat([obs, act, rew.unsqueeze(-1), next_obs], dim=-1).to(device)
+                        x1 = torch.cat([obs, act, rew, next_obs], dim=-1).to(device)
+
+                        # This is preparation for off-policy training
+                        # Normalize x1
+                        x1_normalized = backprop_model.normalizer.normalize(x1)
+                        with torch.no_grad():
+                            rewards = agent.compute_intrinsic_reward(next_obs, square=args.square,pow_reward=args.pow_reward)  # r(x1)
+                            # Clamp rewards to [5th percentile, 95th percentile]
+                            rewards = torch.clamp(rewards, min=reward_percentile_5, max=reward_percentile_95)
+                            # Normalize rewards using average and std computed from entire buffer
+                            rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
+
+
+                        # On-policy Training with Gradient Accumulation
+                        # print('Starting on-policy training step...')
+                        # sample frequency를 1000으로 놓으면, on-policy training은 안하게 됨
+                        if (global_step % args.sample_freq == 0) and (args.backprop_iters > args.sample_freq):
+                            # Gradient accumulation: split batch into chunks
+                            chunk_size = args.ft_batch_size // accumulation_steps
+                            if chunk_size == 0:
+                                chunk_size = args.ft_batch_size
+                                num_chunks = 1
+                            else:
+                                num_chunks = accumulation_steps
+
+                            # Initialize accumulators
+                            accumulated_loss = 0.0
+                            accumulated_reward = 0.0
+                            nan_detected = False
+
+                            # Zero gradients at the start of accumulation
+                            optimizer.zero_grad()
+                            optimizer_z.zero_grad()
+
+                            # Process each chunk
+                            for chunk_idx in range(num_chunks):
+                                # Check model parameters before forward pass
+                                param_has_nan = False
+                                for param in backprop_model.parameters():
+                                    if torch.isnan(param).any() or torch.isinf(param).any():
+                                        param_has_nan = True
+                                        break
+
+                                if param_has_nan:
+                                    print(f'Warning: Model parameters contain NaN/Inf at on-policy chunk {chunk_idx}, batch {batch_idx}')
+                                    nan_detected = True
+                                    break
+
+                                # Denoising process for this chunk
+                                normal_dist = torch.distributions.Normal(
+                                    torch.zeros((chunk_size, *backprop_model.event_shape), device=device), 
+                                    backprop_model.sigma_max * torch.ones((chunk_size, *backprop_model.event_shape), device=device)
+                                )
+                                x_chunk = normal_dist.sample()
+
+                                logpf_pi_chunk = normal_dist.log_prob(x_chunk).sum(1)
+                                logpf_p_chunk = normal_dist.log_prob(x_chunk).sum(1)
+
+                                # Forward pass for this chunk
+                                x_chunk, logpf_pi_chunk, logpf_p_chunk = backprop_model.sample_rtb(
+                                    batch_size=chunk_size, 
+                                    cond=None, 
+                                    logpf_pi=logpf_pi_chunk, 
+                                    logpf_p=logpf_p_chunk,
+                                    pre_trained_model=pre_trained_model
+                                )
+
+                                # Extract obs_next_x from chunk
+                                _, _, _, obs_next_x_chunk = split_diffusion_samples(x_chunk, env)
+
+                                # Compute reward for sampled x chunk
+                                with torch.no_grad():
+                                    rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk, square=args.square, pow_reward=args.pow_reward)
+                                    # Clamp rewards to [5th percentile, 95th percentile]
+                                    rewards_sample_chunk = torch.clamp(rewards_sample_chunk, min=reward_percentile_5, max=reward_percentile_95)
+                                rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
+
+                                logr_chunk = rewards_sample_norm_chunk
+                                # logr_chunk = rewards_sample_chunk
+                                # logr_chunk = rewards_sample_chunk.log()
+                                # Compute loss for this chunk (scaled by 1/accumulation_steps to maintain effective learning rate)
+                                loss_chunk = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2).mean() / accumulation_steps
+
+                                # Check for NaN/Inf in loss
+                                if torch.isnan(loss_chunk) or torch.isinf(loss_chunk):
+                                    print(f'Warning: NaN/Inf loss detected in on-policy chunk {chunk_idx}, batch {batch_idx}, skipping chunk')
+                                    nan_detected = True
+                                    break
+
+                                # Backward pass (accumulate gradients)
+                                loss_chunk.backward()
+
+                                # Accumulate loss and reward for logging
+                                accumulated_loss += loss_chunk.item() * accumulation_steps
+                                accumulated_reward += rewards_sample_norm_chunk.mean().item()
+                                # accumulated_reward += rewards_sample_chunk.mean().item()
+
+                            # Skip optimizer step if NaN was detected
+                            if nan_detected:
+                                print(f'Skipping on-policy optimizer step due to NaN in model output at batch {batch_idx}')
+                                optimizer.zero_grad()
+                                optimizer_z.zero_grad()
+                                continue
+
+                            # Gradient clipping to prevent parameter explosion and NaN weights
+                            torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+                            torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+
+                            # Update optimizer after accumulating gradients from all chunks
+                            optimizer.step()
+                            optimizer_z.step()
+
+                            # Check if model parameters became NaN after optimizer step
+                            has_nan = False
+                            for param in backprop_model.parameters():
+                                if torch.isnan(param).any():
+                                    print(f'Warning: Model parameters contain NaN after on-policy training step at batch {batch_idx}')
+                                    has_nan = True
+                                    break
+                            if has_nan:
+                                print('Model parameters corrupted, skipping remaining training steps for this batch')
+                                optimizer.zero_grad()
+                                optimizer_z.zero_grad()
+                                continue
+
+                            # Average loss and reward for logging
+                            sample_loss = accumulated_loss / num_chunks if num_chunks > 0 else accumulated_loss
+                            avg_reward = accumulated_reward / num_chunks if num_chunks > 0 else accumulated_reward
+
+                            # logging
+                            # This is normalized reward, prior is of course normal(0,1)
+                            epoch_reward_on.append(avg_reward)
+                            epoch_loss_on.append(sample_loss)
+
+                            # logZSample = logC.mean().item()
+                            # loss = logZSample = backprop_model.compute_loss()
+
+
+                        # pdb.set_trace()
+
+
+
+                        # Off-policy Training
+                        # print('Starting off-policy training step...')
+
+                        # Check if model parameters are corrupted BEFORE starting off-policy training
+                        model_has_nan = False
+                        for param in backprop_model.parameters():
+                            if torch.isnan(param).any() or torch.isinf(param).any():
+                                print(f'Warning: Model parameters contain NaN/Inf before off-policy training at batch {batch_idx}')
+                                print('Model was corrupted during on-policy training, skipping off-policy step')
+                                model_has_nan = True
+                                break
+
+                        if model_has_nan:
+                            optimizer.zero_grad()
+                            optimizer_z.zero_grad()
+                            continue
+                        
+                        
+                        x1_repeat = x1_normalized
+                        # batch size
+                        bs = x1_repeat.shape[0]
+                        
+                        # compute the reward
+                        logr = rewards_norm
+
+                        # Gradient accumulation: split batch into chunks
+                        chunk_size = bs // accumulation_steps
+                        if chunk_size == 0:
+                            chunk_size = bs
+                            num_chunks = 1
+                        else:
+                            num_chunks = accumulation_steps
+
+                        # Initialize accumulators
+                        accumulated_loss = 0.0
+                        nan_detected = False
+
+                        # Zero gradients at the start of accumulation
+                        optimizer.zero_grad()
+                        optimizer_z.zero_grad()
+
+                        # Process each chunk
+                        for chunk_idx in range(num_chunks):
+                            start_idx = chunk_idx * chunk_size
+                            end_idx = start_idx + chunk_size if chunk_idx < num_chunks - 1 else bs
+
+                            # Extract chunk
+                            x1_chunk = x1_repeat[start_idx:end_idx]
+                            logr_chunk = logr[start_idx:end_idx]
+                            chunk_bs = x1_chunk.shape[0]
+
+                            # Initialize logpf_pi and logpf_p for this chunk
+                            logpf_pi_chunk = torch.zeros((chunk_bs,), device=x1_chunk.device)
+                            logpf_p_chunk = torch.zeros((chunk_bs,), device=x1_chunk.device)
+
+                            # Check model parameters before forward pass
+                            param_has_nan = False
+                            for param in backprop_model.parameters():
+                                if torch.isnan(param).any() or torch.isinf(param).any():
+                                    param_has_nan = True
+                                    break
+
+                            if param_has_nan:
+                                print(f'Warning: Model parameters contain NaN/Inf at off-policy chunk {chunk_idx}, batch {batch_idx}')
+                                nan_detected = True
+                                break
+
+                            # Forward pass for this chunk
+                            logpf_pi_chunk, logpf_p_chunk = backprop_model.sample_rtb_reverse(
+                                x=x1_chunk, 
+                                logpf_pi=logpf_pi_chunk, 
+                                logpf_p=logpf_p_chunk, 
+                                pre_trained_model=pre_trained_model
+                            )
+
+
+                            # Compute loss for this chunk (scaled by 1/accumulation_steps to maintain effective learning rate)
+                            loss_chunk = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2).mean() / accumulation_steps
+
+                            # Check for NaN/Inf in loss
+                            if torch.isnan(loss_chunk) or torch.isinf(loss_chunk):
+                                print(f'Warning: NaN/Inf loss detected in off-policy chunk {chunk_idx}, batch {batch_idx}, skipping chunk')
+                                nan_detected = True
+                                break
+
+                            # Backward pass (accumulate gradients)
+                            loss_chunk.backward()
+
+                            # Accumulate loss for logging (multiply by accumulation_steps to get actual loss)
+                            accumulated_loss += loss_chunk.item() * accumulation_steps
+
+                        # Skip optimizer step if NaN was detected
+                        if nan_detected:
+                            print(f'Skipping off-policy optimizer step due to NaN in model output at batch {batch_idx}')
+                            optimizer.zero_grad()
+                            optimizer_z.zero_grad()
+                            continue
+
+                        # Gradient clipping to prevent parameter explosion
+                        torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+
+                        # Update optimizer after accumulating gradients from all chunks
+                        optimizer.step()
+                        optimizer_z.step()
+
+                        # Average loss for logging
+                        batch_loss = accumulated_loss / num_chunks if num_chunks > 0 else accumulated_loss
+
+                        # logging
+                        epoch_loss_off.append(batch_loss)
+
+                        global_step += 1                 
+
+
+                    # epoch_loss_on = 0.0
+                    # epoch_reward_on = 0.0
+                    # epoch_loss_off = 0.0
+                    if iter % 1 == 0:
+                        avg_epoch_loss_on = np.mean(epoch_loss_on)
+                        avg_epoch_reward_on = np.mean(epoch_reward_on)
+                        avg_epoch_loss_off = np.mean(epoch_loss_off)
+                        print('======================================================================')
+                        # print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
+                        print(f'RTB Fine-tuning Iter {iter + 1}/{args.backprop_iters} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
+                        print(f'log_Z item: {log_Z.item()}')
+                        print('======================================================================')
+
+                        # Add data to wandb table with epoch information
+                        rtb_log_table.add_data(
+                            cur_epoch,
+                            iter + 1,
+                            f"{avg_epoch_loss_on:.6f}",
+                            f"{avg_epoch_reward_on:.6f}",
+                            f"{avg_epoch_loss_off:.6f}",
+                            f"{log_Z.item():.6f}"
+                        )
+                        
+                        # Log table at the last iteration (with epoch-specific key to avoid overwriting)
+                        if iter == args.backprop_iters - 1:
+                            wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
+                            # pass
+                        
+                # Sync EMA model with fine-tuned weights
+                diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
+                print('RTB fine-tuning complete. Synced EMA model with fine-tuned weights.')
+            # +++++++++++ RTB fine-tuning over +++++++++++
+
+
+
+
+
+            # +++++++++++ sampling +++++++++++
+            # Add samples to agent replay buffer
+            generator = CondDiffusionGenerator(args=args, env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
+            # 샘플링 스텝 수는 128
+            observations, actions, rewards, next_observations, terminals = generator.sample(num_samples=num_samples,
+                                                                                            cfg_scale=cfg_scale)
+            
+            
+
+            print(f'Adding {num_samples} samples to replay buffer.')
+            for o, a, r, o2, term in zip(observations, actions, rewards, next_observations, terminals):
+                agent.diffusion_buffer.store(o, a, r, o2, term)
+            # +++++++++++ sampling +++++++++++
+
+
+
+
+
+
+            
+            # =============================================================================
+            # Novelty computation for histogram and t-SNE visualization
+            # =============================================================================
+            
+            if print_buffer_stats:
+                ptr_location = agent.replay_buffer.ptr
+                real_observations = agent.replay_buffer.obs1_buf[:ptr_location]
+                real_actions = agent.replay_buffer.acts_buf[:ptr_location]
+                real_next_observations = agent.replay_buffer.obs2_buf[:ptr_location]
+                real_rewards = agent.replay_buffer.rews_buf[:ptr_location]
+                # Print min, max, mean, std of each dimension in the obs, rew and action
+                print('Buffer stats:')
+                for i in range(observations.shape[1]):
+                    print(f'Diffusion Obs {i}: {np.mean(observations[:, i]):.2f} {np.std(observations[:, i]):.2f}')
+                    print(f'     Real Obs {i}: {np.mean(real_observations[:, i]):.2f} {np.std(real_observations[:, i]):.2f}')
+                for i in range(actions.shape[1]):
+                    print(f'Diffusion Action {i}: {np.mean(actions[:, i]):.2f} {np.std(actions[:, i]):.2f}')
+                    print(f'     Real Action {i}: {np.mean(real_actions[:, i]):.2f} {np.std(real_actions[:, i]):.2f}')
+                print(f'Diffusion Reward: {np.mean(rewards):.2f} {np.std(rewards):.2f}')
+                print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
+                print(f'Replay buffer size: {ptr_location}')
+                print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
+
+
+            # Sample real and diffusion observations
+            with torch.no_grad():
+                # Sample real data from replay buffer
+                real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
+                diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
+                # Compute novelty (squeezed)
+                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()
+                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()
+                # Combined 10k observations and novelty
+                combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
+                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()     
+
+
+            cur_epoch = t // steps_per_epoch
+
+            # 1. Histogram plotting
+            if (args.algorithm == 'PGRrnd' or args.algorithm == 'PGR' or args.algorithm == 'Ours' or args.algorithm == 'SER'):
+
+                # Prepare output directory
+                out_dir = os.path.join(args.results_folder, 'histograms')
+                os.makedirs(out_dir, exist_ok=True)
+                # cur_epoch = t // steps_per_epoch
+
+                # # Build shared bins/ranges using the widest x-range across the three arrays
+                # x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
+                # x_max = float(max(real_novelty.max(), diffusion_novelty.max(), combined_novelty.max()))
+                # if x_min == x_max:
+                #     # avoid zero-width bins if all values are identical
+                #     x_min -= 1e-8
+                #     x_max += 1e-8
+                # num_bins = 100
+                # bins = np.linspace(x_min, x_max, num_bins + 1)
+                # Build shared bins/ranges using the widest x-range across the three arrays
+                x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
+                x_max = float(np.percentile(combined_novelty, 100))  # Top 100% threshold
+                if x_min == x_max:
+                    # avoid zero-width bins if all values are identical
+                    x_min -= 1e-8
+                    x_max += 1e-8
+                num_bins = 100
+                bins = np.linspace(x_min, x_max, num_bins + 1)
+
+                # Pre-compute counts to unify y-axis range by the maximum count among the three
+                counts_real, _ = np.histogram(real_novelty, bins=bins)
+                counts_diff, _ = np.histogram(diffusion_novelty, bins=bins)
+                counts_comb, _ = np.histogram(combined_novelty, bins=bins)
+                y_max = int(max(counts_real.max(), counts_diff.max(), counts_comb.max()))
+                # small headroom on y-axis
+                y_max = max(1, int(np.ceil(y_max * 1.05)))
+
+                # Compute mean values
+                # real_mean = float(real_novelty.mean())
+                real_mean = float(real_novelty.mean())
+                # 12/24: 상위 10% reward를 제외한 평균 reward 사용, 즉 Stdnormalizer의 mean 사용
+                # real_mean = reward_mean
+                # real_mean = reward_mean
+                diffusion_mean = float(diffusion_novelty.mean())
+                # combined_mean = float(combined_novelty.mean())
+                combined_mean = float(combined_novelty.mean())
+                
+                real_median = float(np.median(real_novelty))
+                diffusion_median = float(np.median(diffusion_novelty))
+                combined_median = float(np.median(combined_novelty))
+
+                print(f'Real novelty mean: {real_mean:.7f}')
+                print(f'Diffusion novelty mean: {diffusion_mean:.7f}')
+                print(f'Combined novelty mean: {combined_mean:.7f}')
+
+
+                # Plot and save combined histogram figure with shared axes
+                fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
+                axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
+                axes[0].axvline(real_mean, color='red', linestyle='--', linewidth=2)
+                axes[0].axvline(real_median, color='blue', linestyle='--', linewidth=2)
+                axes[0].set_title('Real Obs Novelty')
+                axes[0].set_xlabel('Novelty')
+                axes[0].set_ylabel('Count')
+
+                axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
+                axes[1].axvline(diffusion_mean, color='red', linestyle='--', linewidth=2)
+                axes[1].axvline(diffusion_median, color='blue', linestyle='--', linewidth=2)
+                axes[1].set_title('Diffusion Obs Novelty')
+                axes[1].set_xlabel('Novelty')
+                axes[1].set_ylabel('Count')
+
+                axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
+                # axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
+                axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
+                axes[2].axvline(combined_median, color='blue', linestyle='--', linewidth=2)
+                axes[2].set_title('Combined (10k) Novelty')
+                axes[2].set_xlabel('Novelty')
+                axes[2].set_ylabel('Count')
+
+                # Unify axis ranges across all three plots
+                for ax in axes:
+                    ax.set_xlim(bins[0], bins[-1])
+                    ax.set_ylim(0, y_max)
+
+                plt.tight_layout()
+
+                # Optionally log to Weights & Biases
+                if args.wandb:
+                    wandb.log({
+                        'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                    # }, step=t+1)novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                    }, step=cur_epoch)
+                out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
+                fig.savefig(out_path)
+                plt.close(fig)
+                print(f'Saved novelty histogram to {out_path}')
+                
+                # =============================================================================
+                # Full replay buffer novelty histogram
+                # =============================================================================
+                print('Computing novelty for full replay buffer...')
+                ptr_location = agent.replay_buffer.ptr
+                all_next_obs = agent.replay_buffer.obs2_buf[:ptr_location]
+                
+                # Compute novelty in batches to avoid memory issues
+                batch_size_novelty = 5000
+                all_novelty_list = []
+                # topk_threshold = getattr(agent, 'topk_threshold', None)
+                with torch.no_grad():
+                    for i in range(0, ptr_location, batch_size_novelty):
+                        batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
+                        # if args.target_rnd_every > 0:
+                        #     batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
+                        # else:
+                        
+                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
+                        
+                        # # Clip novelty values to topk_threshold if available
+                        # if topk_threshold is not None:
+                        #     print(f'Clipping novelty values to topk_threshold, drawing full-batch histogram: {topk_threshold}')
+                        #     batch_novelty_tensor = torch.clamp(batch_novelty_tensor, max=topk_threshold)
+                        
+                        batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
+                        all_novelty_list.append(batch_novelty)
+                
+                all_novelty = np.concatenate(all_novelty_list)
+                
+                # Build bins for full buffer histogram
+                x_min_full = float(all_novelty.min())
+                x_max_full = float(np.percentile(all_novelty, 100))  # Top 5% threshold
+                if x_min_full == x_max_full:
+                    x_min_full -= 1e-8
+                    x_max_full += 1e-8
+                num_bins_full = 100
+                bins_full = np.linspace(x_min_full, x_max_full, num_bins_full + 1)
+                
+                # Compute mean
+                all_mean = float(all_novelty.mean())
+                print(f'Full replay buffer novelty mean: {all_mean:.7f}')
+                print(f'Full replay buffer size: {ptr_location}')
+                
+                # Compute percentiles (90, 80, 70, 60, 50, 40, 30, 20, 10)
+                # 5% percentile is also included
+                percentiles = [95, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5]
+                percentile_values = {p: float(np.percentile(all_novelty, p)) for p in percentiles}
+                for p, val in percentile_values.items():
+                    print(f'Full replay buffer novelty {p}th percentile: {val:.7f}')
+                
+                # Create histogram figure for full replay buffer
+                fig_full, ax_full = plt.subplots(figsize=(8, 6))
+                ax_full.hist(all_novelty, bins=bins_full, color='tab:purple', alpha=0.8)
+                ax_full.axvline(all_mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {all_mean:.7f}')
+                
+                # Add vertical lines for percentiles
+                colors = plt.cm.viridis(np.linspace(0, 1, len(percentiles)))
+                for i, p in enumerate(percentiles):
+                    val = percentile_values[p]
+                    ax_full.axvline(val, color=colors[i], linestyle=':', linewidth=1.5, 
+                                   label=f'{p}th percentile: {val:.7f}', alpha=0.8)
+                
+                ax_full.set_title(f'Full Replay Buffer Novelty (Epoch {cur_epoch})')
+                ax_full.set_xlabel('Novelty')
+                ax_full.set_ylabel('Count')
+                ax_full.legend(loc='best', fontsize=8)
+                ax_full.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+                # Log to wandb
+                if args.wandb:
+                    wandb.log({
+                        'images/full_replay_buffer_novelty_hist': wandb.Image(fig_full, caption=f'Epoch {cur_epoch}')
+                    }, step=cur_epoch)
+                
+                # Save to disk
+                out_path_full = os.path.join(out_dir, f'full_replay_buffer_novelty_hist_epoch{cur_epoch:04d}.png')
+                fig_full.savefig(out_path_full)
+                plt.close(fig_full)
+                print(f'Saved full replay buffer novelty histogram to {out_path_full}')
+
+
+
+            # 2. T-SNE
+            if args.algorithm != 'REDQ' and args.algorithm != 'SAC':  # only for methods with diffusion model
+                # cur_epoch = t // steps_per_epoch
+
+                # Prepare t-SNE visualization directory
+                tsne_dir = os.path.join(args.results_folder, 't-sne')
+                os.makedirs(tsne_dir, exist_ok=True)
+
+                # Combine real and diffusion observations for t-SNE
+                combined_obs = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0).cpu().numpy()
+
+                # Create labels: 0 for real, 1 for diffusion
+                labels = np.concatenate([
+                    np.zeros(real_obs_tensor.shape[0]),
+                    np.ones(diffusion_obs_tensor.shape[0])
+                ])
+
+                # Apply t-SNE
+                print('Computing t-SNE embedding...')
+                tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+                embedded = tsne.fit_transform(combined_obs)
+
+                # Split embeddings back into real and diffusion
+                real_embedded = embedded[labels == 0]
+                diffusion_embedded = embedded[labels == 1]
+
+                # Create t-SNE plot
+                fig_tsne, ax_tsne = plt.subplots(figsize=(10, 8))
+                ax_tsne.scatter(real_embedded[:, 0], real_embedded[:, 1], 
+                                c='red', alpha=0.5, s=10, label='Real Data')
+                ax_tsne.scatter(diffusion_embedded[:, 0], diffusion_embedded[:, 1], 
+                                c='blue', alpha=0.5, s=10, label='Diffusion Data')
+                ax_tsne.set_xlabel('t-SNE Dimension 1')
+                ax_tsne.set_ylabel('t-SNE Dimension 2')
+                ax_tsne.set_title(f't-SNE Visualization (Epoch {cur_epoch})')
+                ax_tsne.legend()
+                ax_tsne.grid(True, alpha=0.3)
+                plt.tight_layout()
+
+                # Log to wandb
+                if args.wandb:
+                    wandb.log({
+                        'images/t-sne': wandb.Image(fig_tsne, caption=f'Epoch {cur_epoch}')
+                    }, step=cur_epoch)
+
+                # Save to disk
+                tsne_path = os.path.join(tsne_dir, f'tsne_epoch{cur_epoch:04d}.png')
+                fig_tsne.savefig(tsne_path)
+                plt.close(fig_tsne)
+                print(f'Saved t-SNE plot to {tsne_path}')
+                
+            # ================Visualization Over====================
+
+        # End of epoch wrap-up
+        if (t + 1) % steps_per_epoch == 0:
+            epoch = t // steps_per_epoch
+
+            # Test the performance of the deterministic version of the agent.
+            returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
+
+            # Evaluate bias as in REDQ
+            if evaluate_bias:
+                log_bias_evaluation(bias_eval_env, agent, logger, max_ep_len, alpha, gamma, n_mc_eval, n_mc_cutoff)
+
+            # reseed should improve reproducibility (should make results the same whether bias evaluation is on or not)
+            if reseed_each_epoch:
+                seed_all(epoch)
+
+            # Evaluation of state entropy
+            # 헤더 고정형 로거 대비 안전장치: 최초 dump 전에 한 번만 헤더를 미리 등록
+            # if not state_ent_header_initialized and epoch == 0:
+            #     logger.log_tabular('StateEnt', val=float('nan'), average_only=True)
+            #     state_ent_header_initialized = True
+
+            # 매 5의 배수 epoch에서만 계산 및 로깅 (그 외에는 저장/로깅하지 않음)
+            # if (epoch % 5 == 0) and (epoch > 1):
+                # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
+            obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=4000)
+            intr_rew = compute_intr_reward(pbe, obs_tensor)
+            logger.store(StateEnt=intr_rew)
+            logger.log_tabular('StateEnt', average_only=True)
+            print(f'State Entropy: {intr_rew.mean():.4f}')
+
+
+            """logging"""
+            # Log info about epoch
+            logger.log_tabular('Epoch', epoch)
+            logger.log_tabular('TotalEnvInteracts', t)
+            logger.log_tabular('Time', time.time() - start_time)
+            logger.log_tabular('EpRet', with_min_and_max=True)
+            logger.log_tabular('EpLen', average_only=True)
+            logger.log_tabular('TestEpRet', with_min_and_max=True)
+            logger.log_tabular('TestEpLen', average_only=True)
+            logger.log_tabular('LossCond', with_min_and_max=True)
+            logger.log_tabular('Q1Vals', with_min_and_max=True)
+            logger.log_tabular('LossQ1', average_only=True)
+            logger.log_tabular('LogPi', with_min_and_max=True)
+            logger.log_tabular('LossPi', average_only=True)
+            logger.log_tabular('Alpha', with_min_and_max=True)
+            logger.log_tabular('LossAlpha', average_only=True)
+            logger.log_tabular('PreTanh', with_min_and_max=True)
+
+            if evaluate_bias:
+                logger.log_tabular("MCDisRet", with_min_and_max=True)
+                logger.log_tabular("MCDisRetEnt", with_min_and_max=True)
+                logger.log_tabular("QPred", with_min_and_max=True)
+                logger.log_tabular("QBias", with_min_and_max=True)
+                logger.log_tabular("QBiasAbs", with_min_and_max=True)
+                logger.log_tabular("NormQBias", with_min_and_max=True)
+                logger.log_tabular("QBiasSqr", with_min_and_max=True)
+                logger.log_tabular("NormQBiasSqr", with_min_and_max=True)
+            logger.dump_tabular()
+
+            # flush logged information to disk
+            sys.stdout.flush()
+
+    if args.wandb:
+        wandb.finish()
+
+def wrap_gym(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
+    if rescale_actions:
+        env = gym.wrappers.RescaleAction(env, -1, 1)
+
+    if isinstance(env.observation_space, gym.spaces.Dict):
+        env = FlattenObservation(env)
+
+    env = gym.wrappers.ClipAction(env)
+
+    return env
+
+
+def get_time_limit(env: gym.Env):
+    if hasattr(env, 'spec'):
+        if hasattr(env.spec, 'max_episode_steps'):
+            return env.spec.max_episode_steps
+    if hasattr(env, 'env'):
+        return get_time_limit(env.env)
+    if hasattr(env, 'unwrapped'):
+        return get_time_limit(env.unwrapped)
+    else:
+        raise ValueError("Cannot find time limit for env")
+
+
+
+# def linear_beta_schedule(timesteps, start=0.0001, end=0.02):
+#     return torch.linspace(start, end, timesteps)
+
+def linear_beta_schedule(timesteps, start=0.0001, end=0.02):
+    return torch.linspace(start, end, timesteps)
+
+
+
+
+if __name__ == '__main__':
+    import argparse
+    from datetime import datetime
+    import os
+
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--env', type=str, default='Hopper-v2')
+    parser.add_argument('--log_dir', type=str, default='online_logs')
+    parser.add_argument('--results_folder', type=str, default='./results')
+    parser.add_argument('--gin_config_files', nargs='*', type=str,
+                        default=['config/online/sac_synther_dmc.gin'])
+    parser.add_argument('--gin_params', nargs='*', type=str, default=[])
+
+    # Additional arguments
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--wandb', action='store_true', default=False)
+    parser.add_argument('--synther', action='store_true', default=False)
+
+    # parser.add_argument('--state_ent', action='store_true', default=False)
+    # parser.add_argument('--state_ent_every', type=int, default=5)
+    parser.add_argument('--knn_clip', type=float, default=0.0)
+    parser.add_argument('--knn_k', type=int, default=12)
+    parser.add_argument('--knn_avg', action='store_true', default=False) # default: True
+    parser.add_argument('--knn_rms', action='store_true', default=False)
+    # parser.add_argument('--ent_eval_num', type=int, default=5000)
+
+    parser.add_argument('--rnd', action='store_true', default=False)
+
+    # finetune arguments
+    parser.add_argument('--finetune', action='store_true', default=False)
+    parser.add_argument('--backprop_epochs', type=int, default=10)
+    parser.add_argument('--backprop_iters', type=int, default=10)
+    parser.add_argument('--finetune_lr', type=float, default=1e-4)
+    parser.add_argument('--reward_coef', type=float, default=1.0)
+    parser.add_argument('--ft_batch_size', type=int, default=1024)
+    parser.add_argument('--rtb', action='store_true', default=False)
+    parser.add_argument('--beta', type=float, default=1.0)
+    parser.add_argument('--kl_weight', type=float, default=10.0)
+    parser.add_argument('--accumulation_steps', type=int, default=4)
+
+    # REDQ
+    parser.add_argument('--disable_diffusion', action='store_true', default=False)
+    parser.add_argument('--algorithm', type=str, default='REDQ')  # placeholder, not used directly
+
+    parser.add_argument('--sample_freq', type=int, default=1)
+    parser.add_argument('--gfn_batch_size', type=int, default=8)
+    parser.add_argument('--alpha', type=float, default=1.0)
+    parser.add_argument('--delta', type=float, default=1.0)
+
+    parser.add_argument('--domain', type=str, default=None)  # 'dmc' or 'muj'
+
+    parser.add_argument('--amplify', type=float, default=1.0)
+    
+    parser.add_argument('--square', action='store_true', default=False)
+    
+    parser.add_argument('--top_reward_exclude_ratio', type=float, default=0.0, 
+                        help='Ratio of top rewards to exclude when computing reward statistics and threshold (default: 0.3)')
+    
+    parser.add_argument('--pow_reward', type=float, default=1.0)
+
+    args = parser.parse_args()
+
+    assert args.algorithm in ['REDQ', 'PGR', 'PGRrnd', 'SER', 'Ours', 'SAC', 'ft']
+    run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_{args.algorithm}"
+
+    if args.algorithm == 'SAC':
+        args.disable_diffusion = True
+        args.synther = False
+        args.rnd = False
+        args.rtb = False
+    if args.algorithm == 'REDQ':
+        args.disable_diffusion = True
+        args.synther = False
+        args.rnd = False
+        args.rtb = False
+    if args.algorithm == 'SER':
+        args.disable_diffusion = False
+        args.synther = True
+        args.rnd = False
+        args.rtb = False
+    if args.algorithm == 'PGR':
+        args.disable_diffusion = False
+        args.synther = False
+        args.rnd = False
+        args.rtb = False
+    if args.algorithm == 'PGRrnd':
+        args.disable_diffusion = False
+        args.synther = False
+        args.rnd = True
+        args.rtb = False
+    if args.algorithm == 'ft':
+        args.disable_diffusion = False
+        args.synther = True
+        args.rnd = True
+        args.rtb = False
+        args.finetune = True
+    if args.algorithm == 'Ours':
+        args.disable_diffusion = False
+        args.synther = True
+        args.rnd = True
+        args.rtb = True
+
+
+
+    args.results_folder = f'./{args.results_folder}/{args.results_folder}_{run_name}'
+    print(args.results_folder)
+    if not os.path.exists(args.results_folder):
+        os.makedirs(args.results_folder)
+
+    logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
+
+    gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
+
+    redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args, run_name=run_name)
