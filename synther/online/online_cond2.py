@@ -118,7 +118,7 @@ def redq_sac(
             wandb.init(
             project = f'{env_name}',
             group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_iters{args.backprop_iters}_beta{args.beta}_square{args.square}',
+            name = f' {run_name}_iters{args.backprop_iters}_beta{args.beta}_square{args.square}_pow_reward{args.pow_reward}_top_reward_exclude_ratio{args.top_reward_exclude_ratio}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -158,7 +158,8 @@ def redq_sac(
                 # "uniform": args.uniform,
                 # "target_rnd_every": args.target_rnd_every,
                 "finetune_lr": args.finetune_lr,
-                # "top_reward_exclude_ratio": args.top_reward_exclude_ratio,
+                "top_reward_exclude_ratio": args.top_reward_exclude_ratio,
+                "pow_reward": args.pow_reward,
                 # "sample_freq": args.sample_freq,
                 "gin_config_files": args.gin_config_files,
             })
@@ -467,7 +468,7 @@ def redq_sac(
                 pre_trained_model = copy.deepcopy(backprop_model).to(device)
                 pre_trained_model.eval()  # Freeze pre-trained model
 
-                log_Z = torch.nn.Parameter(torch.tensor(0.0, device=device))
+                # log_Z = torch.nn.Parameter(torch.tensor(-0.259, device=device))
 
 
                 # sigmas = backprop_model.sample_schedule(backprop_model.diffusion_steps).to(device)
@@ -496,7 +497,6 @@ def redq_sac(
 
                 # Setup optimizer and log partition function
                 optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
-                optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
 
                 # load Data from replay buffer
                 ptr_location = agent.replay_buffer.ptr
@@ -513,33 +513,28 @@ def redq_sac(
                     # calculate reward of one batch
                     all_rewards = torch.cat(all_rewards, dim=0)
 
-                # 12/24: 상위 10% intrinsic reward를 제외하고 평균/표준편차 계산
                 # all_rewards는 replay buffer 순서와 동일한 순서로 정렬되어 있음
                 rewards_flat = all_rewards.view(-1)
                 num_total = rewards_flat.numel()
-                # 상위 10%에 해당하는 개수
-                # num_top = int(max(0, num_total * 0.1))
-                num_top = int(max(0, num_total * args.top_reward_exclude_ratio))
-                print(f'num_top: {num_top}')
-                has_top10 = num_top > 0
-                if has_top10:
-                    topk_vals, topk_idx = torch.topk(rewards_flat, num_top, largest=True)
-                    valid_mask = torch.ones_like(rewards_flat, dtype=torch.bool)
-                    valid_mask[topk_idx] = False
-                    # 상위 10% reward 중 가장 낮은 값 (즉, 90퍼센타일 수준) 저장
-                    top10_threshold = topk_vals.min().item()
-                else:
-                    valid_mask = torch.ones_like(rewards_flat, dtype=torch.bool)
-                    top10_threshold = None
-
-                # 상위 10%를 제외한 reward들만 사용
-                filtered_rewards = rewards_flat[valid_mask]
-                reward_mean = filtered_rewards.mean().item()
-                reward_std = filtered_rewards.std().item()
-                print(f"Reward statistics (excluding top {args.top_reward_exclude_ratio*100}%) - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
-
-                # 이후 샘플링에서 사용할, 상위 10%를 제외한 인덱스 (replay buffer 기준)
-                valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1).cpu().numpy()
+                
+                # (1-args.top_reward_exclude_ratio)와 args.top_reward_exclude_ratio 비율에 해당하는 percentile 계산
+                reward_percentile_95 = torch.quantile(rewards_flat, 1-args.top_reward_exclude_ratio).item()
+                reward_percentile_5 = torch.quantile(rewards_flat, args.top_reward_exclude_ratio).item()
+                
+                # 전체 데이터에서 reward 통계 계산
+                reward_mean = rewards_flat.mean().item()
+                reward_std = rewards_flat.std().item()
+                print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
+                print('===============================================================')
+                print(f"Reward percentiles - 95th: {reward_percentile_95:.7f}, 5th: {reward_percentile_5:.7f}")
+                
+                # normalized 된 reward를 logZ로 두었으니, reward는 10^-2에서 10^2 사이의 값을 대체로 가질 것. 그리고 아래의 reward_mean에 들어가야하는 값은 10^-2에서 10^2 사이의 값의 평균으로 계산되어야 함
+                all_rewards_norm = (all_rewards - reward_mean) / (reward_std + 1e-8)
+                all_rewards_exp = torch.exp(all_rewards_norm)
+                rewards_mean_exp = all_rewards_exp.mean().item()
+                log_Z = torch.nn.Parameter(torch.tensor(math.log(rewards_mean_exp), device=device), requires_grad=True)
+                # optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
+                optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
 
                 # 12/23: weighted sampling
                 # black magic
@@ -611,10 +606,10 @@ def redq_sac(
                     # done_tensor = torch.tensor(agent.replay_buffer.done_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
 
 
-                    # 상위 10% intrinsic reward를 제외한 인덱스에서만 균등 샘플링
-                    assert len(valid_indices) > 0, "No valid indices available after filtering top 10% rewards."
-                    replace_flag = len(valid_indices) < args.ft_batch_size
-                    sampled_idx = np.random.choice(valid_indices, size=args.ft_batch_size, replace=replace_flag)
+                    # 전체 buffer에서 균등 샘플링
+                    all_indices = np.arange(ptr_location)
+                    replace_flag = len(all_indices) < args.ft_batch_size
+                    sampled_idx = np.random.choice(all_indices, size=args.ft_batch_size, replace=replace_flag)
 
                     obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[sampled_idx],
                                               device=device, dtype=torch.float32)
@@ -656,6 +651,8 @@ def redq_sac(
                         x1_normalized = backprop_model.normalizer.normalize(x1)
                         with torch.no_grad():
                             rewards = agent.compute_intrinsic_reward(next_obs, square=args.square,pow_reward=args.pow_reward)  # r(x1)
+                            # Clamp rewards to [5th percentile, 95th percentile]
+                            rewards = torch.clamp(rewards, min=reward_percentile_5, max=reward_percentile_95)
                             # Normalize rewards using average and std computed from entire buffer
                             rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
 
@@ -720,9 +717,8 @@ def redq_sac(
                                 # Compute reward for sampled x chunk
                                 with torch.no_grad():
                                     rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk, square=args.square, pow_reward=args.pow_reward)
-                                    # 앞에서 계산한 상위 10% reward의 최소값(top10_threshold)을 상한으로 clip
-                                    if has_top10 and top10_threshold is not None:
-                                        rewards_sample_chunk = torch.clamp(rewards_sample_chunk, max=top10_threshold)
+                                    # Clamp rewards to [5th percentile, 95th percentile]
+                                    rewards_sample_chunk = torch.clamp(rewards_sample_chunk, min=reward_percentile_5, max=reward_percentile_95)
                                 rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
 
                                 logr_chunk = rewards_sample_norm_chunk
@@ -743,6 +739,7 @@ def redq_sac(
                                 # Accumulate loss and reward for logging
                                 accumulated_loss += loss_chunk.item() * accumulation_steps
                                 accumulated_reward += rewards_sample_norm_chunk.mean().item()
+                                # accumulated_reward += rewards_sample_chunk.mean().item()
 
                             # Skip optimizer step if NaN was detected
                             if nan_detected:
@@ -1068,7 +1065,7 @@ def redq_sac(
                 # bins = np.linspace(x_min, x_max, num_bins + 1)
                 # Build shared bins/ranges using the widest x-range across the three arrays
                 x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
-                x_max = float(np.percentile(combined_novelty, 95))  # Top 5% threshold
+                x_max = float(np.percentile(combined_novelty, 100))  # Top 100% threshold
                 if x_min == x_max:
                     # avoid zero-width bins if all values are identical
                     x_min -= 1e-8
@@ -1191,7 +1188,7 @@ def redq_sac(
                 
                 # Compute percentiles (90, 80, 70, 60, 50, 40, 30, 20, 10)
                 # 5% percentile is also included
-                percentiles = [90, 80, 70, 60, 50, 40, 30, 20, 10, 5]
+                percentiles = [95, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5]
                 percentile_values = {p: float(np.percentile(all_novelty, p)) for p in percentiles}
                 for p, val in percentile_values.items():
                     print(f'Full replay buffer novelty {p}th percentile: {val:.7f}')
