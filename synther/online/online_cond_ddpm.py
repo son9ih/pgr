@@ -42,7 +42,10 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.utils.data import WeightedRandomSampler
 
 # 1/2: import diffusion model
-from synther.diffusion.diffusion import DiffusionModel
+from synther.diffusion.diffusion import DiffusionModel, QFlow
+from tqdm import tqdm
+import random
+from collections import namedtuple
 
 
 @gin.configurable
@@ -401,57 +404,120 @@ def redq_sac(
             # import ipdb; ipdb.set_trace()
 
             
-            # +++++++++++ 1. Training +++++++++++
-            
-            # # Train new diffusion model
-            # diffusion_trainer = REDQCondTrainer(
-            #     construct_diffusion_model(
-            #         inputs=inputs,
-            #         skip_dims=skip_dims,
-            #         disable_terminal_norm=model_terminals,
-            #         cond_dim=1,
-            #         cfg_dropout=cfg_dropout,
-            #     ),
-            #     results_folder=args.results_folder,
-            #     model_terminals=model_terminals,
-            #     args=args,
-            # )
-            # diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
-            # if not args.rnd:
-            #     cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
-            #                                                        curr_epoch=(t // steps_per_epoch) + 1)
-            # else:
-            #     cond_distri = diffusion_trainer.train_from_redq_buffer_rnd(agent.replay_buffer, agent, top_frac=cond_top_frac,
-            #                                                        curr_epoch=(t // steps_per_epoch) + 1)
-            # agent.reset_diffusion_buffer()
+            # +++++++++++ 1. Training ++++++++++
             
             # +++++++++++ 1.1. unconditional diffusion prior training +++++++++++
+            # set up hyperparameters
+            dtype = torch.float
             
             # define prior model and optimizer
-            prior_model = DiffusionModel(x_dim=dim, diffusion_steps=args.diffusion_steps).to(dtype=dtype, device=device)
+            prior_model = DiffusionModel(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, inputs=inputs, skip_dims=skip_dims).to(dtype=dtype, device=device)
             prior_model.dtype=dtype
-            prior_model_optimizer = torch.optim.Adam(prior_model.parameters(), lr=1e-3)
+            prior_model_optimizer = torch.optim.Adam(prior_model.parameters(), lr=args.prior_lr)
             
-            # define data normalizer
+            # load data from replay buffer
+            test_function_x = None
+            test_function_y = None
+            all_novelty_list = []
+            
+            # sample every data in replay buffer
+            print(f'Loading every data in replay buffer...')
+            ptr_location = agent.replay_buffer.ptr
+            all_obs = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
+            all_acts = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
+            all_rews = torch.FloatTensor(agent.replay_buffer.rews_buf[:ptr_location])
+            all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
+            # done은 diffusion의 대상이 아님 data dimension에 포함되지 않음
+            # all_dones = agent.replay_buffer.done_buf[:ptr_location]
+            # test_function_x[all_next_obs]라고 하면 all_next_obs의 각 행에 대해서 계산된 결과를 반환하도록 test_function_x를 정의
+            # test_function_x = {all_obs=all_obs, all_acts=all_acts, all_rews=all_rews, all_next_obs=all_next_obs, all_dones=all_dones}
+            # test_function_x = torch.cat([all_obs, all_acts, all_rews, all_next_obs, all_dones], dim=1)
+            # test_function_x = [(all_obs, all_acts, all_rews, all_next_obs, all_dones)]
+            # Ensure all_rews has the right shape (should be [N, 1] not [N])
+            if len(all_rews.shape) == 1:
+                all_rews = all_rews.unsqueeze(-1)
+            test_function_x = torch.cat([all_obs, all_acts, all_rews, all_next_obs], dim=1)
+            
+            # compute test function y for all data in replay buffer
+            batch_size_novelty = 4096
+            with torch.no_grad():
+                for i in range(0, ptr_location, batch_size_novelty):
+                    batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
+                    batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
+                    batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
+                    all_novelty_list.append(batch_novelty)
+                test_function_y = np.concatenate(all_novelty_list)
+                
+            print(f'Shape of test function x: {test_function_x.shape}')
+            print(f'Shape of test function y: {test_function_y.shape}')      
+            
+            # test_function_x is already a tensor, just convert y
+            test_function_x_tensor = test_function_x
+            test_function_y_tensor = torch.FloatTensor(test_function_y)
+            
+            # Create a simple dataset class
+            class SimpleDataset:
+                def __init__(self, x, y):
+                    self.x = x
+                    self.y = y
+                
+                def __len__(self):
+                    return len(self.x)
+                
+                def __getitem__(self, idx):
+                    return self.x[idx], self.y[idx]
+            
+            test_function_dataset = SimpleDataset(test_function_x_tensor, test_function_y_tensor)
+            
+            # define data normalizer (x의 통계량 계산을 대체)
+            prior_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
+            # y의 통계량 계산
+            y_mean = test_function_y_tensor.mean().item()
+            y_std = test_function_y_tensor.std().item()
+            print(f'Mean of test function y: {y_mean}')
+            print(f'Std of test function y: {y_std}')
+            
+            # define weights for weighted or uniform sampling 
+            if args.uniform:
+                # For uniform sampling, use shuffle=True instead of WeightedRandomSampler
+                data_loader = DataLoader(test_function_dataset, batch_size=args.train_batch_size, shuffle=True)
+            else:
+                # For weighted sampling, use WeightedRandomSampler
+                weights = torch.exp((test_function_y_tensor.squeeze() - y_mean) / (y_std + 1e-7))
+                sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+                data_loader = DataLoader(test_function_dataset, batch_size=args.train_batch_size, sampler=sampler)
+            
+            
+            # define hyperparameters for training
+            num_prior_epochs = args.num_prior_epochs
+            num_posterior_epochs = args.num_posterior_epochs
             
             
             # training loop
+            print(f'Training conditional diffusion prior...')
+            # round_num is not used in our settings
+            # round_num = (t // retrain_diffusion_every) + 1
             for epoch in tqdm(range(num_prior_epochs), dynamic_ncols=True):
                 total_loss = 0.0
-                for x, y, in data_loader:
-                    
+                
+                # y is not used in prior model training
+                for x, y in data_loader:
+                    # x is already concatenated [obs, act, rew, next_obs] from test_function_x
                     # normalize data
-                    x = (x - test_function.X_mean) / (test_function.X_std + 1e-7)
-                    x += torch.randn_like(x) * 0.001
+                    x_normalized = prior_model.normalizer.normalize(x.to(device))
                     
                     prior_model_optimizer.zero_grad()
-                    loss = prior_model.compute_loss(x)
+                    loss = prior_model.compute_loss(x_normalized)
                     loss.backward()
                     prior_model_optimizer.step()
                     
                     total_loss += loss.item()
-                # print(f"Round: {round+1}\tEpoch: {epoch+1}\tLoss: {total_loss:.3f}")
-            print(f"Round: {round+1}\tPrior model trained")
+                print(f'Epoch: {epoch+1}/{num_prior_epochs} \tLoss: {total_loss:.3f}')
+                
+            
+            # reset diffusion buffer
+            agent.reset_diffusion_buffer()
+            print(f'Diffusion buffer reset')
             
             
             
@@ -459,18 +525,33 @@ def redq_sac(
             
             
             # +++++++++++ 1.2. conditional diffusion posterior training (RTB fine-tuning) +++++++++++
+            print(f'Training conditional diffusion posterior...')
             # set up hyperparameters
-            alpha = args.alpha
+            alpha_rtb = args.alpha_rtb
             beta = args.beta
-            num_prior_epochs = args.num_prior_epochs
-            num_posterior_epochs = args.num_posterior_epochs
             
+            
+            # define reward proxy 
+            proxy_model_ens = agent.compute_intrinsic_reward
             
             # define posterior model and optimizer
-            posterior_model = QFlow(x_dim=dim, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
-            posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=1e-4)
+            # proxy_model_ens is not used in our settings, so replace it with agent.compute_intrinsic_reward()
+            # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
+            posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta, square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype).to(device=device)
+            posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
             
-            # load off-policy data
+            # define weights
+            xs = test_function_x_tensor.clone().detach().to(device)
+            xs = prior_model.normalizer.normalize(xs)
+            # Extract next_obs from xs for reward computation
+            # xs shape: [N, obs_dim + act_dim + 1 + obs_dim]
+            # next_obs starts at obs_dim + act_dim + 1
+            next_obs_start = obs_dim + act_dim + 1
+            next_obs_end = next_obs_start + obs_dim
+            # xs_next_obs = xs[:, next_obs_start:next_obs_end]
+            # ys = proxy_model_ens(xs_next_obs, square=args.square, pow_reward=args.pow_reward)
+            ys = test_function_y_tensor.clone().detach().to(device).log()
+            y_weights = torch.softmax(ys, dim=0)
             
             # fine-tuning loop
             if num_posterior_epochs > 0:
@@ -484,15 +565,19 @@ def redq_sac(
                         
                     if s1 == 0:
                         # on-policy
-                        loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=train_batch_size)
-                        y = proxy_model_ens.log_reward(x)
+                        loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=args.ft_batch_size)
+                        # Extract next_obs from x for reward computation
+                        x_next_obs = x[:, next_obs_start:next_obs_end]
+                        y = proxy_model_ens(x_next_obs, square=args.square, pow_reward=args.pow_reward).squeeze().log()
                     else:
                         # off-policy (reward prioritization)
-                        idx = torch.multinomial(y_weights.squeeze(), train_batch_size, replacement=True)
+                        idx = torch.multinomial(y_weights.squeeze(), args.ft_batch_size, replacement=True)
                         x = xs[idx]
                         x += torch.randn_like(x) * 0.01
                         loss, logZ = posterior_model.compute_loss_with_sample(x, device)
-                        y = proxy_model_ens.log_reward(x)
+                        # Extract next_obs from x for reward computation
+                        x_next_obs = x[:, next_obs_start:next_obs_end]
+                        y = proxy_model_ens(x_next_obs, square=args.square, pow_reward=args.pow_reward).squeeze().log()
                         
                     xs = torch.cat([xs, x], dim=0)
                     ys = torch.cat([ys, y], dim=0)
@@ -501,547 +586,124 @@ def redq_sac(
                     posterior_model_optimizer.zero_grad()
                     loss.backward()
                     posterior_model_optimizer.step()                
-                    # print(f"Round: {round+1}\tEpoch: {epoch+1}\tLoss: {total_loss:.3f}")
-                print(f"Round: {round+1}\tPosterior model trained")    
+                    print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss.item():.3f}')
+            else:
+                print(f'No posterior training')
             
             
             
             # +++++++++++ training over +++++++++++
             
             # +++++++++++ 2. Sampling +++++++++++
+            print(f'Sampling...')
             X_sample_total = []
-            logR_sample_total = []
-            if args.filtering == "True":
-                M = args.num_proposals
-            else: # 
-                M = 1
+            # we only need X_sample, not logR_sample
+            # logR_sample_total = []
+            eval_epochs = int(args.num_samples // args.sample_batch_size)
+            assert args.num_samples % args.sample_batch_size == 0
+            # In our settings, filtering is not used
+            # if args.filtering:
+            #     M = args.num_proposals
+            # else: # 
+            #     M = 1
                 
-            for _ in tqdm(range(M)): #NOTE B * M**2 samples proposal.
+            for _ in tqdm(range(eval_epochs)): #NOTE B * M**2 samples proposal.
                 # Split into batches due to memory constraints
-                X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=batch_size * M, device=device)
-                logpf_pi = posterior_model.compute_marginal_likelihood(X_sample)
-                logr = posterior_model.posterior_log_reward(X_sample).squeeze()
-                logR = logr + logpf_pi * alpha
+                # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
+                X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
+                # X_sample is normalized status
+                # logpf_pi = posterior_model.compute_marginal_likelihood(X_sample)
+                # skip
+                # logr = posterior_model.posterior_log_reward(X_sample).squeeze()
+                # logR = logr + logpf_pi * alpha
                 
-                if args.local_search == "True" and args.local_search_epochs > 0:
-                    X_sample_optimizer = torch.optim.Adam([X_sample], lr=1e-2)
-                    for _ in range(args.local_search_epochs):
-                        X_sample.requires_grad_(True)
-                        logr_sample = posterior_model.posterior_log_reward(X_sample).squeeze()
-                        logpf_pi_sample = posterior_model.compute_marginal_likelihood(X_sample)
-                        logR_sample = logr_sample + logpf_pi_sample * alpha
-                        loss = -torch.exp(logR_sample).sum()
-                        # loss = -logR_sample.sum()
+                # local search is not used in our settings
+                if args.local_search and args.local_search_epochs > 0:
+                    break
+                    # X_sample_optimizer = torch.optim.Adam([X_sample], lr=1e-2)
+                    # for _ in range(args.local_search_epochs):
+                    #     X_sample.requires_grad_(True)
+                    #     # skip
+                    #     logr_sample = posterior_model.posterior_log_reward(X_sample).squeeze()
+                    #     logpf_pi_sample = posterior_model.compute_marginal_likelihood(X_sample)
+                    #     logR_sample = logr_sample + logpf_pi_sample * alpha
+                    #     loss = -torch.exp(logR_sample).sum()
+                    #     # loss = -logR_sample.sum()
                         
-                        X_sample_optimizer.zero_grad()
-                        loss.backward()
-                        X_sample_optimizer.step()
-                    X_sample = X_sample.detach()
-                    logR_sample = logR_sample.detach()
+                    #     X_sample_optimizer.zero_grad()
+                    #     loss.backward()
+                    #     X_sample_optimizer.step()
+                    # X_sample = X_sample.detach()
+                    # logR_sample = logR_sample.detach()
                     
-                    X_sample_total.append(X_sample)
-                    logR_sample_total.append(logR_sample)
+                    # X_sample_total.append(X_sample)
+                    # logR_sample_total.append(logR_sample)
                 else:
                     X_sample_total.append(X_sample)
-                    logR_sample_total.append(logR)
+                    # logR_sample_total.append(logR)
                     
             X_sample = torch.cat(X_sample_total, dim=0)
-            logR_sample = torch.cat(logR_sample_total, dim=0)
+            # logR_sample = torch.cat(logR_sample_total, dim=0)
             
             print(f'Sampling complete')
             
+            # clip
+            print(f'X_sample before clipping: {X_sample}')
+            X_sample = torch.clamp(X_sample, -1, 1)
             # unnormalize samples
+            X_sample_unnorm = prior_model.normalizer.unnormalize(X_sample)
+            # if actions are not clipped, then clamp them to [-1, 1]
+            # X_sample_unnorm = torch.clamp(X_sample_unnorm, -1, 1)
+                
             
-                # if actions are not clipped, then clamp them to [-1, 1]
-                
-                
-                
             # put it in diffusion replay buffer
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-
-            # +++++++++++ RTB fine-tuning +++++++++++
-            if args.rtb:
-                print('Setting up for RTB fine-tuning...')
-                # Calculate current epoch for logging
-                cur_epoch = (t // steps_per_epoch)
+            # Convert to numpy if it's a tensor
+            if isinstance(X_sample_unnorm, torch.Tensor):
+                X_sample_unnorm_np = X_sample_unnorm.cpu().numpy()
+            else:
+                X_sample_unnorm_np = X_sample_unnorm
                 
-                # Initialize fine-tuning model
-                # diffusion model이 epsilon을 뱉으면 됨
-                backprop_model = diffusion_trainer.model.to(device)
-                backprop_model.train()  # Set to training mode for fine-tuning
-
-                pre_trained_model = copy.deepcopy(backprop_model).to(device)
-                pre_trained_model.eval()  # Freeze pre-trained model
-
-                # Setup optimizer and log partition function
-                optimizer = optim.Adam(backprop_model.parameters(), lr=args.finetune_lr)
-
-                # load Data from replay buffer
-                ptr_location = agent.replay_buffer.ptr
-                all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location]).to(device)
-
-                # Compute average of total rewards in batch-level computation
-                all_rewards = []
-                batch_size_stat = args.ft_batch_size
-                with torch.no_grad():
-                    for i in range(0, ptr_location, batch_size_stat):
-                        batch_next_obs = all_next_obs[i:i+batch_size_stat]
-                        batch_rewards = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
-                        all_rewards.append(batch_rewards)
-                    # calculate reward of one batch
-                    all_rewards = torch.cat(all_rewards, dim=0)
-
-                # all_rewards는 replay buffer 순서와 동일한 순서로 정렬되어 있음
-                rewards_flat = all_rewards.view(-1)
-                num_total = rewards_flat.numel()
-                
-                # (1-args.top_reward_exclude_ratio)와 args.top_reward_exclude_ratio 비율에 해당하는 percentile 계산
-                reward_percentile_95 = torch.quantile(rewards_flat, 1-args.top_reward_exclude_ratio).item()
-                reward_percentile_5 = torch.quantile(rewards_flat, args.top_reward_exclude_ratio).item()
-                
-                # 전체 데이터에서 reward 통계 계산
-                reward_mean = rewards_flat.mean().item()
-                reward_std = rewards_flat.std().item()
-                print(f"Reward statistics - Mean: {reward_mean:.7f}, Std: {reward_std:.7f}")
-                print('===============================================================')
-                print(f"Reward percentiles - 95th: {reward_percentile_95:.7f}, 5th: {reward_percentile_5:.7f}")
-                
-                # normalized 된 reward를 logZ로 두었으니, reward는 10^-2에서 10^2 사이의 값을 대체로 가질 것. 그리고 아래의 reward_mean에 들어가야하는 값은 10^-2에서 10^2 사이의 값의 평균으로 계산되어야 함
-                all_rewards_norm = (all_rewards - reward_mean) / (reward_std + 1e-8)
-                all_rewards_exp = torch.exp(all_rewards_norm)
-                rewards_mean_exp = all_rewards_exp.mean().item()
-                log_Z = torch.nn.Parameter(torch.tensor(math.log(rewards_mean_exp), device=device), requires_grad=True)
-                # optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
-                optimizer_z = optim.Adam([log_Z], lr=args.finetune_lr)
-
-                # 12/23: weighted sampling
-                # black magic
-                # w = all_rewards.squeeze().detach()
-                # w = torch.clamp(w,max=torch.quantile(w,0.99))
-                # priority_alpha = getattr(args, "amplify", 1.0)
-                # print(f'priority_alpha: {priority_alpha}')
-                # w = w.pow(priority_alpha)
-                # weights_cpu = w.to("cpu")
-
-                # print(f'w: {w}')
-                # print(f'w.shape: {w.shape}')
-
-
-                # del, caching
-                # del all_rewards, all_next_obs
-                # torch.cuda.empty_cache()
-
-
-                # Setup dataloader
-                # return unnormalized data
-                # obs_data = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
-                # obs_next_data = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
-                # acts_data = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
-                # rews_data = torch.FloatTensor(agent.replay_buffer.rews_buf[:ptr_location])
-                # done_data = torch.FloatTensor(agent.replay_buffer.done_buf[:ptr_location])
-
-                # dataset = TensorDataset(obs_data, obs_next_data, acts_data, rews_data, done_data)
-                # dataloader = DataLoader(dataset, batch_size=args.ft_batch_size, shuffle=True, drop_last=True)
-
-                # Training loop
-                global_step = 0
-                accumulation_steps = args.accumulation_steps
-
-                print('Running RTB fine-tuning...')
-                # print(f'Total batches: {len(dataloader)}')
-
-                # Initialize wandb table for RTB fine-tuning logs (with epoch info to avoid overwriting)
-                rtb_log_table = wandb.Table(columns=["Epoch", "Iter", "On-policy Loss", "On-policy Reward", "Off-policy Loss", "log_Z"])
-                
-                # for epoch in range(args.backprop_epochs):
-                for iter in range(args.backprop_iters):
-                    # print(f'Epoch')
-                    # epoch_loss = 0.0
-                    # epoch_log_z = 0.0
-                    # epoch_reward = 0.0
-                    # epoch_log_ratio = 0.0
-                    # num_batches = 0
-
-                    # Actually not a epoch, but iteration
-                    epoch_loss_on = []
-                    epoch_reward_on = []
-                    epoch_loss_off = []
-
-
-
-                    # sampler = WeightedRandomSampler(weights_cpu, num_samples=len(w), replacement=True)
-                    # sampler = WeightedRandomSampler(weights_cpu, num_samples=args.ft_batch_size, replacement=True)
-                    # idx = torch.tensor(list(sampler), dtype=torch.long, device=device)
-                    # idx_cpu = idx.cpu().numpy()
-                    # print(f'idx_cpu: {idx_cpu}')
-                    # print(f'idx_cpu.shape: {idx_cpu.shape}')
-
-                    # Build tensors directly from replay buffer using sampled indices
-                    # obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[idx_cpu], device=device, dtype=torch.float32)
-                    # obs_next_tensor = torch.tensor(agent.replay_buffer.obs2_buf[idx_cpu], device=device, dtype=torch.float32)
-                    # acts_tensor = torch.tensor(agent.replay_buffer.acts_buf[idx_cpu], device=device, dtype=torch.float32)
-                    # rews_tensor = torch.tensor(agent.replay_buffer.rews_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
-                    # done_tensor = torch.tensor(agent.replay_buffer.done_buf[idx_cpu], device=device, dtype=torch.float32).unsqueeze(-1)
-
-
-                    # 전체 buffer에서 균등 샘플링
-                    all_indices = np.arange(ptr_location)
-                    replace_flag = len(all_indices) < args.ft_batch_size
-                    sampled_idx = np.random.choice(all_indices, size=args.ft_batch_size, replace=replace_flag)
-
-                    obs_tensor = torch.tensor(agent.replay_buffer.obs1_buf[sampled_idx],
-                                              device=device, dtype=torch.float32)
-                    obs_next_tensor = torch.tensor(agent.replay_buffer.obs2_buf[sampled_idx],
-                                                   device=device, dtype=torch.float32)
-                    acts_tensor = torch.tensor(agent.replay_buffer.acts_buf[sampled_idx],
-                                               device=device, dtype=torch.float32)
-                    rews_tensor = torch.tensor(agent.replay_buffer.rews_buf[sampled_idx],
-                                               device=device, dtype=torch.float32).unsqueeze(-1)
-                    done_tensor = torch.tensor(agent.replay_buffer.done_buf[sampled_idx],
-                                               device=device, dtype=torch.float32).unsqueeze(-1)
-
-                    uniform_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
-                    # weighted_sample_data = [(obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor)]
-
-
-
-                    # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(dataloader):
-                    # for batch_idx, (obs, next_obs, act, rew, done) in enumerate(weighted_sample_data):
-                    for batch_idx, (obs, next_obs, act, rew, done) in enumerate(uniform_sample_data):
-                        # on_policy_reward_norm_list = []   
-                        # unnormalized data
-                        # print('Processing batch ', batch_idx)
-                        # print the number of total batches
-                        # print(f'Total batches: {len(dataloader)}')
-                        obs = obs.to(device)
-                        next_obs = next_obs.to(device)
-                        act = act.to(device)
-                        rew = rew.to(device)
-                        current_batch_size = obs.size(0)
-
-                        # Construct x1 (clean samples): [obs, act, rew, next_obs]
-                        # pdb.set_trace()
-                        # x1 = torch.cat([obs, act, rew.unsqueeze(-1), next_obs], dim=-1).to(device)
-                        x1 = torch.cat([obs, act, rew, next_obs], dim=-1).to(device)
-
-                        # This is preparation for off-policy training
-                        # Normalize x1
-                        x1_normalized = backprop_model.normalizer.normalize(x1)
-                        with torch.no_grad():
-                            rewards = agent.compute_intrinsic_reward(next_obs, square=args.square,pow_reward=args.pow_reward)  # r(x1)
-                            # Clamp rewards to [5th percentile, 95th percentile]
-                            rewards = torch.clamp(rewards, min=reward_percentile_5, max=reward_percentile_95)
-                            # Normalize rewards using average and std computed from entire buffer
-                            rewards_norm = (rewards - reward_mean) / (reward_std + 1e-8)
-
-
-                        # On-policy Training with Gradient Accumulation
-                        # print('Starting on-policy training step...')
-                        # sample frequency를 1000으로 놓으면, on-policy training은 안하게 됨
-                        if (global_step % args.sample_freq == 0) and (args.backprop_iters > args.sample_freq):
-                            # Gradient accumulation: split batch into chunks
-                            chunk_size = args.ft_batch_size // accumulation_steps
-                            if chunk_size == 0:
-                                chunk_size = args.ft_batch_size
-                                num_chunks = 1
-                            else:
-                                num_chunks = accumulation_steps
-
-                            # Initialize accumulators
-                            accumulated_loss = 0.0
-                            accumulated_reward = 0.0
-                            nan_detected = False
-
-                            # Zero gradients at the start of accumulation
-                            optimizer.zero_grad()
-                            optimizer_z.zero_grad()
-
-                            # Process each chunk
-                            for chunk_idx in range(num_chunks):
-                                # Check model parameters before forward pass
-                                param_has_nan = False
-                                for param in backprop_model.parameters():
-                                    if torch.isnan(param).any() or torch.isinf(param).any():
-                                        param_has_nan = True
-                                        break
-
-                                if param_has_nan:
-                                    print(f'Warning: Model parameters contain NaN/Inf at on-policy chunk {chunk_idx}, batch {batch_idx}')
-                                    nan_detected = True
-                                    break
-
-                                # Denoising process for this chunk
-                                normal_dist = torch.distributions.Normal(
-                                    torch.zeros((chunk_size, *backprop_model.event_shape), device=device), 
-                                    backprop_model.sigma_max * torch.ones((chunk_size, *backprop_model.event_shape), device=device)
-                                )
-                                x_chunk = normal_dist.sample()
-
-                                logpf_pi_chunk = normal_dist.log_prob(x_chunk).sum(1)
-                                logpf_p_chunk = normal_dist.log_prob(x_chunk).sum(1)
-
-                                # Forward pass for this chunk
-                                x_chunk, logpf_pi_chunk, logpf_p_chunk = backprop_model.sample_rtb(
-                                    batch_size=chunk_size, 
-                                    cond=None, 
-                                    logpf_pi=logpf_pi_chunk, 
-                                    logpf_p=logpf_p_chunk,
-                                    pre_trained_model=pre_trained_model
-                                )
-
-                                # Extract obs_next_x from chunk
-                                _, _, _, obs_next_x_chunk = split_diffusion_samples(x_chunk, env)
-
-                                # Compute reward for sampled x chunk
-                                with torch.no_grad():
-                                    rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk, square=args.square, pow_reward=args.pow_reward)
-                                    # Clamp rewards to [5th percentile, 95th percentile]
-                                    rewards_sample_chunk = torch.clamp(rewards_sample_chunk, min=reward_percentile_5, max=reward_percentile_95)
-                                rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
-
-                                logr_chunk = rewards_sample_norm_chunk
-                                # logr_chunk = rewards_sample_chunk
-                                # logr_chunk = rewards_sample_chunk.log()
-                                # Compute loss for this chunk (scaled by 1/accumulation_steps to maintain effective learning rate)
-                                loss_chunk = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2).mean() / accumulation_steps
-
-                                # Check for NaN/Inf in loss
-                                if torch.isnan(loss_chunk) or torch.isinf(loss_chunk):
-                                    print(f'Warning: NaN/Inf loss detected in on-policy chunk {chunk_idx}, batch {batch_idx}, skipping chunk')
-                                    nan_detected = True
-                                    break
-
-                                # Backward pass (accumulate gradients)
-                                loss_chunk.backward()
-
-                                # Accumulate loss and reward for logging
-                                accumulated_loss += loss_chunk.item() * accumulation_steps
-                                accumulated_reward += rewards_sample_norm_chunk.mean().item()
-                                # accumulated_reward += rewards_sample_chunk.mean().item()
-
-                            # Skip optimizer step if NaN was detected
-                            if nan_detected:
-                                print(f'Skipping on-policy optimizer step due to NaN in model output at batch {batch_idx}')
-                                optimizer.zero_grad()
-                                optimizer_z.zero_grad()
-                                continue
-
-                            # Gradient clipping to prevent parameter explosion and NaN weights
-                            torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
-                            torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
-
-                            # Update optimizer after accumulating gradients from all chunks
-                            optimizer.step()
-                            optimizer_z.step()
-
-                            # Check if model parameters became NaN after optimizer step
-                            has_nan = False
-                            for param in backprop_model.parameters():
-                                if torch.isnan(param).any():
-                                    print(f'Warning: Model parameters contain NaN after on-policy training step at batch {batch_idx}')
-                                    has_nan = True
-                                    break
-                            if has_nan:
-                                print('Model parameters corrupted, skipping remaining training steps for this batch')
-                                optimizer.zero_grad()
-                                optimizer_z.zero_grad()
-                                continue
-
-                            # Average loss and reward for logging
-                            sample_loss = accumulated_loss / num_chunks if num_chunks > 0 else accumulated_loss
-                            avg_reward = accumulated_reward / num_chunks if num_chunks > 0 else accumulated_reward
-
-                            # logging
-                            # This is normalized reward, prior is of course normal(0,1)
-                            epoch_reward_on.append(avg_reward)
-                            epoch_loss_on.append(sample_loss)
-
-                            # logZSample = logC.mean().item()
-                            # loss = logZSample = backprop_model.compute_loss()
-
-
-                        # pdb.set_trace()
-
-
-
-                        # Off-policy Training
-                        # print('Starting off-policy training step...')
-
-                        # Check if model parameters are corrupted BEFORE starting off-policy training
-                        model_has_nan = False
-                        for param in backprop_model.parameters():
-                            if torch.isnan(param).any() or torch.isinf(param).any():
-                                print(f'Warning: Model parameters contain NaN/Inf before off-policy training at batch {batch_idx}')
-                                print('Model was corrupted during on-policy training, skipping off-policy step')
-                                model_has_nan = True
-                                break
-
-                        if model_has_nan:
-                            optimizer.zero_grad()
-                            optimizer_z.zero_grad()
-                            continue
-                        
-                        
-                        x1_repeat = x1_normalized
-                        # batch size
-                        bs = x1_repeat.shape[0]
-                        
-                        # compute the reward
-                        logr = rewards_norm
-
-                        # Gradient accumulation: split batch into chunks
-                        chunk_size = bs // accumulation_steps
-                        if chunk_size == 0:
-                            chunk_size = bs
-                            num_chunks = 1
-                        else:
-                            num_chunks = accumulation_steps
-
-                        # Initialize accumulators
-                        accumulated_loss = 0.0
-                        nan_detected = False
-
-                        # Zero gradients at the start of accumulation
-                        optimizer.zero_grad()
-                        optimizer_z.zero_grad()
-
-                        # Process each chunk
-                        for chunk_idx in range(num_chunks):
-                            start_idx = chunk_idx * chunk_size
-                            end_idx = start_idx + chunk_size if chunk_idx < num_chunks - 1 else bs
-
-                            # Extract chunk
-                            x1_chunk = x1_repeat[start_idx:end_idx]
-                            logr_chunk = logr[start_idx:end_idx]
-                            chunk_bs = x1_chunk.shape[0]
-
-                            # Initialize logpf_pi and logpf_p for this chunk
-                            logpf_pi_chunk = torch.zeros((chunk_bs,), device=x1_chunk.device)
-                            logpf_p_chunk = torch.zeros((chunk_bs,), device=x1_chunk.device)
-
-                            # Check model parameters before forward pass
-                            param_has_nan = False
-                            for param in backprop_model.parameters():
-                                if torch.isnan(param).any() or torch.isinf(param).any():
-                                    param_has_nan = True
-                                    break
-
-                            if param_has_nan:
-                                print(f'Warning: Model parameters contain NaN/Inf at off-policy chunk {chunk_idx}, batch {batch_idx}')
-                                nan_detected = True
-                                break
-
-                            # Forward pass for this chunk
-                            logpf_pi_chunk, logpf_p_chunk = backprop_model.sample_rtb_reverse(
-                                x=x1_chunk, 
-                                logpf_pi=logpf_pi_chunk, 
-                                logpf_p=logpf_p_chunk, 
-                                pre_trained_model=pre_trained_model
-                            )
-
-
-                            # Compute loss for this chunk (scaled by 1/accumulation_steps to maintain effective learning rate)
-                            loss_chunk = 0.5*((args.alpha*logpf_p_chunk + log_Z - args.alpha*logpf_pi_chunk - args.beta*logr_chunk.detach())**2).mean() / accumulation_steps
-
-                            # Check for NaN/Inf in loss
-                            if torch.isnan(loss_chunk) or torch.isinf(loss_chunk):
-                                print(f'Warning: NaN/Inf loss detected in off-policy chunk {chunk_idx}, batch {batch_idx}, skipping chunk')
-                                nan_detected = True
-                                break
-
-                            # Backward pass (accumulate gradients)
-                            loss_chunk.backward()
-
-                            # Accumulate loss for logging (multiply by accumulation_steps to get actual loss)
-                            accumulated_loss += loss_chunk.item() * accumulation_steps
-
-                        # Skip optimizer step if NaN was detected
-                        if nan_detected:
-                            print(f'Skipping off-policy optimizer step due to NaN in model output at batch {batch_idx}')
-                            optimizer.zero_grad()
-                            optimizer_z.zero_grad()
-                            continue
-
-                        # Gradient clipping to prevent parameter explosion
-                        torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
-                        torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
-
-                        # Update optimizer after accumulating gradients from all chunks
-                        optimizer.step()
-                        optimizer_z.step()
-
-                        # Average loss for logging
-                        batch_loss = accumulated_loss / num_chunks if num_chunks > 0 else accumulated_loss
-
-                        # logging
-                        epoch_loss_off.append(batch_loss)
-
-                        global_step += 1                 
-
-
-                    # epoch_loss_on = 0.0
-                    # epoch_reward_on = 0.0
-                    # epoch_loss_off = 0.0
-                    if iter % 1 == 0:
-                        avg_epoch_loss_on = np.mean(epoch_loss_on)
-                        avg_epoch_reward_on = np.mean(epoch_reward_on)
-                        avg_epoch_loss_off = np.mean(epoch_loss_off)
-                        print('======================================================================')
-                        # print(f'RTB Fine-tuning Epoch {epoch + 1}/{args.backprop_epochs} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
-                        print(f'RTB Fine-tuning Iter {iter + 1}/{args.backprop_iters} | On-policy Loss: {avg_epoch_loss_on:.6f} | On-policy Reward: {avg_epoch_reward_on:.6f} | Off-policy Loss: {avg_epoch_loss_off:.6f}')
-                        print(f'log_Z item: {log_Z.item()}')
-                        print('======================================================================')
-
-                        # Add data to wandb table with epoch information
-                        rtb_log_table.add_data(
-                            cur_epoch,
-                            iter + 1,
-                            f"{avg_epoch_loss_on:.6f}",
-                            f"{avg_epoch_reward_on:.6f}",
-                            f"{avg_epoch_loss_off:.6f}",
-                            f"{log_Z.item():.6f}"
-                        )
-                        
-                        # Log table at the last iteration (with epoch-specific key to avoid overwriting)
-                        if iter == args.backprop_iters - 1:
-                            wandb.log({f"RTB_Fine-tuning_Log_Epoch_{cur_epoch}": rtb_log_table}, step=cur_epoch)
-                            # pass
-                        
-                # Sync EMA model with fine-tuned weights
-                diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
-                print('RTB fine-tuning complete. Synced EMA model with fine-tuned weights.')
-            # +++++++++++ RTB fine-tuning over +++++++++++
-
-
-
-
-
-            # +++++++++++ sampling +++++++++++
-            # Add samples to agent replay buffer
-            generator = CondDiffusionGenerator(args=args, env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
-            # 샘플링 스텝 수는 128
-            observations, actions, rewards, next_observations, terminals = generator.sample(num_samples=num_samples,
-                                                                                            cfg_scale=cfg_scale)
+            transitions = split_diffusion_samples(X_sample_unnorm_np, env)
+            if len(transitions) == 4:
+                obs, act, rew, next_obs = transitions
+                # Convert to numpy if tensors
+                if isinstance(next_obs, torch.Tensor):
+                    next_obs = next_obs.cpu().numpy()
+                terminal = np.zeros_like(next_obs[:, 0])
+            else:
+                # won't be chosen
+                obs, act, rew, next_obs, terminal = transitions
+                # Convert to numpy if tensors
+                if isinstance(next_obs, torch.Tensor):
+                    next_obs = next_obs.cpu().numpy()
+                if isinstance(terminal, torch.Tensor):
+                    terminal = terminal.cpu().numpy()
             
-            
-
-            print(f'Adding {num_samples} samples to replay buffer.')
+            # Convert all to numpy arrays if they're tensors
+            if isinstance(obs, torch.Tensor):
+                obs = obs.cpu().numpy()
+            if isinstance(act, torch.Tensor):
+                act = act.cpu().numpy()
+            if isinstance(rew, torch.Tensor):
+                rew = rew.cpu().numpy()
+            if isinstance(next_obs, torch.Tensor):
+                next_obs = next_obs.cpu().numpy()
+            if isinstance(terminal, torch.Tensor):
+                terminal = terminal.cpu().numpy()
+                
+            observations = np.array(obs).squeeze()
+            actions = np.array(act).squeeze()
+            rewards = np.array(rew).squeeze()
+            next_observations = np.array(next_obs).squeeze()
+            terminals = np.array(terminal).squeeze()
+    
+            num_samples_actual = len(observations)
+            print(f'Adding {num_samples_actual} samples to replay buffer.')
             for o, a, r, o2, term in zip(observations, actions, rewards, next_observations, terminals):
                 agent.diffusion_buffer.store(o, a, r, o2, term)
-            # +++++++++++ sampling +++++++++++
-
-
-
-
+                
+            # +++++++++++ sampling over +++++++++++
+            print(f'Sampling over')
 
 
             
@@ -1057,14 +719,15 @@ def redq_sac(
                 real_rewards = agent.replay_buffer.rews_buf[:ptr_location]
                 # Print min, max, mean, std of each dimension in the obs, rew and action
                 print('Buffer stats:')
-                for i in range(observations.shape[1]):
-                    print(f'Diffusion Obs {i}: {np.mean(observations[:, i]):.2f} {np.std(observations[:, i]):.2f}')
-                    print(f'     Real Obs {i}: {np.mean(real_observations[:, i]):.2f} {np.std(real_observations[:, i]):.2f}')
-                for i in range(actions.shape[1]):
-                    print(f'Diffusion Action {i}: {np.mean(actions[:, i]):.2f} {np.std(actions[:, i]):.2f}')
-                    print(f'     Real Action {i}: {np.mean(real_actions[:, i]):.2f} {np.std(real_actions[:, i]):.2f}')
-                print(f'Diffusion Reward: {np.mean(rewards):.2f} {np.std(rewards):.2f}')
-                print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
+                if len(observations) > 0:
+                    for i in range(observations.shape[1]):
+                        print(f'Diffusion Obs {i}: {np.mean(observations[:, i]):.2f} {np.std(observations[:, i]):.2f}')
+                        print(f'     Real Obs {i}: {np.mean(real_observations[:, i]):.2f} {np.std(real_observations[:, i]):.2f}')
+                    for i in range(actions.shape[1]):
+                        print(f'Diffusion Action {i}: {np.mean(actions[:, i]):.2f} {np.std(actions[:, i]):.2f}')
+                        print(f'     Real Action {i}: {np.mean(real_actions[:, i]):.2f} {np.std(real_actions[:, i]):.2f}')
+                    print(f'Diffusion Reward: {np.mean(rewards):.2f} {np.std(rewards):.2f}')
+                    print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
 
@@ -1477,6 +1140,25 @@ if __name__ == '__main__':
                         help='Ratio of top rewards to exclude when computing reward statistics and threshold (default: 0.3)')
     
     parser.add_argument('--pow_reward', type=float, default=1.0)
+    
+    # ddqm
+    parser.add_argument('--uniform', action='store_true', default=False)
+    parser.add_argument('--diffusion_steps', type=int, default=100)
+    parser.add_argument('--num_prior_epochs', type=int, default=100)
+    parser.add_argument('--num_posterior_epochs', type=int, default=100)
+    parser.add_argument('--training_posterior', type=str, default='both') # 'both', 'on', 'off'
+    parser.add_argument('--filtering', action='store_true', default=False)
+    parser.add_argument('--num_proposals', type=int, default=10)
+    parser.add_argument('--local_search', action='store_true', default=False)
+    parser.add_argument('--local_search_epochs', type=int, default=10)
+    
+    parser.add_argument('--train_batch_size', type=int, default=256)
+    parser.add_argument('--num_samples', type=int, default=1000000)
+    parser.add_argument('--sample_batch_size', type=int, default=100000)
+    
+    parser.add_argument('--prior_lr', type=float, default=3e-4)
+    parser.add_argument('--alpha_rtb', type=float, default=1e-5)
+    
 
     args = parser.parse_args()
 
