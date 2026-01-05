@@ -526,6 +526,7 @@ class ElucidatedDiffusion(nn.Module):
         return (self.P_mean + self.P_std * torch.randn((batch_size,), device=self.device)).exp()
 
     def forward(self, inputs, cond=None):
+        # 역시 normalizer가 forward안에 포함
         inputs = self.normalizer.normalize(inputs)
         if cond is not None:
             cond = self.cond_normalizer.normalize(cond)
@@ -685,7 +686,7 @@ class Trainer(object):
     # Train for the full number of steps.
     def train(self):
         accelerator = self.accelerator
-        device = accelerator.device
+        device = accelerator.device                             
 
         with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
             while self.step < self.train_num_steps:
@@ -986,11 +987,12 @@ class CondDistri(object):
     
     
 class CondDistri_RND(object):
-    def __init__(self, agent, train_batch_size, buffer, top_frac):
+    def __init__(self, agent, train_batch_size, buffer, top_frac, square=True, pow_reward=1.0):
         self.top_frac = top_frac
         self.buffer = buffer
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+        self.square = square
+        self.pow_reward = pow_reward
         # Iterate over buffer and generate the conditional generation signal
         self.irews_buf = np.zeros_like(buffer.rews_buf)
         # Use some large batch size
@@ -1003,8 +1005,8 @@ class CondDistri_RND(object):
             done = self.buffer.done_buf[idxs][:, None]
             with torch.no_grad():
                 next_obs = Tensor(next_obs).to(self.device)
-                self.irews_buf[idxs] = agent.compute_intrinsic_reward(next_obs).squeeze().cpu().numpy()
-        
+                # self.irews_buf[idxs] = agent.compute_intrinsic_reward(next_obs, square=args.square, pow_reward=args.pow_reward).squeeze().cpu().numpy()
+                self.irews_buf[idxs] = agent.compute_intrinsic_reward(next_obs, square=self.square, pow_reward=self.pow_reward).squeeze().cpu().numpy()
         self.top_frac_indices = np.argsort(self.irews_buf, axis=0)[-int(top_frac * buffer.size):]
 
     def sample_batch(self, batch_size=32, idxs=None):

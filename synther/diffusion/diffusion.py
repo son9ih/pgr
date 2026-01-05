@@ -10,6 +10,49 @@ from torch.nn import functional as F
 from synther.diffusion.norm import normalizer_factory
 from redq.algos.core import ReplayBuffer
 from synther.online.utils import make_inputs_from_replay_buffer
+
+# new
+import math
+from einops import rearrange
+import gin
+from torch.distributions import Bernoulli
+
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+
+class RandomOrLearnedSinusoidalPosEmb(nn.Module):
+    """ following @crowsonkb 's lead with random (learned optional) sinusoidal pos emb """
+    """ https://github.com/crowsonkb/v-diffusion-jax/blob/master/diffusion/models/danbooru_128.py#L8 """
+
+    def __init__(
+            self,
+            dim: int,
+            is_random: bool = False,
+    ):
+        super().__init__()
+        assert (dim % 2) == 0
+        half_dim = dim // 2
+        self.weights = nn.Parameter(torch.randn(half_dim), requires_grad=not is_random)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = rearrange(x, 'b -> b 1')
+        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
+        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
+        fouriered = torch.cat((x, fouriered), dim=-1)
+        return fouriered
     
 class ResidualBlock(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, activation: str = "relu", layer_norm: bool = True):
@@ -25,93 +68,205 @@ class ResidualBlock(nn.Module):
         return x + self.linear(self.activation(self.ln(x)))
     
     
+# class ResidualMLP(nn.Module):
+#     def __init__(
+#             self,
+#             input_dim: int,
+#             width: int,
+#             depth: int,
+#             output_dim: int,
+#             activation: str = "gelu",
+#             layer_norm: bool = False,
+#     ):
+#         super().__init__()
+
+#         self.network = nn.Sequential(
+#             nn.Linear(input_dim, width),
+#             *[ResidualBlock(width, width, activation, layer_norm) for _ in range(depth)],
+#             nn.LayerNorm(width) if layer_norm else torch.nn.Identity(),
+#         )
+
+#         self.activation = getattr(F, activation)
+#         self.final_linear = nn.Linear(width, output_dim)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         return self.final_linear(self.activation(self.network(x)))    
+
 class ResidualMLP(nn.Module):
     def __init__(
             self,
             input_dim: int,
+            cond_dim: int,
             width: int,
             depth: int,
             output_dim: int,
-            activation: str = "gelu",
+            activation: str = "relu",
             layer_norm: bool = False,
     ):
         super().__init__()
 
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, width),
-            *[ResidualBlock(width, width, activation, layer_norm) for _ in range(depth)],
-            nn.LayerNorm(width) if layer_norm else torch.nn.Identity(),
+        assert cond_dim is not None, "Residual MLP constructor requires cond_dim"
+        self.x_proj = nn.Linear(input_dim, width)
+        self.cond_proj = nn.Linear(cond_dim, width)
+
+        self.network = nn.ModuleList(
+            [ResidualBlock(width * 2, width * 2, activation, layer_norm) for _ in range(depth)]
         )
 
         self.activation = getattr(F, activation)
-        self.final_linear = nn.Linear(width, output_dim)
+        self.final_linear = nn.Linear(2 * width, output_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.final_linear(self.activation(self.network(x)))    
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        x = self.x_proj(x)
+        cond = self.cond_proj(cond)
+        x = torch.cat((x, cond), dim=-1)
+        for layer in self.network:
+            x = layer(x)
+        return self.final_linear(self.activation(x))
 
-    
+# @gin.configurable
+# class QFlowMLP(nn.Module):
+#     def __init__(self, x_dim, hidden_dim=512, is_qflow=False, q_net=None, beta=None, dtype = torch.float32):
+#         super(QFlowMLP, self).__init__()
+#         self.is_qflow = is_qflow
+#         self.q = q_net
+#         self.beta = beta
+
+#         # self.x_model = nn.Sequential(
+#         #     nn.Linear(x_dim + 128, hidden_dim, dtype=dtype), nn.GELU(), nn.Linear(hidden_dim, hidden_dim, dtype=dtype), nn.GELU()
+#         # )
+
+#         # self.out_model = nn.Sequential(
+#         #     nn.Linear(hidden_dim, hidden_dim, dtype=dtype),
+#         #     nn.LayerNorm(hidden_dim, dtype=dtype),
+#         #     nn.GELU(),
+#         #     nn.Linear(hidden_dim, x_dim, dtype=dtype),
+#         # )
+
+#         self.proj = nn.Linear(x_dim, hidden_dim)
+#         self.residual_mlp = ResidualMLP(
+#             input_dim=hidden_dim + 128,
+#             width=hidden_dim,
+#             depth=3,
+#             output_dim=x_dim,
+#             activation="gelu",
+#             layer_norm=True,
+#         )
+
+#         self.means_scaling_model = nn.Sequential(
+#             nn.Linear(128, hidden_dim // 2, dtype=dtype),
+#             nn.LayerNorm(hidden_dim // 2, dtype=dtype),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim // 2, hidden_dim // 2, dtype=dtype),
+#             nn.LayerNorm(hidden_dim // 2, dtype=dtype),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim // 2, x_dim, dtype=dtype),
+#         )
+
+#         self.harmonics = nn.Parameter(torch.arange(1, 64 + 1, dtype=dtype) * 2 * np.pi).requires_grad_(False)
+
+#     def forward(self, x, t):
+#         t_fourier1 = (t.unsqueeze(1) * self.harmonics).sin()
+#         t_fourier2 = (t.unsqueeze(1) * self.harmonics).cos()
+#         t_emb = torch.cat([t_fourier1, t_fourier2], 1)
+#         # if not self.is_qflow:
+#         #     x_emb = self.x_model(torch.cat([x, t_emb], 1))
+#         # if self.is_qflow:
+#         #     # with torch.no_grad():
+#         #     x_emb = self.x_model(torch.cat([x, t_emb], 1))
+#         #     with torch.enable_grad():
+#         #         x.requires_grad_(True)
+#         #         means_scaling = self.means_scaling_model(t_emb) * self.q.score(x, beta=self.beta)
+#         #     return self.out_model(x_emb) + means_scaling
+#         # return self.out_model(x_emb)
+#         # x = self.proj(x) + t_emb
+#         # problem: needs debugging
+#         x = torch.cat([self.proj(x), t_emb], 1)
+#         return self.residual_mlp(x)
+
+@gin.configurable
 class QFlowMLP(nn.Module):
-    def __init__(self, x_dim, hidden_dim=512, is_qflow=False, q_net=None, beta=None, dtype = torch.float32):
-        super(QFlowMLP, self).__init__()
-        self.is_qflow = is_qflow
-        self.q = q_net
-        self.beta = beta
-
-        # self.x_model = nn.Sequential(
-        #     nn.Linear(x_dim + 128, hidden_dim, dtype=dtype), nn.GELU(), nn.Linear(hidden_dim, hidden_dim, dtype=dtype), nn.GELU()
-        # )
-
-        # self.out_model = nn.Sequential(
-        #     nn.Linear(hidden_dim, hidden_dim, dtype=dtype),
-        #     nn.LayerNorm(hidden_dim, dtype=dtype),
-        #     nn.GELU(),
-        #     nn.Linear(hidden_dim, x_dim, dtype=dtype),
-        # )
-
-        self.proj = nn.Linear(x_dim, hidden_dim)
+    def __init__(
+            self,
+            d_in: int,
+            dim_t: int = 128,
+            mlp_width: int = 1024,
+            num_layers: int = 6,
+            learned_sinusoidal_cond: bool = False,
+            random_fourier_features: bool = True,
+            learned_sinusoidal_dim: int = 16,
+            activation: str = "relu",
+            layer_norm: bool = True,
+            cond_dim: int = None,
+            cfg_dropout: float = 0.0,
+    ):
+        super().__init__()
         self.residual_mlp = ResidualMLP(
-            input_dim=hidden_dim + 128,
-            width=hidden_dim,
-            depth=3,
-            output_dim=x_dim,
-            activation="gelu",
-            layer_norm=True,
+            input_dim=d_in,
+            cond_dim=dim_t * 2,
+            width=mlp_width,
+            depth=num_layers,
+            output_dim=d_in,
+            activation=activation,
+            layer_norm=layer_norm,
+        )
+        assert cond_dim is not None, "Conditional denoiser constructor requires cond_dim"
+
+        # Conditional dropout
+        self.cond_dropout = Bernoulli(probs=1 - cfg_dropout)
+
+        # time embeddings
+        self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
+        if self.random_or_learned_sinusoidal_cond:
+            sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
+            fourier_dim = learned_sinusoidal_dim + 1
+        else:
+            sinu_pos_emb = SinusoidalPosEmb(dim_t)
+            fourier_dim = dim_t
+
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(cond_dim, dim_t * 2),
+            nn.Mish(),
+            nn.Linear(dim_t * 2, dim_t),
         )
 
-        self.means_scaling_model = nn.Sequential(
-            nn.Linear(128, hidden_dim // 2, dtype=dtype),
-            nn.LayerNorm(hidden_dim // 2, dtype=dtype),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2, dtype=dtype),
-            nn.LayerNorm(hidden_dim // 2, dtype=dtype),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, x_dim, dtype=dtype),
+        self.time_mlp = nn.Sequential(
+            sinu_pos_emb,
+            nn.Linear(fourier_dim, dim_t * 4),
+            nn.Mish(),
+            nn.Linear(dim_t * 4, dim_t)
         )
+        
 
-        self.harmonics = nn.Parameter(torch.arange(1, 64 + 1, dtype=dtype) * 2 * np.pi).requires_grad_(False)
+    def forward(
+            self,
+            x: torch.Tensor,
+            timesteps: torch.Tensor,
+            cond=None,
+    ) -> torch.Tensor:
+        
+        t = self.time_mlp(timesteps)
+        
+        if cond is not None:
+            
+            c = self.cond_mlp(cond)
+            
+            # Do conditional dropout during training
+            # Where is self.training?
+            if self.training:
+                mask = self.cond_dropout.sample(sample_shape=(c.shape[0], 1)).to(c.device)
+                c = c * mask
+        else:
+            c = torch.zeros_like(t).to(t.device)
 
-    def forward(self, x, t):
-        t_fourier1 = (t.unsqueeze(1) * self.harmonics).sin()
-        t_fourier2 = (t.unsqueeze(1) * self.harmonics).cos()
-        t_emb = torch.cat([t_fourier1, t_fourier2], 1)
-        # if not self.is_qflow:
-        #     x_emb = self.x_model(torch.cat([x, t_emb], 1))
-        # if self.is_qflow:
-        #     # with torch.no_grad():
-        #     x_emb = self.x_model(torch.cat([x, t_emb], 1))
-        #     with torch.enable_grad():
-        #         x.requires_grad_(True)
-        #         means_scaling = self.means_scaling_model(t_emb) * self.q.score(x, beta=self.beta)
-        #     return self.out_model(x_emb) + means_scaling
-        # return self.out_model(x_emb)
-        # x = self.proj(x) + t_emb
-        # problem: needs debugging
-        x = torch.cat([self.proj(x), t_emb], 1)
-        return self.residual_mlp(x)
+        t = torch.cat((c, t), dim=-1)
 
+        return self.residual_mlp(x, t)
+    
+    
 
 class DiffusionModel(nn.Module):
-    def __init__(self, x_dim, diffusion_steps, inputs, skip_dims, schedule="linear", predict="epsilon", policy_net="mlp", hidden_dim=512, dtype=torch.float32):
+    def __init__(self, x_dim, diffusion_steps, inputs, skip_dims, schedule="linear", predict="epsilon", policy_net="mlp", hidden_dim=1024, dtype=torch.float32, cond_dim=1, cfg_dropout=0.25):
         super(DiffusionModel, self).__init__()
         # ================================
         # new things
@@ -119,12 +274,19 @@ class DiffusionModel(nn.Module):
         self.skip_dims = skip_dims
         # normalizer of pgr 
         self.normalizer = normalizer_factory(normalizer_type='minmax', dataset=inputs, skip_dims=skip_dims)
+        # cond normalizer for conditional generation
+        cond_inputs = torch.zeros((128, cond_dim)).float()
+        self.cond_normalizer = normalizer_factory(normalizer_type='minmax', dataset=cond_inputs, skip_dims=[])
         # ================================
         self.x_dim = x_dim
         self.diffusion_steps = diffusion_steps
         self.schedule = schedule
         self.dtype = dtype
-        self.policy = QFlowMLP(x_dim=x_dim, hidden_dim=hidden_dim, dtype=dtype)
+        # QFlowMLP requires cond_dim, default to 1 if not provided
+        if cond_dim is None:
+            cond_dim = 1
+        # this initialization is carefully designed w.r.t. PGR
+        self.policy = QFlowMLP(d_in=x_dim, dim_t=256, mlp_width=hidden_dim, num_layers=6, cond_dim=cond_dim, cfg_dropout=cfg_dropout)
         self.diffusion_steps = diffusion_steps
         self.predict = predict
         if self.schedule == "linear":
@@ -149,8 +311,9 @@ class DiffusionModel(nn.Module):
         self.register_buffer("sqrtmab", torch.flip(sqrtmab, dims=[0]))
         self.register_buffer("mab_over_sqrtmab_inv", torch.flip(mab_over_sqrtmab_inv, dims=[0]))
 
-    def forward(self, x, t):
-        epsilon = self.policy(x, t)
+    def forward(self, x, t, cond=None):
+        # conditional generation
+        epsilon = self.policy(x, t, cond=cond)
         return epsilon
 
     def score(self, x, t):
@@ -162,35 +325,78 @@ class DiffusionModel(nn.Module):
             score = (self.sqrtab[t_idx] * epsilon - x) / (1 - self.alphabar_t[t_idx])
         return score
 
-    def sample(self, bs, device):
-        x = torch.randn(bs, self.x_dim, dtype=self.dtype, device=device)
-        t = torch.zeros((bs,), dtype=self.dtype, device=device)
-        dt = 1 / self.diffusion_steps
-        for i in range(self.diffusion_steps):
-            epsilon = self(x, t)
-            if self.predict == "epsilon":
-                x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon) + torch.sqrt(
-                    self.beta_t[i]
-                ) * torch.randn_like(x, dtype=self.dtype, device=device)
-            elif self.predict == "x0":
-                x = (1 / torch.sqrt(self.alpha_t[i])) * (
-                    (1 - (1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * x
-                    + ((1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * self.sqrtab[i] * epsilon
-                ) + torch.sqrt(self.beta_t[i]) * torch.randn_like(x, dtype=self.dtype, device=device)
-            t += dt
+    def sample(self, bs, device, cond=None, cfg_scale=None, eval=False):
+        """
+        Sample from the diffusion model with optional classifier-free guidance.
+        
+        Args:
+            bs: batch size
+            device: device to run on
+            cond: conditional input (optional)
+            cfg_scale: classifier-free guidance scale. If 1.0, no guidance is applied.
+                      If > 1.0, conditional generation is strengthened.
+            eval: if True, disable dropout during sampling
+        """
+        with torch.no_grad():
+            x = torch.randn(bs, self.x_dim, dtype=self.dtype, device=device)
+            t = torch.zeros((bs,), dtype=self.dtype, device=device)
+            dt = 1 / self.diffusion_steps
+            
+            # Set model to eval mode if specified (disables dropout)
+            was_training = self.training
+            if eval:
+                self.eval()
+            
+            try:
+                for i in range(self.diffusion_steps):
+                    # Classifier-free guidance: combine unconditional and conditional scores
+                    if cond is not None and cfg_scale is not None:
+                        # Compute unconditional score (cond=None)
+                        with torch.no_grad():
+                            epsilon_uncond = self(x, t, cond=None)
+                        
+                        # Compute conditional score
+                        epsilon_cond = self(x, t, cond=cond)
+                        
+                        # Combine scores using classifier-free guidance formula:
+                        # epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
+                        # This can be rewritten as:
+                        # epsilon = (1 + cfg_scale) * epsilon_cond - cfg_scale * epsilon_uncond
+                        epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
+                    else:
+                        # No guidance: use conditional or unconditional score directly
+                        epsilon = self(x, t, cond=cond)
+                    
+                    if self.predict == "epsilon":
+                        x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon) + torch.sqrt(
+                            self.beta_t[i]
+                        ) * torch.randn_like(x, dtype=self.dtype, device=device)
+                    elif self.predict == "x0":
+                        x = (1 / torch.sqrt(self.alpha_t[i])) * (
+                            (1 - (1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * x
+                            + ((1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * self.sqrtab[i] * epsilon
+                        ) + torch.sqrt(self.beta_t[i]) * torch.randn_like(x, dtype=self.dtype, device=device)
+                    t += dt
+            finally:
+                # Restore original training mode
+                if eval:
+                    self.train(was_training)
+            
         return x
 
-    def compute_loss(self, x):
+    # code for training prior or on-policy posterior training
+    def compute_loss(self, x, cond=None):
         t_idx = torch.randint(0, self.diffusion_steps, (x.shape[0], 1)).to(x.device)
         t = t_idx.float().squeeze(1) / self.diffusion_steps
         epsilon = torch.randn_like(x, dtype=self.dtype).to(x.device)
         x_t = self.sqrtab[t_idx] * x + self.sqrtmab[t_idx] * epsilon
-        epsilon_pred = self(x_t, t)
+        epsilon_pred = self(x_t, t, cond=cond)
         if self.predict == "epsilon":
             w = torch.minimum(
                 torch.tensor(5, dtype=self.dtype) / ((self.sqrtab[t_idx] / self.sqrtmab[t_idx]) ** 2), torch.tensor(1, dtype=self.dtype)
             )  # Min-SNR-gamma weights
             loss = (w * (epsilon - epsilon_pred) ** 2).mean()
+        # we are not using x0
         elif self.predict == "x0":
             w = torch.minimum((self.sqrtab[t_idx] / self.sqrtmab[t_idx]) ** 2, torch.tensor(5, dtype=self.dtype))
             loss = (w * (x - epsilon_pred) ** 2).mean()
@@ -206,6 +412,15 @@ class DiffusionModel(nn.Module):
             # self.model.normalizer.to(device)
             self.normalizer.to(device)
             # self.ema.ema_model.normalizer.to(device)
+            
+    def update_cond_normalizer(self, cond_distri, device=None):
+        data = cond_distri.irews_buf[:, None]
+        data = torch.from_numpy(data).float()
+        self.cond_normalizer.reset(data)
+        # self.ema.ema_model.cond_normalizer.reset(data)
+        if device:
+            self.cond_normalizer.to(device)
+            # self.ema.ema_model.cond_normalizer.to(device)
 
 class QFlow(nn.Module):
     def __init__(
@@ -252,57 +467,58 @@ class QFlow(nn.Module):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
 
-    def forward(self, x, t):
+    def forward(self, x, t, cond=None):
         # problem: needs debugging
-        q_epsilon = self.qflow(x, t)
+        q_epsilon = self.qflow(x, t, cond=cond)
         with torch.no_grad():
-            bc_epsilon = self.bc_net(x, t).detach()
+            bc_epsilon = self.bc_net(x, t, cond=cond).detach()
         return q_epsilon, bc_epsilon
 
-    def sample(self, bs, device, extra=False, eval=False):
+    def sample(self, bs, device, extra=False, eval=False, cond=None):
         if eval:
-            normal_dist = torch.distributions.Normal(
-                torch.zeros((bs, self.x_dim), device=device, dtype=self.dtype), 
-                torch.ones((bs, self.x_dim), device=device, dtype=self.dtype)
-            )
-            x = normal_dist.sample()
-            t = torch.zeros((bs,), device=device, dtype=self.dtype)
-            dt = 1 / self.diffusion_steps
+            with torch.no_grad():
+                normal_dist = torch.distributions.Normal(
+                    torch.zeros((bs, self.x_dim), device=device, dtype=self.dtype), 
+                    torch.ones((bs, self.x_dim), device=device, dtype=self.dtype)
+                )
+                x = normal_dist.sample()
+                t = torch.zeros((bs,), device=device, dtype=self.dtype)
+                dt = 1 / self.diffusion_steps
 
-            # logpf_pi = normal_dist.log_prob(x).sum(1)
-            # logpf_p = normal_dist.log_prob(x).sum(1)
-            # print(logpf_pi[:4])
-            extra_steps = 1
-            if extra:
-                extra_steps = 20
-            for i in range(self.diffusion_steps):
-                for j in range(extra_steps):
-                    # problem: needs debugging
-                    q_epsilon, bc_epsilon = self(x, t)
+                # logpf_pi = normal_dist.log_prob(x).sum(1)
+                # logpf_p = normal_dist.log_prob(x).sum(1)
+                # print(logpf_pi[:4])
+                extra_steps = 1
+                if extra:
+                    extra_steps = 20
+                for i in range(self.diffusion_steps):
+                    for j in range(extra_steps):
+                        # problem: needs debugging
+                        q_epsilon, bc_epsilon = self(x, t, cond=cond)
 
-                    epsilon = q_epsilon + bc_epsilon
-                    new_x = self.bc_net.oneover_sqrta[i] * (
-                        x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
-                    ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
+                        epsilon = q_epsilon + bc_epsilon
+                        new_x = self.bc_net.oneover_sqrta[i] * (
+                            x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
+                        ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
 
-                    # pf_pi_dist = torch.distributions.Normal(
-                    #     self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
-                    #     torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
-                    # )
-                    # logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
+                        # pf_pi_dist = torch.distributions.Normal(
+                        #     self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
+                        #     torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
+                        # )
+                        # logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
 
-                    # pf_p_dist = torch.distributions.Normal(
-                    #     self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
-                    #     torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
-                    # )
-                    # logpf_p += pf_p_dist.log_prob(new_x).sum(1)
+                        # pf_p_dist = torch.distributions.Normal(
+                        #     self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
+                        #     torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
+                        # )
+                        # logpf_p += pf_p_dist.log_prob(new_x).sum(1)
 
-                    x = new_x
-                    if i < self.diffusion_steps - 1:
-                        break
-                t = t + dt
+                        x = new_x
+                        if i < self.diffusion_steps - 1:
+                            break
+                    t = t + dt
             
-            return x
+                return x
         
         # This is for training   
         else:
