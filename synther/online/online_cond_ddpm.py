@@ -22,7 +22,7 @@ from synther.diffusion.utils import construct_diffusion_model, split_diffusion_s
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
 
 import wandb
-from synther.online.utils import PBE, RMS, compute_intr_reward
+from synther.online.utils import PBE, RMS, compute_intr_reward, make_inputs_from_replay_buffer
 import pdb
 
 import copy
@@ -48,6 +48,7 @@ import random
 from collections import namedtuple
 
 from torch.utils.data import Dataset
+from synther.diffusion.norm import MinMaxNormalizer
 
 
 @gin.configurable
@@ -418,10 +419,41 @@ def redq_sac(
             dtype = torch.float
             
             # define prior model and optimizer
-            prior_model = DiffusionModel(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, inputs=inputs, skip_dims=skip_dims).to(dtype=dtype, device=device)
+            prior_model = DiffusionModel(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, inputs=inputs, skip_dims=skip_dims, disable_terminal_norm=model_terminals).to(dtype=dtype, device=device)
             prior_model.dtype=dtype
             prior_model.train()
-            prior_model_optimizer = torch.optim.Adam(prior_model.parameters(), lr=args.prior_lr)
+            # prior_model_optimizer = torch.optim.Adam(prior_model.parameters(), lr=args.prior_lr)
+            
+            # prior_model_optimizer = torch.optim.AdamW(prior_model.parameters(), lr=args.prior_lr)
+            no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
+            optimizer_grouped_parameters = [
+                {
+                    'params': [p for n, p in prior_model.named_parameters() if not any(nd in n for nd in no_decay)],
+                    'weight_decay': 0.,
+                },
+                {
+                    'params': [p for n, p in prior_model.named_parameters() if any(nd in n for nd in no_decay)],
+                    'weight_decay': 0.0,
+                },
+            ]
+            
+            prior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.prior_lr, betas=args.prior_adam_betas)
+            # scheduler for prior model
+            if args.prior_lr_scheduler == 'linear':
+                print('using linear learning rate scheduler')
+                prior_model_lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    prior_model_optimizer,
+                    lambda step: max(0, 1 - step / args.num_prior_epochs)
+                )
+            elif args.prior_lr_scheduler == 'cosine':
+                print('using cosine learning rate scheduler')
+                prior_model_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    prior_model_optimizer,
+                    # 원래는 100,000 steps
+                    args.num_prior_epochs
+                )
+            else:
+                prior_model_lr_scheduler = None
             
             # load data from replay buffer
             test_function_x = None
@@ -431,20 +463,25 @@ def redq_sac(
             # sample every data in replay buffer
             print(f'Loading every data in replay buffer...')
             ptr_location = agent.replay_buffer.ptr
-            all_obs = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location])
-            all_acts = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location])
-            all_rews = torch.FloatTensor(agent.replay_buffer.rews_buf[:ptr_location])
-            all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location])
-            # done은 diffusion의 대상이 아님 data dimension에 포함되지 않음
-            if len(all_rews.shape) == 1:
-                all_rews = all_rews.unsqueeze(-1)
-            test_function_x = torch.cat([all_obs, all_acts, all_rews, all_next_obs], dim=1)
+            
+            # Use make_inputs_from_replay_buffer to ensure consistency with update_normalizer
+            # This ensures the data format matches exactly what update_normalizer uses
+            test_function_x_np = make_inputs_from_replay_buffer(agent.replay_buffer, model_terminals=model_terminals)
+            test_function_x = torch.from_numpy(test_function_x_np).float()
+            
+            # Extract next_obs for novelty computation (needed for test_function_y)
+            # Format: [obs, actions, rewards, next_obs] (or with terminals)
+            obs_dim = env.observation_space.shape[0]
+            act_dim = env.action_space.shape[0]
+            next_obs_start = obs_dim + act_dim + 1
+            next_obs_end = next_obs_start + obs_dim
+            all_next_obs = test_function_x[:, next_obs_start:next_obs_end]
             
             # compute test function y for all data in replay buffer
             batch_size_novelty = 4096
             with torch.no_grad():
                 for i in range(0, ptr_location, batch_size_novelty):
-                    batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
+                    batch_next_obs = all_next_obs[i:i+batch_size_novelty].to(device)
                     batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
                     batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
                     all_novelty_list.append(batch_novelty)
@@ -468,6 +505,7 @@ def redq_sac(
             test_function_dataset = SimpleDataset(test_function_x_tensor, test_function_y_tensor)
             
             # define data normalizer (x의 통계량 계산을 대체)
+            # Now test_function_x uses the same format as update_normalizer, so they are consistent
             prior_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
             # y의 통계량 계산
             y_mean = test_function_y_tensor.mean().item()
@@ -532,7 +570,8 @@ def redq_sac(
                         loss = prior_model.compute_loss(x_normalized)
                     loss.backward()
                     prior_model_optimizer.step()
-                    
+                    if prior_model_lr_scheduler is not None:
+                        prior_model_lr_scheduler.step()
                     total_loss += loss.item()
                 print(f'Epoch: {epoch+1}/{num_prior_epochs} \tLoss: {total_loss:.7f}')
                 
@@ -668,12 +707,16 @@ def redq_sac(
                 # Split into batches due to memory constraints
                 # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
                 if args.algorithm == 'Ours':
+                    posterior_model.eval()
                     X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
                 elif args.algorithm == 'PGRrnd':
+                    prior_model.eval()
                     cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
+                    # pdb.set_trace()
                     cond = prior_model.cond_normalizer.normalize(cond)
                     X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=args.cfg_scale)
                 elif args.algorithm == 'SER':
+                    prior_model.eval()
                     X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
                 else:
                     raise ValueError(f'Invalid algorithm: {args.algorithm}')
@@ -692,8 +735,14 @@ def redq_sac(
             
             # clip
             print(f'X_sample before clipping: {X_sample}')
-            X_sample = torch.clamp(X_sample, -1, 1)
-            # unnormalize samples
+            # originally in PGR source code
+            if isinstance(prior_model.normalizer, MinMaxNormalizer):
+                print('Clipping X_sample to [-1, 1]')
+                print('it works anyway')
+                X_sample = torch.clamp(X_sample, -1., 1.)
+            else:
+                print('Not clipping X_sample')
+            # unnormalize samples after clipping
             X_sample_unnorm = prior_model.normalizer.unnormalize(X_sample)
             # if actions are not clipped, then clamp them to [-1, 1]
             # X_sample_unnorm = torch.clamp(X_sample_unnorm, -1, 1)
@@ -705,8 +754,8 @@ def redq_sac(
                 X_sample_unnorm_np = X_sample_unnorm.cpu().numpy()
             else:
                 X_sample_unnorm_np = X_sample_unnorm
-                
-            transitions = split_diffusion_samples(X_sample_unnorm_np, env)
+            
+            transitions = split_diffusion_samples(X_sample_unnorm_np, env, modelled_terminals=model_terminals)
             if len(transitions) == 4:
                 obs, act, rew, next_obs = transitions
                 # Convert to numpy if tensors
@@ -1198,8 +1247,10 @@ if __name__ == '__main__':
     parser.add_argument('--train_batch_size', type=int, default=512)
     parser.add_argument('--num_samples', type=int, default=1000000)
     parser.add_argument('--sample_batch_size', type=int, default=100000)
+    parser.add_argument('--prior_lr_scheduler', type=str, default='cosine')
+    parser.add_argument('--prior_adam_betas', type=tuple, default=(0.9, 0.99))
     
-    parser.add_argument('--prior_lr', type=float, default=3e-4)
+    parser.add_argument('--prior_lr', type=float, default=1e-4)
     parser.add_argument('--alpha_rtb', type=float, default=1e-5)
     parser.add_argument('--cond_top_frac', type=float, default=0.25)
     parser.add_argument('--cfg_scale', type=float, default=2.0)
