@@ -52,6 +52,13 @@ def construct_diffusion_model(
         cond_dim: Optional[int] = None,
         cfg_dropout: float = 0.0,
 ) -> ElucidatedDiffusion:
+    # construct_diffusion_model(
+    #                 inputs=inputs,
+    #                 skip_dims=skip_dims,
+    #                 disable_terminal_norm=model_terminals,
+    #                 cond_dim=1,
+    #                 cfg_dropout=cfg_dropout,
+    #             ),
     event_dim = inputs.shape[1]
     model = denoising_network(d_in=event_dim, activation=activation, 
                               cond_dim=cond_dim, cfg_dropout=cfg_dropout)

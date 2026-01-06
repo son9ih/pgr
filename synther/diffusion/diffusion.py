@@ -17,6 +17,8 @@ from einops import rearrange
 import gin
 from torch.distributions import Bernoulli
 
+import pdb
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim: int):
@@ -189,16 +191,17 @@ class QFlowMLP(nn.Module):
     def __init__(
             self,
             d_in: int,
-            dim_t: int = 128,
+            dim_t: int = 256,
             mlp_width: int = 1024,
             num_layers: int = 6,
             learned_sinusoidal_cond: bool = False,
             random_fourier_features: bool = True,
             learned_sinusoidal_dim: int = 16,
-            activation: str = "relu",
-            layer_norm: bool = True,
+            # gin referenced activation: mish
+            activation: str = "mish",
+            layer_norm: bool = False,
             cond_dim: int = None,
-            cfg_dropout: float = 0.0,
+            cfg_dropout: float = 0.25,
     ):
         super().__init__()
         self.residual_mlp = ResidualMLP(
@@ -266,17 +269,25 @@ class QFlowMLP(nn.Module):
     
 
 class DiffusionModel(nn.Module):
-    def __init__(self, x_dim, diffusion_steps, inputs, skip_dims, schedule="linear", predict="epsilon", policy_net="mlp", hidden_dim=1024, dtype=torch.float32, cond_dim=1, cfg_dropout=0.25):
+    def __init__(self, x_dim, diffusion_steps, inputs, skip_dims, disable_terminal_norm=False, schedule="linear", predict="epsilon", policy_net="mlp", hidden_dim=1024, dtype=torch.float32, cond_dim=1, cfg_dropout=0.25):
         super(DiffusionModel, self).__init__()
         # ================================
         # new things
         self.inputs = inputs
         self.skip_dims = skip_dims
+        self.disable_terminal_norm = disable_terminal_norm
+        self.event_dim = self.inputs.shape[1]
+        if disable_terminal_norm:
+            terminal_dim = self.event_dim - 1
+            if terminal_dim not in skip_dims:
+                self.skip_dims.append(terminal_dim)
+        if skip_dims:
+            print(f"Skipping normalization for dimensions {self.skip_dims}.")
         # normalizer of pgr 
-        self.normalizer = normalizer_factory(normalizer_type='minmax', dataset=inputs, skip_dims=skip_dims)
+        self.normalizer = normalizer_factory('minmax', inputs, skip_dims=self.skip_dims)
         # cond normalizer for conditional generation
         cond_inputs = torch.zeros((128, cond_dim)).float()
-        self.cond_normalizer = normalizer_factory(normalizer_type='minmax', dataset=cond_inputs, skip_dims=[])
+        self.cond_normalizer = normalizer_factory('minmax', cond_inputs, skip_dims=[])
         # ================================
         self.x_dim = x_dim
         self.diffusion_steps = diffusion_steps
@@ -351,12 +362,14 @@ class DiffusionModel(nn.Module):
                 for i in range(self.diffusion_steps):
                     # Classifier-free guidance: combine unconditional and conditional scores
                     if cond is not None and cfg_scale is not None:
+                        # print("Now conditioned generation")
                         # Compute unconditional score (cond=None)
                         with torch.no_grad():
                             epsilon_uncond = self(x, t, cond=None)
                         
                         # Compute conditional score
                         epsilon_cond = self(x, t, cond=cond)
+                        # pdb.set_trace()
                         
                         # Combine scores using classifier-free guidance formula:
                         # epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
@@ -762,7 +775,10 @@ class QFlow(nn.Module):
 
         logpf_pi = torch.zeros((bs,), device=device, dtype=self.dtype)
         logpf_p = torch.zeros((bs,), device=device, dtype=self.dtype)
-        logr = self.posterior_log_reward(x, square=self.square, pow_reward=self.pow_reward)
+        # I think we need to log here
+        # Also, we need to unnormalize x here
+        x_unnormalized = self.bc_net.normalizer.unnormalize(x)
+        logr = self.posterior_log_reward(x_unnormalized, square=self.square, pow_reward=self.pow_reward).log()
 
         for i in range(self.diffusion_steps - 1, -1, -1):
             pb_dist = torch.distributions.Normal(
@@ -794,7 +810,15 @@ class QFlow(nn.Module):
         return loss, self.logZ
 
     def compute_loss(self, device, gfn_batch_size=512):
+        # return normalized samples x
         x, logpf_pi, logpf_p = self.sample(bs=gfn_batch_size, device=device)
+        # need to unnormalize x
+        # self.bc_net.normalizer is the prior normalizer
+        x = self.bc_net.normalizer.unnormalize(x)
+        # I think we need to log here
         logr = self.posterior_log_reward(x, square=self.square, pow_reward=self.pow_reward)
+        print(f'logr: {logr}')
+        logr = logr.log()
+        # pdb.set_trace()
         loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()
         return loss, self.logZ, x, logr

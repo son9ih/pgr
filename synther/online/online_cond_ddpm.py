@@ -159,7 +159,7 @@ def redq_sac(
                 "cfg_scale": cfg_scale,
                 "cond_hidden_size": cond_hidden_size,
                 "beta": args.beta,
-                "backprop_iters": args.backprop_iters,
+                # "backprop_iters": args.backprop_iters,
                 # "amplify": args.amplify,
                 "finetune_lr": args.finetune_lr,
                 "ft_batch_size": args.ft_batch_size,
@@ -175,6 +175,7 @@ def redq_sac(
                 "uniform": args.uniform,
                 # "sample_freq": args.sample_freq,
                 "gin_config_files": args.gin_config_files,
+                "version": args.version,
             })
 
         elif args.finetune:
@@ -346,6 +347,7 @@ def redq_sac(
         diff_dims += 1
     inputs = torch.zeros((128, diff_dims)).float()
     if skip_reward_norm:
+        print('Skipping reward normalization')
         skip_dims = [obs_dim + act_dim]
     else:
         skip_dims = []
@@ -556,8 +558,8 @@ def redq_sac(
                     
                     # normalize data
                     x_normalized = prior_model.normalizer.normalize(x.to(device))
+                    # add small noise to data
                     x_normalized += torch.randn_like(x_normalized) * 0.001
-                    prior_model_optimizer.zero_grad()
                     
                     if args.algorithm == 'PGR':
                         # normalize condition
@@ -568,6 +570,7 @@ def redq_sac(
                         loss = prior_model.compute_loss(x_normalized, cond=y)
                     else:
                         loss = prior_model.compute_loss(x_normalized)
+                    prior_model_optimizer.zero_grad()
                     loss.backward()
                     prior_model_optimizer.step()
                     if prior_model_lr_scheduler is not None:
@@ -613,9 +616,42 @@ def redq_sac(
                 # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
                 posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
                                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype).to(device=device)
-                posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
+                # TODO: check if AdamW is better
+                # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
+                posterior_model_optimizer = torch.optim.AdamW(posterior_model.parameters(), lr=args.finetune_lr, betas=args.rtb_adam_betas)
+                
+                # prior_model_optimizer = torch.optim.AdamW(prior_model.parameters(), lr=args.prior_lr)
+                # no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
+                # optimizer_grouped_parameters = [
+                #         {
+                #             'params': [p for n, p in posterior_model.named_parameters() if not any(nd in n for nd in no_decay)],
+                #             'weight_decay': 0.,
+                #         },
+                #         {
+                #             'params': [p for n, p in posterior_model.named_parameters() if any(nd in n for nd in no_decay)],
+                #             'weight_decay': 0.0,
+                #         },
+                #     ]
+                # posterior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.finetune_lr, betas=args.rtb_adam_betas)
+                # # scheduler for posterior model
+                # if args.rtb_lr_scheduler == 'linear':
+                #     print('using linear learning rate scheduler')
+                #     posterior_model_lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                #         posterior_model_optimizer,
+                #         lambda step: max(0, 1 - step / args.num_posterior_epochs)
+                #     )
+                # elif args.rtb_lr_scheduler == 'cosine':
+                #     print('using cosine learning rate scheduler')
+                #     posterior_model_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                #         posterior_model_optimizer,
+                #         # 원래는 100,000 steps
+                #         args.num_posterior_epochs
+                #     )
+                # else:
+                #     posterior_model_lr_scheduler = None
                 
                 # define weights
+                # unnormalized data
                 xs = test_function_x_tensor.clone().detach().to(device)
                 xs = prior_model.normalizer.normalize(xs)
                 # Extract next_obs from xs for reward computation
@@ -625,7 +661,8 @@ def redq_sac(
                 next_obs_end = next_obs_start + obs_dim
                 # xs_next_obs = xs[:, next_obs_start:next_obs_end]
                 # ys = proxy_model_ens(xs_next_obs, square=args.square, pow_reward=args.pow_reward)
-                ys = test_function_y_tensor.clone().detach().to(device).log()
+                ys = test_function_y_tensor.clone().detach().to(device)
+                # reward proportional weighting
                 y_weights = torch.softmax(ys, dim=0)
                 
                 # fine-tuning loop
@@ -644,19 +681,25 @@ def redq_sac(
                             
                         if s1 == 0:
                             # on-policy
+                            print(f'On-policy training')
+                            # return unnormalized samples x
                             loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=args.ft_batch_size)
                             # Extract next_obs from x for reward computation
                             x_next_obs = x[:, next_obs_start:next_obs_end]
+                            # x_next_obs should be unnormalized as input of proxy_model_ens
                             y = proxy_model_ens(x_next_obs, square=args.square, pow_reward=args.pow_reward).squeeze()
                         else:
                             # off-policy (reward prioritization)
+                            print(f'Off-policy training')
                             idx = torch.multinomial(y_weights.squeeze(), args.ft_batch_size, replacement=True)
+                            # this is normalized samples x
                             x = xs[idx]
                             x += torch.randn_like(x) * 0.01
                             loss, logZ = posterior_model.compute_loss_with_sample(x, device)
                             # Extract next_obs from x for reward computation
-                            x_next_obs = x[:, next_obs_start:next_obs_end]
-                            y = proxy_model_ens(x_next_obs, square=args.square, pow_reward=args.pow_reward).squeeze()
+                            x_unnormalized = prior_model.normalizer.unnormalize(x)
+                            x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
+                            y = proxy_model_ens(x_next_obs_unnormalized, square=args.square, pow_reward=args.pow_reward).squeeze()
                             
                             
                         xs = torch.cat([xs, x], dim=0)
@@ -665,6 +708,10 @@ def redq_sac(
                         
                         posterior_model_optimizer.zero_grad()
                         loss.backward()
+                        # Gradient clipping to prevent gradient explosion
+                        # torch.nn.utils.clip_grad_norm_(posterior_model.qflow.parameters(), max_norm=1.0)
+                        # if hasattr(posterior_model, 'logZ') and posterior_model.logZ.requires_grad:
+                        #     torch.nn.utils.clip_grad_norm_([posterior_model.logZ], max_norm=1.0)
                         posterior_model_optimizer.step()                
                         print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss.item():.9f}')
                         
@@ -1205,7 +1252,6 @@ if __name__ == '__main__':
     parser.add_argument('--finetune', action='store_true', default=False)
     parser.add_argument('--backprop_epochs', type=int, default=10)
     parser.add_argument('--backprop_iters', type=int, default=10)
-    parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--reward_coef', type=float, default=1.0)
     parser.add_argument('--ft_batch_size', type=int, default=1024)
     parser.add_argument('--rtb', action='store_true', default=False)
@@ -1244,22 +1290,27 @@ if __name__ == '__main__':
     parser.add_argument('--local_search', action='store_true', default=False)
     parser.add_argument('--local_search_epochs', type=int, default=10)
     
-    parser.add_argument('--train_batch_size', type=int, default=512)
+    parser.add_argument('--train_batch_size', type=int, default=256)
     parser.add_argument('--num_samples', type=int, default=1000000)
     parser.add_argument('--sample_batch_size', type=int, default=100000)
     parser.add_argument('--prior_lr_scheduler', type=str, default='cosine')
+    parser.add_argument('--rtb_lr_scheduler', type=str, default='cosine')
     parser.add_argument('--prior_adam_betas', type=tuple, default=(0.9, 0.99))
+    parser.add_argument('--rtb_adam_betas', type=tuple, default=(0.9, 0.99))
     
-    parser.add_argument('--prior_lr', type=float, default=1e-4)
+    parser.add_argument('--prior_lr', type=float, default=1e-3)
+    parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--alpha_rtb', type=float, default=1e-5)
     parser.add_argument('--cond_top_frac', type=float, default=0.25)
     parser.add_argument('--cfg_scale', type=float, default=2.0)
+    
+    parser.add_argument('--version', type=str, default='DDPM')
     
 
     args = parser.parse_args()
 
     assert args.algorithm in ['REDQ', 'PGR', 'PGRrnd', 'SER', 'Ours', 'SAC', 'ft']
-    run_name = f"{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_{args.algorithm}"
+    run_name = f"{args.version}_{args.env}_{args.seed}_{time.strftime('%Y%m%d-%H%M%S')}_{args.algorithm}"
 
     if args.algorithm == 'SAC':
         args.disable_diffusion = True
