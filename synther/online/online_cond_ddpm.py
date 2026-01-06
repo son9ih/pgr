@@ -685,9 +685,10 @@ def redq_sac(
                             # return unnormalized samples x
                             loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=args.ft_batch_size)
                             # Extract next_obs from x for reward computation
-                            x_next_obs = x[:, next_obs_start:next_obs_end]
+                            x_unnormalized = prior_model.normalizer.unnormalize(x)
+                            x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
                             # x_next_obs should be unnormalized as input of proxy_model_ens
-                            y = proxy_model_ens(x_next_obs, square=args.square, pow_reward=args.pow_reward).squeeze()
+                            y = proxy_model_ens(x_next_obs_unnormalized, square=args.square, pow_reward=args.pow_reward).squeeze()
                         else:
                             # off-policy (reward prioritization)
                             print(f'Off-policy training')

@@ -814,9 +814,9 @@ class QFlow(nn.Module):
         x, logpf_pi, logpf_p = self.sample(bs=gfn_batch_size, device=device)
         # need to unnormalize x
         # self.bc_net.normalizer is the prior normalizer
-        x = self.bc_net.normalizer.unnormalize(x)
+        x_unnormalized = self.bc_net.normalizer.unnormalize(x)
         # I think we need to log here
-        logr = self.posterior_log_reward(x, square=self.square, pow_reward=self.pow_reward)
+        logr = self.posterior_log_reward(x_unnormalized, square=self.square, pow_reward=self.pow_reward)
         print(f'logr: {logr}')
         logr = logr.log()
         # pdb.set_trace()
