@@ -198,7 +198,8 @@ class QFlowMLP(nn.Module):
             random_fourier_features: bool = True,
             learned_sinusoidal_dim: int = 16,
             # gin referenced activation: mish
-            activation: str = "mish",
+            # activation: str = "mish",
+            activation: str = "relu",
             layer_norm: bool = False,
             cond_dim: int = None,
             cfg_dropout: float = 0.25,
@@ -206,11 +207,14 @@ class QFlowMLP(nn.Module):
         super().__init__()
         self.residual_mlp = ResidualMLP(
             input_dim=d_in,
-            cond_dim=dim_t,
+            # including both time and cond embeddings
+            cond_dim=dim_t * 2,
             width=mlp_width,
             depth=num_layers,
             output_dim=d_in,
-            activation="gelu",
+            # activation="gelu",
+            activation=activation,
+            # in pgr, originally false
             layer_norm=True,
         )
         assert cond_dim is not None, "Conditional denoiser constructor requires cond_dim"
@@ -224,6 +228,7 @@ class QFlowMLP(nn.Module):
             sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
             fourier_dim = learned_sinusoidal_dim + 1
         else:
+            # activates
             sinu_pos_emb = SinusoidalPosEmb(dim_t)
             fourier_dim = dim_t
 
@@ -250,19 +255,19 @@ class QFlowMLP(nn.Module):
         
         t = self.time_mlp(timesteps)
         
-        # if cond is not None:
+        if cond is not None:
             
-        #     c = self.cond_mlp(cond)
+            # pdb.set_trace()
+            c = self.cond_mlp(cond)
             
-        #     # Do conditional dropout during training
-        #     # Where is self.training?
-        #     if self.training:
-        #         mask = self.cond_dropout.sample(sample_shape=(c.shape[0], 1)).to(c.device)
-        #         c = c * mask
-        # else:
-        #     c = torch.zeros_like(t).to(t.device)
+            # Do conditional dropout during training
+            if self.training:
+                mask = self.cond_dropout.sample(sample_shape=(c.shape[0], 1)).to(c.device)
+                c = c * mask
+        else:
+            c = torch.zeros_like(t).to(t.device)
 
-        # t = torch.cat((c, t), dim=-1)
+        t = torch.cat((c, t), dim=-1)
 
         return self.residual_mlp(x, t)
     
@@ -368,6 +373,8 @@ class DiffusionModel(nn.Module):
                             epsilon_uncond = self(x, t, cond=None)
                         
                         # Compute conditional score
+                        if cond.dim() == 1:
+                            cond = cond.unsqueeze(-1)
                         epsilon_cond = self(x, t, cond=cond)
                         # pdb.set_trace()
                         
@@ -403,6 +410,9 @@ class DiffusionModel(nn.Module):
         t = t_idx.float().squeeze(1) / self.diffusion_steps
         epsilon = torch.randn_like(x, dtype=self.dtype).to(x.device)
         x_t = self.sqrtab[t_idx] * x + self.sqrtmab[t_idx] * epsilon
+        # if cond is 1D tensor, we need to expand it to 2D tensor
+        if cond is not None and cond.dim() == 1:
+            cond = cond.unsqueeze(-1)
         epsilon_pred = self(x_t, t, cond=cond)
         if self.predict == "epsilon":
             w = torch.minimum(
@@ -817,7 +827,7 @@ class QFlow(nn.Module):
         x_unnormalized = self.bc_net.normalizer.unnormalize(x)
         # I think we need to log here
         logr = self.posterior_log_reward(x_unnormalized, square=self.square, pow_reward=self.pow_reward)
-        print(f'logr: {logr}')
+        # print(f'logr: {logr}')
         logr = logr.log()
         # pdb.set_trace()
         loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()

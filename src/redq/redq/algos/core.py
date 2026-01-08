@@ -214,14 +214,11 @@ class TanhGaussianPolicy(Mlp):
             h = self.hidden_activation(fc_layer(h))
         mean = self.last_fc_layer(h)
         
-        try:
-            log_std = self.last_fc_log_std(h)
-            log_std = torch.clamp(log_std, LOG_SIG_MIN, LOG_SIG_MAX)
-            std = torch.exp(log_std)
-            normal = Normal(mean, std)
-        except:
-            breakpoint()
-
+        log_std = self.last_fc_log_std(h)
+        log_std = torch.clamp(log_std, LOG_SIG_MIN, LOG_SIG_MAX)
+        std = torch.exp(log_std)
+        normal = Normal(mean, std)
+            
         if deterministic:
             pre_tanh_value = mean
             action = torch.tanh(mean)

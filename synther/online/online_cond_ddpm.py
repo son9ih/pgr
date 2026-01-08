@@ -127,7 +127,7 @@ def redq_sac(
             wandb.init(
             project = f'{env_name}',
             group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_square{args.square}_pow_reward{args.pow_reward}_alpha_rtb{args.alpha_rtb}_num_prior_epochs{args.num_prior_epochs}_num_posterior_epochs{args.num_posterior_epochs}_uniform{args.uniform}',
+            name = f' {run_name}_square{args.square}_pow_reward{args.pow_reward}_alpha_rtb{args.alpha_rtb}_num_prior_epochs{args.num_prior_epochs}_num_posterior_epochs{args.num_posterior_epochs}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -176,14 +176,17 @@ def redq_sac(
                 # "sample_freq": args.sample_freq,
                 "gin_config_files": args.gin_config_files,
                 "version": args.version,
+                "cfg_scale": args.cfg_scale,
             })
+        else:
 
-        elif args.finetune:
+        # args.results_folder = run_name
+
             wandb.init(
-            project = f'{env_name}',
-            group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_epochs{args.backprop_epochs}_kl_weight{args.kl_weight}_reward_coef{args.reward_coef}',
-            config={
+                project = f'{env_name}',
+                group = f'{run_name.split("_")[-1]}',
+                name = run_name,
+                config={
                 "env_name": env_name,
                 "seed": seed,
                 "epochs": epochs,
@@ -213,47 +216,27 @@ def redq_sac(
                 "cond_top_frac": cond_top_frac,
                 "cfg_scale": cfg_scale,
                 "cond_hidden_size": cond_hidden_size,
-            })
-
-        else:
-
-        # args.results_folder = run_name
-
-            wandb.init(
-                project = f'{env_name}',
-                group = f'{run_name.split("_")[-1]}',
-                name = run_name,
-                config={
-                    "env_name": env_name,
-                    "seed": seed,
-                    "epochs": epochs,
-                    "steps_per_epoch": steps_per_epoch,
-                    "hidden_sizes": hidden_sizes,
-                    "replay_size": replay_size,
-                    "batch_size": batch_size,
-                    "lr": lr,
-                    "gamma": gamma,
-                    "polyak": polyak,
-                    "alpha": alpha,
-                    "auto_alpha": auto_alpha,
-                    "target_entropy": target_entropy,
-                    "start_steps": start_steps,
-                    "delay_update_steps": delay_update_steps,
-                    "utd_ratio": utd_ratio,
-                    "num_Q": num_Q,
-                    "num_min": num_min,
-                    "q_target_mode": q_target_mode,
-                    "policy_update_delay": policy_update_delay,
-                    "diffusion_buffer_size": diffusion_buffer_size,
-                    "diffusion_sample_ratio": diffusion_sample_ratio,
-                    "retrain_diffusion_every": retrain_diffusion_every,
-                    "num_samples": num_samples,
-                    "disable_diffusion": disable_diffusion,
-                    "cfg_dropout": cfg_dropout,
-                    "cond_top_frac": cond_top_frac,
-                    "cfg_scale": cfg_scale,
-                    "cond_hidden_size": cond_hidden_size,
-                }
+                "beta": args.beta,
+                # "backprop_iters": args.backprop_iters,
+                # "amplify": args.amplify,
+                "finetune_lr": args.finetune_lr,
+                "ft_batch_size": args.ft_batch_size,
+                "accumulation_steps": args.accumulation_steps,
+                # "uniform": args.uniform,
+                # "target_rnd_every": args.target_rnd_every,
+                "finetune_lr": args.finetune_lr,
+                "top_reward_exclude_ratio": args.top_reward_exclude_ratio,
+                "pow_reward": args.pow_reward,
+                "alpha_rtb": args.alpha_rtb,
+                "num_prior_epochs": args.num_prior_epochs,
+                "num_posterior_epochs": args.num_posterior_epochs,
+                "uniform": args.uniform,
+                # "sample_freq": args.sample_freq,
+                "gin_config_files": args.gin_config_files,
+                "version": args.version,
+                "cfg_scale": args.cfg_scale,
+                
+            }
             )
         print(f'Initialized wandb with run name {run_name}')
 
@@ -440,6 +423,7 @@ def redq_sac(
             ]
             
             prior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.prior_lr, betas=args.prior_adam_betas)
+            # prior_model_optimizer = torch.optim.Adam(prior_model.parameters(), lr=args.prior_lr)
             # scheduler for prior model
             if args.prior_lr_scheduler == 'linear':
                 print('using linear learning rate scheduler')
@@ -561,12 +545,12 @@ def redq_sac(
                     # add small noise to data
                     x_normalized += torch.randn_like(x_normalized) * 0.001
                     
-                    if args.algorithm == 'PGR':
+                    if args.algorithm == 'PGRrnd':
                         # normalize condition
-                        print('y before normalization: ', y)
+                        # print('y before normalization: ', y)
                         y = prior_model.cond_normalizer.normalize(y.to(device))
-                        print('y after normalization: ', y)
-                        pdb.set_trace()
+                        # print('y after normalization: ', y)
+                        # pdb.set_trace()
                         loss = prior_model.compute_loss(x_normalized, cond=y)
                     else:
                         loss = prior_model.compute_loss(x_normalized)
@@ -618,37 +602,34 @@ def redq_sac(
                                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype).to(device=device)
                 # TODO: check if AdamW is better
                 # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
-                posterior_model_optimizer = torch.optim.AdamW(posterior_model.parameters(), lr=args.finetune_lr, betas=args.rtb_adam_betas)
-                
-                # prior_model_optimizer = torch.optim.AdamW(prior_model.parameters(), lr=args.prior_lr)
-                # no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
-                # optimizer_grouped_parameters = [
-                #         {
-                #             'params': [p for n, p in posterior_model.named_parameters() if not any(nd in n for nd in no_decay)],
-                #             'weight_decay': 0.,
-                #         },
-                #         {
-                #             'params': [p for n, p in posterior_model.named_parameters() if any(nd in n for nd in no_decay)],
-                #             'weight_decay': 0.0,
-                #         },
-                #     ]
-                # posterior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.finetune_lr, betas=args.rtb_adam_betas)
-                # # scheduler for posterior model
-                # if args.rtb_lr_scheduler == 'linear':
-                #     print('using linear learning rate scheduler')
-                #     posterior_model_lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                #         posterior_model_optimizer,
-                #         lambda step: max(0, 1 - step / args.num_posterior_epochs)
-                #     )
-                # elif args.rtb_lr_scheduler == 'cosine':
-                #     print('using cosine learning rate scheduler')
-                #     posterior_model_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                #         posterior_model_optimizer,
-                #         # 원래는 100,000 steps
-                #         args.num_posterior_epochs
-                #     )
-                # else:
-                #     posterior_model_lr_scheduler = None
+                no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
+                optimizer_grouped_parameters = [
+                        {
+                            'params': [p for n, p in posterior_model.named_parameters() if not any(nd in n for nd in no_decay)],
+                            'weight_decay': 0.,
+                        },
+                        {
+                            'params': [p for n, p in posterior_model.named_parameters() if any(nd in n for nd in no_decay)],
+                            'weight_decay': 0.0,
+                        },
+                    ]
+                posterior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.finetune_lr, betas=args.rtb_adam_betas)
+                # scheduler for posterior model
+                if args.rtb_lr_scheduler == 'linear':
+                    print('using linear learning rate scheduler')
+                    posterior_model_lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                        posterior_model_optimizer,
+                        lambda step: max(0, 1 - step / args.num_posterior_epochs)
+                    )
+                elif args.rtb_lr_scheduler == 'cosine':
+                    print('using cosine learning rate scheduler')
+                    posterior_model_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        posterior_model_optimizer,
+                        # 원래는 100,000 steps
+                        args.num_posterior_epochs
+                    )
+                else:
+                    posterior_model_lr_scheduler = None
                 
                 # define weights
                 # unnormalized data
@@ -709,11 +690,9 @@ def redq_sac(
                         
                         posterior_model_optimizer.zero_grad()
                         loss.backward()
-                        # Gradient clipping to prevent gradient explosion
-                        # torch.nn.utils.clip_grad_norm_(posterior_model.qflow.parameters(), max_norm=1.0)
-                        # if hasattr(posterior_model, 'logZ') and posterior_model.logZ.requires_grad:
-                        #     torch.nn.utils.clip_grad_norm_([posterior_model.logZ], max_norm=1.0)
                         posterior_model_optimizer.step()                
+                        if posterior_model_lr_scheduler is not None:
+                            posterior_model_lr_scheduler.step()
                         print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss.item():.9f}')
                         
                         # Add data to wandb table
@@ -1254,7 +1233,7 @@ if __name__ == '__main__':
     parser.add_argument('--backprop_epochs', type=int, default=10)
     parser.add_argument('--backprop_iters', type=int, default=10)
     parser.add_argument('--reward_coef', type=float, default=1.0)
-    parser.add_argument('--ft_batch_size', type=int, default=1024)
+    parser.add_argument('--ft_batch_size', type=int, default=256)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--kl_weight', type=float, default=10.0)
@@ -1291,7 +1270,7 @@ if __name__ == '__main__':
     parser.add_argument('--local_search', action='store_true', default=False)
     parser.add_argument('--local_search_epochs', type=int, default=10)
     
-    parser.add_argument('--train_batch_size', type=int, default=256)
+    parser.add_argument('--train_batch_size', type=int, default=512)
     parser.add_argument('--num_samples', type=int, default=1000000)
     parser.add_argument('--sample_batch_size', type=int, default=100000)
     parser.add_argument('--prior_lr_scheduler', type=str, default='cosine')
@@ -1299,7 +1278,7 @@ if __name__ == '__main__':
     parser.add_argument('--prior_adam_betas', type=tuple, default=(0.9, 0.99))
     parser.add_argument('--rtb_adam_betas', type=tuple, default=(0.9, 0.99))
     
-    parser.add_argument('--prior_lr', type=float, default=1e-3)
+    parser.add_argument('--prior_lr', type=float, default=3e-4)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--alpha_rtb', type=float, default=1e-5)
     parser.add_argument('--cond_top_frac', type=float, default=0.25)
