@@ -398,29 +398,6 @@ class DiffusionModel(nn.Module):
                         ) + torch.sqrt(self.beta_t[i]) * torch.randn_like(x, dtype=self.dtype, device=device)
                     t += dt
                     
-            # Final correction: ensure the sample matches the training distribution
-                # At t=0, we should predict x_0 from x_1 without noise
-                # This ensures the marginal distribution is preserved
-                t_zero = torch.zeros((bs,), dtype=self.dtype, device=device)
-                if cond is not None and cfg_scale is not None:
-                    with torch.no_grad():
-                        epsilon_uncond_zero = self(x, t_zero, cond=None)
-                    if cond.dim() == 1:
-                        cond = cond.unsqueeze(-1)
-                    epsilon_cond_zero = self(x, t_zero, cond=cond)
-                    epsilon_zero = epsilon_uncond_zero + cfg_scale * (epsilon_cond_zero - epsilon_uncond_zero)
-                else:
-                    epsilon_zero = self(x, t_zero, cond=cond)
-                
-                # Predict clean x_0 from x_1: x_0 = (x_1 - sqrt(1 - alpha_bar_1) * epsilon) / sqrt(alpha_bar_1)
-                # Using index 0 which corresponds to t=1 (the last step before t=0)
-                if self.predict == "epsilon":
-                    # x_0 = (x_1 - sqrt(1 - alpha_bar_1) * epsilon) / sqrt(alpha_bar_1)
-                    x = (x - self.sqrtmab[0] * epsilon_zero) / (self.sqrtab[0] + 1e-8)
-                elif self.predict == "x0":
-                    # If predicting x0 directly, use the prediction
-                    x = epsilon_zero
-                    
             finally:
                 # Restore original training mode
                 if eval:

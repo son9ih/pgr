@@ -50,6 +50,8 @@ from collections import namedtuple
 from torch.utils.data import Dataset
 from synther.diffusion.norm import MinMaxNormalizer
 
+from ema_pytorch import EMA
+
 
 @gin.configurable
 def redq_sac(
@@ -176,7 +178,6 @@ def redq_sac(
                 # "sample_freq": args.sample_freq,
                 "gin_config_files": args.gin_config_files,
                 "version": args.version,
-                "cfg_scale": args.cfg_scale,
             })
         else:
 
@@ -234,7 +235,6 @@ def redq_sac(
                 # "sample_freq": args.sample_freq,
                 "gin_config_files": args.gin_config_files,
                 "version": args.version,
-                "cfg_scale": args.cfg_scale,
                 
             }
             )
@@ -405,8 +405,19 @@ def redq_sac(
             
             # define prior model and optimizer
             prior_model = DiffusionModel(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, inputs=inputs, skip_dims=skip_dims, disable_terminal_norm=model_terminals).to(dtype=dtype, device=device)
+            num_params = sum(p.numel() for p in prior_model.parameters() if p.requires_grad)
+            print(f'Number of trainable parameters in prior model: {num_params}.')
             prior_model.dtype=dtype
             prior_model.train()
+            
+            # define EMA model
+            # make a deep copy of prior_model
+            prior_ema = EMA(prior_model, beta=0.995, update_every=10)
+            
+            # move normalizer and cond_normalizer to device
+            prior_ema.ema_model.normalizer.to(device)
+            prior_ema.ema_model.cond_normalizer.to(device)
+            
             # prior_model_optimizer = torch.optim.Adam(prior_model.parameters(), lr=args.prior_lr)
             
             # prior_model_optimizer = torch.optim.AdamW(prior_model.parameters(), lr=args.prior_lr)
@@ -493,6 +504,8 @@ def redq_sac(
             # define data normalizer (x의 통계량 계산을 대체)
             # Now test_function_x uses the same format as update_normalizer, so they are consistent
             prior_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
+            prior_ema.ema_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
+            
             # y의 통계량 계산
             y_mean = test_function_y_tensor.mean().item()
             y_std = test_function_y_tensor.std().item()
@@ -523,6 +536,7 @@ def redq_sac(
             # unnecessary except for PGR
             cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac, square=args.square, pow_reward=args.pow_reward)
             prior_model.update_cond_normalizer(cond_distri, device=device)
+            prior_ema.ema_model.update_cond_normalizer(cond_distri, device=device)
             # round_num is not used in our settings
             # round_num = (t // retrain_diffusion_every) + 1
             
@@ -536,39 +550,91 @@ def redq_sac(
             for epoch in tqdm(range(num_prior_epochs), dynamic_ncols=True):
                 total_loss = 0.0
                 
-                # y is not used in prior model training
-                for x, y in data_loader:
-                    # x is already concatenated [obs, act, rew, next_obs] from test_function_x
-                    
-                    # normalize data
-                    x_normalized = prior_model.normalizer.normalize(x.to(device))
-                    # add small noise to data
-                    x_normalized += torch.randn_like(x_normalized) * 0.001
-                    
-                    if args.algorithm == 'PGRrnd':
-                        # normalize condition
-                        # print('y before normalization: ', y)
-                        y = prior_model.cond_normalizer.normalize(y.to(device))
-                        # print('y after normalization: ', y)
-                        # pdb.set_trace()
-                        loss = prior_model.compute_loss(x_normalized, cond=y)
-                    else:
-                        loss = prior_model.compute_loss(x_normalized)
-                    prior_model_optimizer.zero_grad()
-                    loss.backward()
-                    prior_model_optimizer.step()
-                    if prior_model_lr_scheduler is not None:
-                        prior_model_lr_scheduler.step()
-                    total_loss += loss.item()
-                print(f'Epoch: {epoch+1}/{num_prior_epochs} \tLoss: {total_loss:.7f}')
+                # iteration based training
+                b = cond_distri.sample_batch(args.train_batch_size)
+                obs = b['obs1']
+                next_obs = b['obs2']
+                actions = b['acts']
+                rewards = b['rews'][:, None]
+                done = b['done'][:, None]
+                cond_signal = b['irews'][:, None]
+
+                data = [obs, actions, rewards, next_obs]
+                if model_terminals:
+                    data.append(done)
+                data = np.concatenate(data, axis=1)
                 
-                # Add data to wandb table
-                if args.wandb:
-                    prior_log_table.add_data(
-                        cur_epoch,
-                        epoch + 1,
-                        f"{total_loss:.7f}"
-                    )
+                # move to cuda (옮기고 normalize하는 순서가 맞음)
+                data = torch.from_numpy(data).float().to(device)
+                cond_signal = torch.from_numpy(cond_signal).float().to(device)
+                
+                # normalize data
+                data = prior_model.normalizer.normalize(data)
+                cond_signal = prior_model.cond_normalizer.normalize(cond_signal)
+                
+                if args.synther:
+                    loss = prior_model.compute_loss(data, cond=None)
+                else:
+                    loss = prior_model.compute_loss(data, cond=cond_signal)
+                    
+                prior_model_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(prior_model.parameters(), 1.0)
+                prior_model_optimizer.step()
+                
+                # update learning rate scheduler
+                if prior_model_lr_scheduler is not None:
+                    prior_model_lr_scheduler.step()
+                    
+                # update EMA model
+                prior_ema.to(device)
+                prior_ema.update()
+                
+                total_loss += loss.item()
+                
+                
+                
+                
+                
+                # # Dibo style training
+                # # y is not used in prior model training
+                # for x, y in data_loader:
+                #     # x is already concatenated [obs, act, rew, next_obs] from test_function_x
+                    
+                #     # normalize data
+                #     x_normalized = prior_model.normalizer.normalize(x.to(device))
+                #     # add small noise to data
+                #     x_normalized += torch.randn_like(x_normalized) * 0.001
+                    
+                #     if args.algorithm == 'PGRrnd':
+                #         # normalize condition
+                #         # print('y before normalization: ', y)
+                #         y = prior_model.cond_normalizer.normalize(y.to(device))
+                #         # print('y after normalization: ', y)
+                #         # pdb.set_trace()
+                #         loss = prior_model.compute_loss(x_normalized, cond=y)
+                #     else:
+                #         loss = prior_model.compute_loss(x_normalized)
+                #     prior_model_optimizer.zero_grad()
+                #     loss.backward()
+                    
+                #     torch.nn.utils.clip_grad_norm_(prior_model.parameters(), 1.0)
+                #     prior_model_optimizer.step()
+                #     if prior_model_lr_scheduler is not None:
+                #         prior_model_lr_scheduler.step()
+                #     total_loss += loss.item()
+                    
+                    
+                if epoch % 1000 == 0:
+                    print(f'[{epoch}/{num_prior_epochs}] loss: {total_loss:.4f}')
+                
+                    # Add data to wandb table
+                    if args.wandb:
+                        prior_log_table.add_data(
+                            cur_epoch,
+                            epoch + 1,
+                            f"{total_loss:.7f}"
+                        )
             
             # Log table at the end of prior training (with epoch-specific key to avoid overwriting)
             if args.wandb:
@@ -737,14 +803,20 @@ def redq_sac(
                     posterior_model.eval()
                     X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
                 elif args.algorithm == 'PGRrnd':
-                    prior_model.eval()
+                    # prior_model.eval()
+                    # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
+                    # # pdb.set_trace()
+                    # cond = prior_model.cond_normalizer.normalize(cond)
+                    # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale)
+                    prior_ema.ema_model.eval()
                     cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
-                    # pdb.set_trace()
-                    cond = prior_model.cond_normalizer.normalize(cond)
-                    X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=args.cfg_scale)
+                    cond = prior_ema.ema_model.cond_normalizer.normalize(cond)
+                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale)
                 elif args.algorithm == 'SER':
-                    prior_model.eval()
-                    X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
+                    # prior_model.eval()
+                    # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
+                    prior_ema.ema_model.eval()
+                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
                 else:
                     raise ValueError(f'Invalid algorithm: {args.algorithm}')
                 
@@ -1282,7 +1354,7 @@ if __name__ == '__main__':
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--alpha_rtb', type=float, default=1e-5)
     parser.add_argument('--cond_top_frac', type=float, default=0.25)
-    parser.add_argument('--cfg_scale', type=float, default=2.0)
+    # parser.add_argument('--cfg_scale', type=float, default=2.0)
     
     parser.add_argument('--version', type=str, default='DDPM')
     
