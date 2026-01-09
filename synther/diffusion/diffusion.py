@@ -397,12 +397,116 @@ class DiffusionModel(nn.Module):
                             + ((1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * self.sqrtab[i] * epsilon
                         ) + torch.sqrt(self.beta_t[i]) * torch.randn_like(x, dtype=self.dtype, device=device)
                     t += dt
+                    
+            # Final correction: ensure the sample matches the training distribution
+                # At t=0, we should predict x_0 from x_1 without noise
+                # This ensures the marginal distribution is preserved
+                t_zero = torch.zeros((bs,), dtype=self.dtype, device=device)
+                if cond is not None and cfg_scale is not None:
+                    with torch.no_grad():
+                        epsilon_uncond_zero = self(x, t_zero, cond=None)
+                    if cond.dim() == 1:
+                        cond = cond.unsqueeze(-1)
+                    epsilon_cond_zero = self(x, t_zero, cond=cond)
+                    epsilon_zero = epsilon_uncond_zero + cfg_scale * (epsilon_cond_zero - epsilon_uncond_zero)
+                else:
+                    epsilon_zero = self(x, t_zero, cond=cond)
+                
+                # Predict clean x_0 from x_1: x_0 = (x_1 - sqrt(1 - alpha_bar_1) * epsilon) / sqrt(alpha_bar_1)
+                # Using index 0 which corresponds to t=1 (the last step before t=0)
+                if self.predict == "epsilon":
+                    # x_0 = (x_1 - sqrt(1 - alpha_bar_1) * epsilon) / sqrt(alpha_bar_1)
+                    x = (x - self.sqrtmab[0] * epsilon_zero) / (self.sqrtab[0] + 1e-8)
+                elif self.predict == "x0":
+                    # If predicting x0 directly, use the prediction
+                    x = epsilon_zero
+                    
             finally:
                 # Restore original training mode
                 if eval:
                     self.train(was_training)
             
         return x
+    
+    
+    
+    # def sample(self, bs, device, cond=None, cfg_scale=None, eval=False):
+    #     with torch.no_grad():
+    #         # 초기 가우시안 노이즈
+    #         x = torch.randn(bs, self.x_dim, dtype=self.dtype, device=device)
+    #         t_val = torch.zeros((bs,), dtype=self.dtype, device=device)
+    #         dt = 1 / self.diffusion_steps
+
+    #         # 훈련 상태 저장 및 평가 모드 전환
+    #         was_training = self.training
+    #         if eval:
+    #             self.eval()
+
+    #         try:
+    #             for i in range(self.diffusion_steps):
+    #                 # 현재 타임스텝 텐서 생성 (i)
+    #                 t_curr = torch.full((bs,), i / self.diffusion_steps, dtype=self.dtype, device=device)
+    #                 # 다음 타임스텝 텐서 (i+1) - 교정용
+    #                 t_next = torch.full((bs,), (i + 1) / self.diffusion_steps, dtype=self.dtype, device=device)
+
+    #                 # --- [Step 1: Predictor] 현재 위치에서 기울기 f(x, t) 계산 ---
+    #                 # CFG가 적용된 에플실론 계산 (헬퍼 함수 호출)
+    #                 eps_curr = self._get_cfg_epsilon(x, t_curr, cond, cfg_scale)
+                    
+    #                 # DDPM의 결정론적 업데이트 방향 (Deterministic Velocity)
+    #                 # 수식: x_next = 1/sqrt(a) * (x - (1-a)/sqrt(1-ab)*eps)
+    #                 # 여기서 '속도' 성분만 추출합니다.
+    #                 v_curr = self._get_velocity(x, eps_curr, i)
+
+    #                 # --- [Step 2: Corrector] 2차 교정을 위한 예측 지점 계산 ---
+    #                 # Euler step으로 임시 x_next 계산
+    #                 x_prime = x + v_curr * dt
+                    
+    #                 # --- [Step 3: Second-order Correction] ---
+    #                 if i < self.diffusion_steps - 1:
+    #                     # 예측된 x_prime 지점에서의 기울기 계산
+    #                     eps_next = self._get_cfg_epsilon(x_prime, t_next, cond, cfg_scale)
+    #                     v_next = self._get_velocity(x_prime, eps_next, i + 1)
+                        
+    #                     # 현재 기울기와 미래 기울기의 평균 사용 (Heun's method)
+    #                     # 여기에 SDE의 확률적 항(노이즈)을 더해줍니다.
+    #                     noise = torch.sqrt(self.beta_t[i]) * torch.randn_like(x)
+    #                     x = x + 0.5 * (v_curr + v_next) * dt + noise
+    #                 else:
+    #                     # 마지막 스텝은 1차 예측값으로 처리
+    #                     noise = torch.sqrt(self.beta_t[i]) * torch.randn_like(x)
+    #                     x = x_prime + noise
+
+    #         finally:
+    #             if eval:
+    #                 self.train(was_training)
+
+    #         return x
+
+    def _get_cfg_epsilon(self, x, t, cond, cfg_scale):
+        """Classifier-Free Guidance를 적용한 에플실론 계산"""
+        if cond is not None and cfg_scale is not None:
+            if cond.dim() == 1:
+                cond = cond.unsqueeze(-1)
+            eps_uncond = self(x, t, cond=None)
+            eps_cond = self(x, t, cond=cond)
+            return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+        else:
+            return self(x, t, cond=cond)
+
+    def _get_velocity(self, x, epsilon, i):
+        """DDPM 스케줄 변수를 사용하여 dx/dt (v) 유도"""
+        if self.predict == "epsilon":
+            # x_next = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon)
+            # v = (x_next - x) / dt  => 여기서 dt는 1/steps 이므로 * self.diffusion_steps
+            target_x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon)
+            return (target_x - x) * self.diffusion_steps
+        elif self.predict == "x0":
+            target_x = (1 / torch.sqrt(self.alpha_t[i])) * (
+                (1 - (1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * x
+                + ((1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * self.sqrtab[i] * epsilon
+            )
+            return (target_x - x) * self.diffusion_steps
 
     # code for training prior or on-policy posterior training
     def compute_loss(self, x, cond=None):
