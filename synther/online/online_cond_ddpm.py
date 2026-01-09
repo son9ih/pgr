@@ -319,6 +319,11 @@ def redq_sac(
                               utd_ratio, num_Q, num_min, q_target_mode,
                               policy_update_delay,
                               args.rnd)
+    
+    # Enable intrinsic reward normalization for PGRrnd
+    if args.algorithm == 'PGRrnd':
+        agent.set_normalize_intrinsic_reward(True)
+        print('Enabled intrinsic reward normalization for PGRrnd')
 
     # pbe for state entropy evaluation
     # if args.state_ent:
@@ -360,6 +365,15 @@ def redq_sac(
 
         # give new data to replay buffer
         agent.store_data(o, a, r, o2, d)
+        
+        # Accumulate intrinsic reward during episode (for PGRrnd normalization)
+        if args.algorithm == 'PGRrnd' and agent.normalize_intrinsic_reward:
+            # Compute and accumulate intrinsic reward for this step
+            o2_tensor = torch.FloatTensor(o2).unsqueeze(0).to(device)
+            agent.pred_net.eval()
+            _ = agent.compute_intrinsic_reward(o2_tensor, accumulate=True)
+            agent.pred_net.train()
+        
         # let agent update
         agent.train(logger)
         # set obs to next obs
@@ -382,6 +396,10 @@ def redq_sac(
 
         # if d or (ep_len == max_ep_len):
         if (ep_len == max_ep_len):
+            # Update discounted intrinsic return statistics at end of episode (for PGRrnd)
+            if args.algorithm == 'PGRrnd' and agent.normalize_intrinsic_reward:
+                agent.update_discounted_return_stats(gamma=gamma)
+            
             # store episode return and length to logger
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             # reset environment
@@ -499,7 +517,7 @@ def redq_sac(
                         agent.cond_net.train()
                     else:
                         # PGRrnd
-                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
+                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
                     batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
                     all_novelty_list.append(batch_novelty)
                 test_function_y = np.concatenate(all_novelty_list)    
@@ -952,11 +970,11 @@ def redq_sac(
                 real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
                 diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
-                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()
-                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()
+                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, square=args.square, pow_reward=args.pow_reward, accumulate=False).cpu().numpy().squeeze()
+                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, square=args.square, pow_reward=args.pow_reward, accumulate=False).cpu().numpy().squeeze()
                 # Combined 10k observations and novelty
                 combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
-                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()     
+                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, square=args.square, pow_reward=args.pow_reward, accumulate=False).cpu().numpy().squeeze()     
 
 
             cur_epoch = t // steps_per_epoch
@@ -1075,7 +1093,7 @@ def redq_sac(
                         #     batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
                         # else:
                         
-                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
+                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward, accumulate=False)
                         
                         # # Clip novelty values to topk_threshold if available
                         # if topk_threshold is not None:

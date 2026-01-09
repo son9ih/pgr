@@ -94,3 +94,39 @@ class RMS(object):
         self.n += bs
 
         return self.M, self.S
+
+
+class RunningMeanStd(object):
+    """Running mean and std for numpy arrays (used for discounted intrinsic return normalization)"""
+    def __init__(self, epsilon=1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Update running statistics from batch moments using parallel variance algorithm"""
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta ** 2 * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+        
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+    def update(self, x):
+        """Update statistics from a batch of values"""
+        if isinstance(x, np.ndarray):
+            batch_mean = np.mean(x)
+            batch_var = np.var(x)
+            batch_count = len(x)
+        else:
+            # Handle scalar
+            batch_mean = float(x)
+            batch_var = 0.0
+            batch_count = 1
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+        return batch_mean

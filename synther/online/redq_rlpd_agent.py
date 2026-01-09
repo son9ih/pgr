@@ -4,6 +4,7 @@ from redq.algos.core import (ReplayBuffer,
                              soft_update_model1_with_model2)
 from redq.algos.redq_sac import REDQSACAgent
 from synther.online.conditional_nets import Curiosity, Predictor
+from synther.online.utils import RunningMeanStd
 from torch import Tensor
 from tqdm import trange
 
@@ -39,6 +40,14 @@ class REDQRLPDCondAgent(REDQSACAgent):
         self.pred_optimizer = torch.optim.Adam(self.pred_net.parameters(), lr=1e-4)
         
         self.topk_threshold = None
+        
+        # For RND intrinsic reward normalization (PGRrnd)
+        # Track discounted intrinsic return variance for normalization
+        self.discounted_return_rms = RunningMeanStd()
+        # Accumulate intrinsic rewards during episode
+        self.episode_intrinsic_rewards = []
+        # Flag to enable normalization (set to True for PGRrnd)
+        self.normalize_intrinsic_reward = False
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -57,7 +66,7 @@ class REDQRLPDCondAgent(REDQSACAgent):
         return action
     
     # get novelty score based on random network distillation
-    def compute_intrinsic_reward(self, next_obs, square=True, pow_reward=1.0):
+    def compute_intrinsic_reward(self, next_obs, accumulate=False):
         # if not square: 
         #     # 어짜피 이때는 weight 계산용, evaluation 용으로만 쓸꺼니까, temperature 조절 용도
         #     with torch.no_grad():
@@ -76,6 +85,22 @@ class REDQRLPDCondAgent(REDQSACAgent):
         fix_next_feature = fix_next_feature.detach()
         # intrinsic_reward = ((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0).pow(pow_reward)
         intrinsic_reward = ((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0)
+        
+        # Accumulate original (unnormalized) intrinsic rewards during episode (for discounted return calculation)
+        # IMPORTANT: We must accumulate the original reward BEFORE normalization
+        if accumulate and self.normalize_intrinsic_reward:
+            # Store original (unnormalized) reward as numpy for accumulation
+            intrinsic_reward_original_np = intrinsic_reward.detach().cpu().numpy()
+            if len(intrinsic_reward_original_np.shape) == 0:
+                intrinsic_reward_original_np = np.array([intrinsic_reward_original_np])
+            self.episode_intrinsic_rewards.extend(intrinsic_reward_original_np.tolist())
+        
+        # Normalize by discounted return std if enabled (PGRrnd)
+        # This normalization is only for the returned reward, not for accumulation
+        if self.normalize_intrinsic_reward and self.discounted_return_rms.count > 1.0:
+            # Normalize by std (not mean-subtracted, just scale normalization)
+            std = np.sqrt(self.discounted_return_rms.var + 1e-8)
+            intrinsic_reward = intrinsic_reward / std
                 
         return intrinsic_reward
     
@@ -217,9 +242,11 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
     def train_pred_net(self, batch_size, mask=True, update_proportion=0.25):
         if self.pred_optimizer is not None:
+            
             _, obs_next_tensor, _, _, _ = self.sample_real_data_recent(batch_size=batch_size)
             self.pred_optimizer.zero_grad()
-            pred_loss = self.compute_intrinsic_reward(obs_next_tensor) # .mean()
+            # Don't accumulate during training
+            pred_loss = self.compute_intrinsic_reward(obs_next_tensor, accumulate=False) # .mean()
             if mask:
                 mask_tensor = torch.rand(len(pred_loss)).to(self.device)
                 mask_tensor = (mask_tensor < update_proportion).type(torch.FloatTensor).to(self.device)
@@ -232,6 +259,30 @@ class REDQRLPDCondAgent(REDQSACAgent):
         else:
             pred_loss = Tensor([0])
         return pred_loss.detach().cpu().numpy()
-            
+    
+    def update_discounted_return_stats(self, gamma=0.99):
+        """
+        Update discounted intrinsic return statistics at end of episode.
+        This computes the discounted return from accumulated intrinsic rewards and updates RMS.
+        """
+        if not self.normalize_intrinsic_reward or len(self.episode_intrinsic_rewards) == 0:
+            self.episode_intrinsic_rewards = []
+            return
+        
+        # Compute discounted return from accumulated intrinsic rewards
+        intrinsic_rewards = np.array(self.episode_intrinsic_rewards)
+        discounted_return = 0.0
+        for t in range(len(intrinsic_rewards)):
+            discounted_return += (gamma ** t) * intrinsic_rewards[t]
+        
+        # Update RMS with discounted return (single value per episode)
+        self.discounted_return_rms.update(discounted_return)
+        
+        # Reset episode accumulation
+        self.episode_intrinsic_rewards = []
+    
+    def set_normalize_intrinsic_reward(self, enable):
+        """Enable/disable intrinsic reward normalization (for PGRrnd)"""
+        self.normalize_intrinsic_reward = enable
               
 
