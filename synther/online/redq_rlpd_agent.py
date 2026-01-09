@@ -4,7 +4,7 @@ from redq.algos.core import (ReplayBuffer,
                              soft_update_model1_with_model2)
 from redq.algos.redq_sac import REDQSACAgent
 from synther.online.conditional_nets import Curiosity, Predictor
-from synther.online.utils import RunningMeanStd
+from synther.online.utils import RunningMeanStd, RMS
 from torch import Tensor
 from tqdm import trange
 
@@ -48,6 +48,10 @@ class REDQRLPDCondAgent(REDQSACAgent):
         self.episode_intrinsic_rewards = []
         # Flag to enable normalization (set to True for PGRrnd)
         self.normalize_intrinsic_reward = False
+        
+        # For next_obs normalization (used in pred_net training and reward computation)
+        # Track next_obs statistics from original buffer (not diffusion buffer)
+        self.next_obs_rms = RMS(device=self.device, epsilon=1e-4, shape=(self.obs_dim,))
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -67,21 +71,28 @@ class REDQRLPDCondAgent(REDQSACAgent):
     
     # get novelty score based on random network distillation
     def compute_intrinsic_reward(self, next_obs, accumulate=False):
+        # Normalize next_obs before computing intrinsic reward
+        # Use statistics from original buffer (not diffusion buffer)
+        if self.next_obs_rms.n > 1.0:
+            next_obs_normalized = self.next_obs_rms.normalize(next_obs)
+        else:
+            next_obs_normalized = next_obs
+        
         # if not square: 
         #     # 어짜피 이때는 weight 계산용, evaluation 용으로만 쓸꺼니까, temperature 조절 용도
         #     with torch.no_grad():
         #     # assert
-        #         pred_next_feature = self.pred_net(next_obs)
+        #         pred_next_feature = self.pred_net(next_obs_normalized)
         #         with torch.no_grad():
-        #             fix_next_feature = self.fix_net(next_obs)
+        #             fix_next_feature = self.fix_net(next_obs_normalized)
         #         fix_next_feature = fix_next_feature.detach()
         #         # square root of the original difference
         #         intrinsic_reward = torch.sqrt((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0).pow(pow_reward)
         #         # intrinsic_reward = (fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0
         # else:
-        pred_next_feature = self.pred_net(next_obs)
+        pred_next_feature = self.pred_net(next_obs_normalized)
         with torch.no_grad():
-            fix_next_feature = self.fix_net(next_obs)
+            fix_next_feature = self.fix_net(next_obs_normalized)
         fix_next_feature = fix_next_feature.detach()
         # intrinsic_reward = ((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0).pow(pow_reward)
         intrinsic_reward = ((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0)
@@ -107,10 +118,16 @@ class REDQRLPDCondAgent(REDQSACAgent):
     # compute intrinsic reward using temp_net as frozen predictor,
     # This is used to compute novelty as appropriate reward function for RTB
     def compute_intrinsic_reward_temp(self, next_obs):
+        # Normalize next_obs before computing intrinsic reward
+        if self.next_obs_rms.n > 1.0:
+            next_obs_normalized = self.next_obs_rms.normalize(next_obs)
+        else:
+            next_obs_normalized = next_obs
+        
         self.temp_net.eval()
-        pred_next_feature = self.temp_net(next_obs)
+        pred_next_feature = self.temp_net(next_obs_normalized)
         with torch.no_grad():
-            fix_next_feature = self.fix_net(next_obs)
+            fix_next_feature = self.fix_net(next_obs_normalized)
         fix_next_feature = fix_next_feature.detach()
         intrinsic_reward = (fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0
         
@@ -284,5 +301,21 @@ class REDQRLPDCondAgent(REDQSACAgent):
     def set_normalize_intrinsic_reward(self, enable):
         """Enable/disable intrinsic reward normalization (for PGRrnd)"""
         self.normalize_intrinsic_reward = enable
+    
+    def update_next_obs_stats(self):
+        """
+        Update next_obs statistics from original buffer (not diffusion buffer).
+        This should be called at the end of each epoch.
+        """
+        ptr_location = self.replay_buffer.ptr
+        if ptr_location == 0:
+            return
+        
+        # Get all next_obs from original buffer (not diffusion buffer)
+        next_obs_all = self.replay_buffer.obs2_buf[:ptr_location]
+        
+        # Convert to torch tensor and update RMS
+        next_obs_tensor = torch.FloatTensor(next_obs_all).to(self.device)
+        self.next_obs_rms(next_obs_tensor)
               
 

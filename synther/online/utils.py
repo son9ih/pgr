@@ -80,6 +80,7 @@ class RMS(object):
         self.M = torch.zeros(shape).to(device)
         self.S = torch.ones(shape).to(device)
         self.n = epsilon
+        self.device = device
 
     def __call__(self, x):
         bs = x.size(0)
@@ -94,6 +95,17 @@ class RMS(object):
         self.n += bs
 
         return self.M, self.S
+    
+    def normalize(self, x):
+        """
+        Normalize input tensor using running mean and std.
+        Formula: (x - mean) / std
+        """
+        if self.n <= 1.0:
+            # Not enough data, return as is
+            return x
+        std = torch.sqrt(self.S + 1e-8)
+        return (x - self.M) / std
 
 
 class RunningMeanStd(object):

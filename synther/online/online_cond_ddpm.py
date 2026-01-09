@@ -1216,6 +1216,10 @@ def redq_sac(
         if (t + 1) % steps_per_epoch == 0:
             epoch = t // steps_per_epoch
 
+            # Update next_obs statistics from original buffer (for input normalization)
+            # This uses statistics from previous epoch's data
+            agent.update_next_obs_stats()
+
             # Test the performance of the deterministic version of the agent.
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
 
