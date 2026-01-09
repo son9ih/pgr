@@ -58,23 +58,24 @@ class REDQRLPDCondAgent(REDQSACAgent):
     
     # get novelty score based on random network distillation
     def compute_intrinsic_reward(self, next_obs, square=True, pow_reward=1.0):
-        if not square: 
-            # 어짜피 이때는 weight 계산용, evaluation 용으로만 쓸꺼니까, temperature 조절 용도
-            with torch.no_grad():
-            # assert
-                pred_next_feature = self.pred_net(next_obs)
-                with torch.no_grad():
-                    fix_next_feature = self.fix_net(next_obs)
-                fix_next_feature = fix_next_feature.detach()
-                # square root of the original difference
-                intrinsic_reward = torch.sqrt((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0).pow(pow_reward)
-                # intrinsic_reward = (fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0
-        else:
-            pred_next_feature = self.pred_net(next_obs)
-            with torch.no_grad():
-                fix_next_feature = self.fix_net(next_obs)
-            fix_next_feature = fix_next_feature.detach()
-            intrinsic_reward = ((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0).pow(pow_reward)
+        # if not square: 
+        #     # 어짜피 이때는 weight 계산용, evaluation 용으로만 쓸꺼니까, temperature 조절 용도
+        #     with torch.no_grad():
+        #     # assert
+        #         pred_next_feature = self.pred_net(next_obs)
+        #         with torch.no_grad():
+        #             fix_next_feature = self.fix_net(next_obs)
+        #         fix_next_feature = fix_next_feature.detach()
+        #         # square root of the original difference
+        #         intrinsic_reward = torch.sqrt((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0).pow(pow_reward)
+        #         # intrinsic_reward = (fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0
+        # else:
+        pred_next_feature = self.pred_net(next_obs)
+        with torch.no_grad():
+            fix_next_feature = self.fix_net(next_obs)
+        fix_next_feature = fix_next_feature.detach()
+        # intrinsic_reward = ((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0).pow(pow_reward)
+        intrinsic_reward = ((fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0)
                 
         return intrinsic_reward
     
