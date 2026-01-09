@@ -16,7 +16,7 @@ from redq.algos.core import mbpo_epoches, test_agent
 from redq.utils.bias_utils import log_bias_evaluation
 from redq.utils.logx import EpochLogger
 from redq.utils.run_utils import setup_logger_kwargs
-from synther.diffusion.elucidated_diffusion import REDQCondTrainer, CondDistri_RND
+from synther.diffusion.elucidated_diffusion import REDQCondTrainer, CondDistri_RND, CondDistri
 from synther.diffusion.diffusion_generator import CondDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model, split_diffusion_samples
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
@@ -51,6 +51,8 @@ from torch.utils.data import Dataset
 from synther.diffusion.norm import MinMaxNormalizer
 
 from ema_pytorch import EMA
+
+
 
 
 @gin.configurable
@@ -473,13 +475,31 @@ def redq_sac(
             next_obs_start = obs_dim + act_dim + 1
             next_obs_end = next_obs_start + obs_dim
             all_next_obs = test_function_x[:, next_obs_start:next_obs_end]
+            all_actions = test_function_x[:, obs_dim:obs_dim+act_dim]
+            all_rewards = test_function_x[:, obs_dim+act_dim:obs_dim+act_dim+1]
+            all_done = test_function_x[:, obs_dim+act_dim+1:obs_dim+act_dim+2]
+            all_obs = test_function_x[:, :obs_dim]
             
             # compute test function y for all data in replay buffer
             batch_size_novelty = 4096
             with torch.no_grad():
                 for i in range(0, ptr_location, batch_size_novelty):
                     batch_next_obs = all_next_obs[i:i+batch_size_novelty].to(device)
-                    batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
+                    # set curiosity as a measure of novelty
+                    if args.algorithm == 'PGR':
+                        agent.cond_net.eval()
+                        batch_next_obs = batch_next_obs.cpu().numpy()
+                        batch_actions = all_actions[i:i+batch_size_novelty].cpu().numpy()
+                        batch_rewards = all_rewards[i:i+batch_size_novelty].cpu().numpy()
+                        batch_done = all_done[i:i+batch_size_novelty].cpu().numpy()
+                        batch_obs = all_obs[i:i+batch_size_novelty].cpu().numpy()
+                        
+                        # TypeError: expected np.ndarray (got Tensor)
+                        batch_novelty_tensor = agent.cond_net.compute_reward(batch_obs, batch_next_obs, batch_actions, batch_rewards, batch_done).squeeze().to(device)
+                        agent.cond_net.train()
+                    else:
+                        # PGRrnd
+                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
                     batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
                     all_novelty_list.append(batch_novelty)
                 test_function_y = np.concatenate(all_novelty_list)    
@@ -513,15 +533,15 @@ def redq_sac(
             print(f'Std of test function y: {y_std}')
             
             # define weights for weighted or uniform sampling 
-            if args.uniform:
+            # if args.uniform:
                 # For uniform sampling, use shuffle=True instead of WeightedRandomSampler
-                data_loader = DataLoader(test_function_dataset, batch_size=args.train_batch_size, shuffle=True)
-            else:
-                # For weighted sampling, use WeightedRandomSampler
-                # use torch.exp? or not?
-                weights = torch.exp((test_function_y_tensor.squeeze() - y_mean) / (y_std + 1e-7))
-                sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-                data_loader = DataLoader(test_function_dataset, batch_size=args.train_batch_size, sampler=sampler)
+            # data_loader = DataLoader(test_function_dataset, batch_size=args.train_batch_size, shuffle=True)
+            # else:
+            #     # For weighted sampling, use WeightedRandomSampler
+            #     # use torch.exp? or not?
+            #     weights = torch.exp((test_function_y_tensor.squeeze() - y_mean) / (y_std + 1e-7))
+            #     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            #     data_loader = DataLoader(test_function_dataset, batch_size=args.train_batch_size, sampler=sampler)
             
             
             # define hyperparameters for training
@@ -534,7 +554,10 @@ def redq_sac(
             agent.pred_net.eval()
             agent.fix_net.eval()
             # unnecessary except for PGR
-            cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac, square=args.square, pow_reward=args.pow_reward)
+            if args.algorithm == 'PGR':
+                cond_distri = CondDistri(agent.cond_net, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
+            else:
+                cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac, square=args.square, pow_reward=args.pow_reward)
             prior_model.update_cond_normalizer(cond_distri, device=device)
             prior_ema.ema_model.update_cond_normalizer(cond_distri, device=device)
             # round_num is not used in our settings
@@ -802,7 +825,7 @@ def redq_sac(
                 if args.algorithm == 'Ours':
                     posterior_model.eval()
                     X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
-                elif args.algorithm == 'PGRrnd':
+                elif args.algorithm == 'PGRrnd' or args.algorithm == 'PGR':
                     # prior_model.eval()
                     # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
                     # # pdb.set_trace()
