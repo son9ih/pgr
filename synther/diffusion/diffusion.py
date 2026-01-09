@@ -61,8 +61,10 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.linear = nn.Linear(dim_in, dim_out, bias=True)
         if layer_norm:
+            # when we use layer norm,
             self.ln = nn.LayerNorm(dim_in)
         else:
+            # current style
             self.ln = torch.nn.Identity()
         self.activation = getattr(F, activation)
 
@@ -198,9 +200,9 @@ class QFlowMLP(nn.Module):
             random_fourier_features: bool = True,
             learned_sinusoidal_dim: int = 16,
             # gin referenced activation: mish
-            # activation: str = "mish",
-            activation: str = "relu",
-            layer_norm: bool = False,
+            activation: str = "mish",
+            # activation: str = "gelu",
+            layer_norm: bool = True,
             cond_dim: int = None,
             cfg_dropout: float = 0.25,
     ):
@@ -215,7 +217,8 @@ class QFlowMLP(nn.Module):
             # activation="gelu",
             activation=activation,
             # in pgr, originally false
-            layer_norm=True,
+            # layer_norm=True,
+            layer_norm=layer_norm,
         )
         assert cond_dim is not None, "Conditional denoiser constructor requires cond_dim"
 
@@ -303,7 +306,6 @@ class DiffusionModel(nn.Module):
             cond_dim = 1
         # this initialization is carefully designed w.r.t. PGR
         self.policy = QFlowMLP(d_in=x_dim, dim_t=256, mlp_width=hidden_dim, num_layers=6, cond_dim=cond_dim, cfg_dropout=cfg_dropout)
-        self.diffusion_steps = diffusion_steps
         self.predict = predict
         if self.schedule == "linear":
             beta1 = 0.02
@@ -358,50 +360,38 @@ class DiffusionModel(nn.Module):
             t = torch.zeros((bs,), dtype=self.dtype, device=device)
             dt = 1 / self.diffusion_steps
             
-            # Set model to eval mode if specified (disables dropout)
-            was_training = self.training
-            if eval:
-                self.eval()
-            
-            try:
-                for i in range(self.diffusion_steps):
-                    # Classifier-free guidance: combine unconditional and conditional scores
-                    if cond is not None and cfg_scale is not None:
-                        # print("Now conditioned generation")
-                        # Compute unconditional score (cond=None)
-                        with torch.no_grad():
-                            epsilon_uncond = self(x, t, cond=None)
+           
+            for i in range(self.diffusion_steps):
+                # Classifier-free guidance: combine unconditional and conditional scores
+                if cond is not None and cfg_scale is not None:
+                    # print("Now conditioned generation")
+                    # Compute unconditional score (cond=None)
+                    epsilon_uncond = self(x, t, cond=None)
                         
-                        # Compute conditional score
-                        if cond.dim() == 1:
-                            cond = cond.unsqueeze(-1)
-                        epsilon_cond = self(x, t, cond=cond)
-                        # pdb.set_trace()
-                        
-                        # Combine scores using classifier-free guidance formula:
-                        # epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
-                        # This can be rewritten as:
-                        # epsilon = (1 + cfg_scale) * epsilon_cond - cfg_scale * epsilon_uncond
-                        epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
-                    else:
-                        # No guidance: use conditional or unconditional score directly
-                        epsilon = self(x, t, cond=cond)
+                    cond_input = cond.unsqueeze(-1) if cond.dim() == 1 else cond
+                    epsilon_cond = self(x, t, cond=cond_input)
+                    # pdb.set_trace()
                     
-                    if self.predict == "epsilon":
-                        x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon) + torch.sqrt(
-                            self.beta_t[i]
-                        ) * torch.randn_like(x, dtype=self.dtype, device=device)
-                    elif self.predict == "x0":
-                        x = (1 / torch.sqrt(self.alpha_t[i])) * (
-                            (1 - (1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * x
-                            + ((1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * self.sqrtab[i] * epsilon
-                        ) + torch.sqrt(self.beta_t[i]) * torch.randn_like(x, dtype=self.dtype, device=device)
-                    t += dt
-                    
-            finally:
-                # Restore original training mode
-                if eval:
-                    self.train(was_training)
+                    # Combine scores using classifier-free guidance formula:
+                    # epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
+                    # This can be rewritten as:
+                    # epsilon = (1 + cfg_scale) * epsilon_cond - cfg_scale * epsilon_uncond
+                    epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
+                else:
+                    # No guidance: use conditional or unconditional score directly
+                    epsilon = self(x, t, cond=cond)
+                
+                if self.predict == "epsilon":
+                    x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon) + torch.sqrt(
+                        self.beta_t[i]
+                    ) * torch.randn_like(x, dtype=self.dtype, device=device)
+                elif self.predict == "x0":
+                    x = (1 / torch.sqrt(self.alpha_t[i])) * (
+                        (1 - (1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * x
+                        + ((1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * self.sqrtab[i] * epsilon
+                    ) + torch.sqrt(self.beta_t[i]) * torch.randn_like(x, dtype=self.dtype, device=device)
+                t += dt
+                
             
         return x
     

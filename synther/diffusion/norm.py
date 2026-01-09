@@ -34,8 +34,11 @@ class MinMaxNormalizer(BaseNormalizer):
     def reset(self, dataset: torch.Tensor, eps: float = 1e-5):
         self.min = dataset.min(dim=0).values
         self.max = dataset.max(dim=0).values + eps
-        print('Mins:', self.min)
-        print('Maxs:', self.max)
+        # write the value until 6th decimal place
+        min_str = ', '.join([f'{val:.6f}' for val in self.min.tolist()])
+        max_str = ', '.join([f'{val:.6f}' for val in self.max.tolist()])
+        print(f'Mins: [{min_str}]')
+        print(f'Maxs: [{max_str}]')
 
 
 class Normalizer(BaseNormalizer):
