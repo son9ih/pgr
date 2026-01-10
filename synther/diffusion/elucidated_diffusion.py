@@ -987,12 +987,10 @@ class CondDistri(object):
     
     
 class CondDistri_RND(object):
-    def __init__(self, agent, train_batch_size, buffer, top_frac, square=True, pow_reward=1.0):
+    def __init__(self, agent, train_batch_size, buffer, top_frac):
         self.top_frac = top_frac
         self.buffer = buffer
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.square = square
-        self.pow_reward = pow_reward
         # Iterate over buffer and generate the conditional generation signal
         self.irews_buf = np.zeros_like(buffer.rews_buf)
         # Use some large batch size

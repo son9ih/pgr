@@ -131,7 +131,7 @@ def redq_sac(
             wandb.init(
             project = f'{env_name}',
             group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_square{args.square}_pow_reward{args.pow_reward}_alpha_rtb{args.alpha_rtb}_num_prior_epochs{args.num_prior_epochs}_num_posterior_epochs{args.num_posterior_epochs}',
+            name = f' {run_name}_square{args.square}_pow_reward{args.pow_reward}_alpha_rtb{args.alpha_rtb}_num_prior_epochs{args.num_prior_epochs}_num_posterior_epochs{args.num_posterior_epochs}_NoV{args.novelty_measure}_IoP{args.inter_onpolicy}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -181,6 +181,8 @@ def redq_sac(
                 "gin_config_files": args.gin_config_files,
                 "version": args.version,
                 "diffusion_steps": args.diffusion_steps,
+                "novelty_measure": args.novelty_measure,
+                "inter_onpolicy": args.inter_onpolicy,
             })
         else:
 
@@ -239,6 +241,8 @@ def redq_sac(
                 "gin_config_files": args.gin_config_files,
                 "version": args.version,
                 "diffusion_steps": args.diffusion_steps,
+                "novelty_measure": args.novelty_measure,
+                "inter_onpolicy": args.inter_onpolicy,
             }
             )
         print(f'Initialized wandb with run name {run_name}')
@@ -527,19 +531,6 @@ def redq_sac(
             test_function_x_tensor = test_function_x
             test_function_y_tensor = torch.FloatTensor(test_function_y)
             
-            # Create a simple dataset class
-            class SimpleDataset(Dataset):
-                def __init__(self, x, y):
-                    self.x = x
-                    self.y = y
-                
-                def __len__(self):
-                    return len(self.x)
-                
-                def __getitem__(self, idx):
-                    return self.x[idx], self.y[idx]
-            test_function_dataset = SimpleDataset(test_function_x_tensor, test_function_y_tensor)
-            
             # define data normalizer (x의 통계량 계산을 대체)
             # Now test_function_x uses the same format as update_normalizer, so they are consistent
             prior_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
@@ -701,14 +692,33 @@ def redq_sac(
                 
                 
                 # define reward proxy 
-                proxy_model_ens = agent.compute_intrinsic_reward
+                # update basic onpolicy reward
+                agent.update_onpolicy_reward()
+                print(f'max_onpolicy_reward: {agent.max_onpolicy_reward}')
+                
+                # Choose different reward function to optimize for different algorithms
+                # For unity, each compute_intrinsic_reward and compute_reward should take the whole transition as input
+                # TODO
+                if args.novelty_measure == 'curiosity':
+                    proxy_model_ens = agent.cond_net.compute_reward
+                elif args.novelty_measure == 'rnd':
+                    proxy_model_ens = agent.compute_intrinsic_reward
+                elif args.novelty_measure == 'eco':
+                    # proxy_model_ens = agent.compute_eco_reward
+                    pass # TODO: implement eco reward
+                else:
+                    raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                 
                 # define posterior model and optimizer
                 # proxy_model_ens is not used in our settings, so replace it with agent.compute_intrinsic_reward()
                 # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
-                posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
-                                        square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype).to(device=device)
-                # TODO: check if AdamW is better
+                # TODO: requires an argument for onpolicy reward function in QFlow()
+                # add 1) onpolicy reward function, 2) args.novelty measure (curiosity, rnd, eco)
+                # TODO: We need to normalize the novelty, so that we can handle different scales of novelty measures with on-policy reward
+                # EMA: Instead of using original prior, we use EMA model
+                posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
+                                        square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
+                                        agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
                 # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
                 no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
                 optimizer_grouped_parameters = [
@@ -1404,6 +1414,9 @@ if __name__ == '__main__':
     
     parser.add_argument('--version', type=str, default='DDPM')
     
+    parser.add_argument('--novelty_measure', type=str, default='curiosity') # 'curiosity', 'rnd', 'eco'
+    parser.add_arguemnt('--inter_onpolicy', type=float, default=0.1)
+    
 
     args = parser.parse_args()
 
@@ -1430,11 +1443,13 @@ if __name__ == '__main__':
         args.synther = False
         args.rnd = False
         args.rtb = False
+        args.novelty_measure = 'curiosity'
     if args.algorithm == 'PGRrnd':
         args.disable_diffusion = False
         args.synther = False
         args.rnd = True
         args.rtb = False
+        args.novelty_measure = 'rnd'
     if args.algorithm == 'ft':
         args.disable_diffusion = False
         args.synther = True

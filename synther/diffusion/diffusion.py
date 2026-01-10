@@ -532,6 +532,9 @@ class QFlow(nn.Module):
         pow_reward=1.0,
         obs_dim=None,
         act_dim=None,
+        novelty_measure=None,
+        agent=None,
+        inter_onpolicy=0.1,
     ):
         super(QFlow, self).__init__()
         self.x_dim = x_dim
@@ -560,6 +563,15 @@ class QFlow(nn.Module):
         # Store dimensions for extracting next_obs from tensor
         self.obs_dim = obs_dim
         self.act_dim = act_dim
+        
+        # Store novelty measure
+        self.novelty_measure = novelty_measure
+        
+        # on-policyness measure
+        self.agent = agent
+        self.inter_onpolicy = inter_onpolicy
+        
+        self.cond_normalizer = bc_net.cond_normalizer
 
     def forward(self, x, t, cond=None):
         # problem: needs debugging
@@ -685,7 +697,7 @@ class QFlow(nn.Module):
             
         # Compute the log probability
         t = torch.zeros((x.shape[0],), device=device, dtype=self.dtype)
-        logr = self.posterior_log_reward(x, square=self.square, pow_reward=self.pow_reward)
+        logr = self.posterior_log_reward(x)
         logpf_pi = torch.zeros((x.shape[0],), device=device, dtype=self.dtype)
         for i in range(self.diffusion_steps - 1, -1, -1):
             pb_dist = torch.distributions.Normal(
@@ -821,12 +833,15 @@ class QFlow(nn.Module):
         ll_prior = torch.distributions.Normal(torch.tensor(0.0, dtype=dtype, device=latent.device), sigma_max).log_prob(latent).flatten(1).sum(1)
         return ll_prior + delta_ll
         
-    def posterior_log_reward(self, x, square=None, pow_reward=None):
+    def posterior_log_reward(self, x):
         # Handle both dict and tensor inputs
         if isinstance(x, dict):
+            # This will not be probably called
             # Dict input: extract next_obs_tensor
             next_obs = x['next_obs_tensor']
+            next_act = x['next_act_tensor']
         elif isinstance(x, torch.Tensor):
+            # This will probably be called
             # Tensor input: extract next_obs from concatenated tensor
             # x shape: [batch_size, obs_dim + act_dim + 1 + obs_dim]
             # next_obs starts at obs_dim + act_dim + 1
@@ -834,19 +849,44 @@ class QFlow(nn.Module):
                 next_obs_start = self.obs_dim + self.act_dim + 1
                 next_obs_end = next_obs_start + self.obs_dim
                 next_obs = x[:, next_obs_start:next_obs_end]
+                obs = x[:, :self.obs_dim]
+                act = x[:, self.obs_dim:self.obs_dim+self.act_dim]
             else:
                 raise ValueError("obs_dim and act_dim must be provided to QFlow when using tensor inputs")
         else:
             raise TypeError(f"x must be dict or torch.Tensor, got {type(x)}")
         
-        # Use instance defaults if not provided
-        if square is None:
-            square = self.square
-        if pow_reward is None:
-            pow_reward = self.pow_reward
-            
-        q_r = self.q_net(next_obs).squeeze()
+        # According to the measure of novelty, we use different code to compute q_r
+        # TODO
+        if self.novelty_measure == 'curiosity':
+            q_r = self.q_net(obs, next_obs, act, reward=None, done=None).squeeze()
+        elif self.novelty_measure == 'rnd':
+            q_r = self.agent.compute_intrinsic_reward(next_obs).squeeze()
+        elif self.novelty_measure == 'eco':
+            q_r = self.agent.compute_eco_reward(next_obs).squeeze()
+        else:
+            raise ValueError(f'Invalid novelty measure: {self.novelty_measure}')
+        
+        q_r = (self.cond_normalizer.normalize(q_r) + 1) / 2
+        print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
+        print('Here is diffusion.py')
+        
+        # combine novelty reward with on-policyness reward
+        if self.inter_onpolicy > 0:
+            with torch.no_grad():
+                # ranging from 0 to 1
+                on_policy_reward = self.agent.compute_onpolicy_reward(obs, act)
+                print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
+            q_r = q_r * (1 - self.inter_onpolicy) + self.inter_onpolicy * on_policy_reward
+        else:
+            q_r = q_r
+        # q_r = self.q_net(next_obs).squeeze()
         return q_r
+    
+    def combined_posterior_log_reward(self, x, alpha=0.1):
+        # alpha is the weight of the on-policyness reward
+        # TODO
+        return 0.0
 
     def compute_loss_with_sample(self, x, device):
         bs = x.shape[0]
@@ -859,7 +899,7 @@ class QFlow(nn.Module):
         # I think we need to log here
         # Also, we need to unnormalize x here
         x_unnormalized = self.bc_net.normalizer.unnormalize(x)
-        logr = self.posterior_log_reward(x_unnormalized, square=self.square, pow_reward=self.pow_reward).log()
+        logr = self.posterior_log_reward(x_unnormalized).log()
 
         for i in range(self.diffusion_steps - 1, -1, -1):
             pb_dist = torch.distributions.Normal(
@@ -897,7 +937,7 @@ class QFlow(nn.Module):
         # self.bc_net.normalizer is the prior normalizer
         x_unnormalized = self.bc_net.normalizer.unnormalize(x)
         # I think we need to log here
-        logr = self.posterior_log_reward(x_unnormalized, square=self.square, pow_reward=self.pow_reward)
+        logr = self.posterior_log_reward(x_unnormalized)
         # print(f'logr: {logr}')
         logr = logr.log()
         # pdb.set_trace()

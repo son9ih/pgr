@@ -256,8 +256,6 @@ class REDQRLPDCondAgent(REDQSACAgent):
             self.max_onpolicy_reward = max(self.total_onpolicy_reward)
         else:
             self.max_onpolicy_reward = 0.0
-        
-        return self.max_onpolicy_reward
 
     def train(self, logger):
         # Put conditional net in training mode
