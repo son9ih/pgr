@@ -845,7 +845,7 @@ class QFlow(nn.Module):
         if pow_reward is None:
             pow_reward = self.pow_reward
             
-        q_r = self.q_net(next_obs, square=square, pow_reward=pow_reward).squeeze()
+        q_r = self.q_net(next_obs).squeeze()
         return q_r
 
     def compute_loss_with_sample(self, x, device):

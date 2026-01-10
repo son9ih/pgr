@@ -1006,7 +1006,7 @@ class CondDistri_RND(object):
             with torch.no_grad():
                 next_obs = Tensor(next_obs).to(self.device)
                 # self.irews_buf[idxs] = agent.compute_intrinsic_reward(next_obs, square=args.square, pow_reward=args.pow_reward).squeeze().cpu().numpy()
-                self.irews_buf[idxs] = agent.compute_intrinsic_reward(next_obs, square=self.square, pow_reward=self.pow_reward).squeeze().cpu().numpy()
+                self.irews_buf[idxs] = agent.compute_intrinsic_reward(next_obs).squeeze().cpu().numpy()
         self.top_frac_indices = np.argsort(self.irews_buf, axis=0)[-int(top_frac * buffer.size):]
 
     def sample_batch(self, batch_size=32, idxs=None):

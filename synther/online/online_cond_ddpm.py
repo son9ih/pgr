@@ -180,6 +180,7 @@ def redq_sac(
                 # "sample_freq": args.sample_freq,
                 "gin_config_files": args.gin_config_files,
                 "version": args.version,
+                "diffusion_steps": args.diffusion_steps,
             })
         else:
 
@@ -237,7 +238,7 @@ def redq_sac(
                 # "sample_freq": args.sample_freq,
                 "gin_config_files": args.gin_config_files,
                 "version": args.version,
-                
+                "diffusion_steps": args.diffusion_steps,
             }
             )
         print(f'Initialized wandb with run name {run_name}')
@@ -575,7 +576,7 @@ def redq_sac(
             if args.algorithm == 'PGR':
                 cond_distri = CondDistri(agent.cond_net, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
             else:
-                cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac, square=args.square, pow_reward=args.pow_reward)
+                cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
             prior_model.update_cond_normalizer(cond_distri, device=device)
             prior_ema.ema_model.update_cond_normalizer(cond_distri, device=device)
             # round_num is not used in our settings
@@ -970,11 +971,11 @@ def redq_sac(
                 real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
                 diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
-                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, square=args.square, pow_reward=args.pow_reward, accumulate=False).cpu().numpy().squeeze()
-                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, square=args.square, pow_reward=args.pow_reward, accumulate=False).cpu().numpy().squeeze()
+                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
                 # Combined 10k observations and novelty
                 combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
-                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, square=args.square, pow_reward=args.pow_reward, accumulate=False).cpu().numpy().squeeze()     
+                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()     
 
 
             cur_epoch = t // steps_per_epoch
@@ -1093,7 +1094,7 @@ def redq_sac(
                         #     batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
                         # else:
                         
-                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward, accumulate=False)
+                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
                         
                         # # Clip novelty values to topk_threshold if available
                         # if topk_threshold is not None:
