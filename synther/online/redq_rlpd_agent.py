@@ -77,6 +77,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
             next_obs_normalized = self.next_obs_rms.normalize(next_obs)
         else:
             next_obs_normalized = next_obs
+        # Clip normalized observations to [-5, 5] range
+        next_obs_normalized = torch.clamp(next_obs_normalized, -5.0, 5.0)
         
         # if not square: 
         #     # 어짜피 이때는 weight 계산용, evaluation 용으로만 쓸꺼니까, temperature 조절 용도
@@ -123,6 +125,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
             next_obs_normalized = self.next_obs_rms.normalize(next_obs)
         else:
             next_obs_normalized = next_obs
+        # Clip normalized observations to [-5, 5] range
+        next_obs_normalized = torch.clamp(next_obs_normalized, -5.0, 5.0)
         
         self.temp_net.eval()
         pred_next_feature = self.temp_net(next_obs_normalized)
