@@ -1,11 +1,13 @@
 import numpy as np
 import torch
 from redq.algos.core import (ReplayBuffer,
-                             soft_update_model1_with_model2)
+                             soft_update_model1_with_model2,
+                             ACTION_BOUND_EPSILON)
 from redq.algos.redq_sac import REDQSACAgent
 from synther.online.conditional_nets import Curiosity, Predictor
 from synther.online.utils import RunningMeanStd, RMS
 from torch import Tensor
+from torch.distributions import Normal
 from tqdm import trange
 
 import pdb
@@ -52,6 +54,9 @@ class REDQRLPDCondAgent(REDQSACAgent):
         # For next_obs normalization (used in pred_net training and reward computation)
         # Track next_obs statistics from original buffer (not diffusion buffer)
         self.next_obs_rms = RMS(device=self.device, epsilon=1e-4, shape=(self.obs_dim,))
+        
+        self.max_onpolicy_reward = 0.0
+        self.total_onpolicy_reward = []
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -117,29 +122,142 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 
         return intrinsic_reward
     
-    # compute intrinsic reward using temp_net as frozen predictor,
-    # This is used to compute novelty as appropriate reward function for RTB
-    def compute_intrinsic_reward_temp(self, next_obs):
-        # Normalize next_obs before computing intrinsic reward
-        if self.next_obs_rms.n > 1.0:
-            next_obs_normalized = self.next_obs_rms.normalize(next_obs)
-        else:
-            next_obs_normalized = next_obs
-        # Clip normalized observations to [-5, 5] range
-        next_obs_normalized = torch.clamp(next_obs_normalized, -5.0, 5.0)
-        
-        self.temp_net.eval()
-        pred_next_feature = self.temp_net(next_obs_normalized)
-        with torch.no_grad():
-            fix_next_feature = self.fix_net(next_obs_normalized)
-        fix_next_feature = fix_next_feature.detach()
-        intrinsic_reward = (fix_next_feature - pred_next_feature).pow(2).sum(1) / 2.0
-        
-        return intrinsic_reward
     
-    def compute_intrinsic_reward_cpu(self, next_obs):
-        pass
+    def compute_onpolicy_reward(self, obs, act, low=-12.0, high=7.0):
+        """
+        Compute on-policy reward for a given (obs, act) pair.
+        Formula: exp(Clip(log π_θ(a|s), low, high) - p_max)
+        where p_max = max_{d in D} (Clip(log π_θ(a|s), low, high))
+        """
+        # Convert inputs to tensors if they are numpy arrays
+        if isinstance(obs, np.ndarray):
+            obs = torch.FloatTensor(obs).to(self.device)
+        if isinstance(act, np.ndarray):
+            act = torch.FloatTensor(act).to(self.device)
         
+        # Ensure correct shape
+        if len(obs.shape) == 1:
+            obs = obs.unsqueeze(0)
+        if len(act.shape) == 1:
+            act = act.unsqueeze(0)
+        
+        # Compute log likelihood of action under current policy
+        with torch.no_grad():
+            # Get policy distribution parameters
+            h = obs
+            for fc_layer in self.policy_net.hidden_layers:
+                h = self.policy_net.hidden_activation(fc_layer(h))
+            mean = self.policy_net.last_fc_layer(h)
+            log_std = self.policy_net.last_fc_log_std(h)
+            log_std = torch.clamp(log_std, -20, 2)  # LOG_SIG_MIN, LOG_SIG_MAX
+            std = torch.exp(log_std)
+            
+            # Normalize action by action_limit to get tanh-normalized action
+            action_normalized = act / self.policy_net.action_limit
+            
+            # Invert tanh to get pre_tanh_value: atanh(x) = 0.5 * ln((1+x)/(1-x))
+            # Clamp to avoid numerical issues near boundaries
+            action_normalized_clamped = torch.clamp(action_normalized, -0.999999, 0.999999)
+            pre_tanh_value = 0.5 * torch.log((1 + action_normalized_clamped) / (1 - action_normalized_clamped))
+            
+            # Compute log probability from normal distribution
+            normal = Normal(mean, std)
+            log_prob = normal.log_prob(pre_tanh_value)
+            
+            # Apply tanh correction: log_prob -= log(1 - tanh^2(x))
+            log_prob -= torch.log(1 - action_normalized_clamped.pow(2) + ACTION_BOUND_EPSILON)
+            
+            # Sum over action dimensions
+            log_prob = log_prob.sum(1, keepdim=True)
+            
+            # Clip log probability
+            clipped_log_prob = torch.clamp(log_prob, low, high)
+            
+            # Compute on-policy reward: exp(clipped_log_prob - max_onpolicy_reward)
+            onpolicy_reward = torch.exp(clipped_log_prob - self.max_onpolicy_reward)
+            
+            # Remove keepdim dimension if present (from sum(1, keepdim=True))
+            if len(onpolicy_reward.shape) > 1 and onpolicy_reward.shape[-1] == 1:
+                onpolicy_reward = onpolicy_reward.squeeze(-1)
+            
+            # Convert to numpy/scalar if needed
+            if onpolicy_reward.numel() == 1:
+                onpolicy_reward = onpolicy_reward.item()
+            else:
+                onpolicy_reward = onpolicy_reward.cpu().numpy()
+        
+        return onpolicy_reward
+    
+    def update_onpolicy_reward(self, low=-12.0, high=7.0):
+        """
+        Compute on-policy reward for all transitions in the original replay buffer.
+        Store clipped log probabilities in self.total_onpolicy_reward.
+        Return the maximum clipped log probability (p_max).
+        """
+        self.total_onpolicy_reward = []
+        
+        # Get all transitions from original replay buffer
+        ptr_location = self.replay_buffer.ptr
+        if ptr_location == 0:
+            self.max_onpolicy_reward = 0.0
+            return self.max_onpolicy_reward
+        
+        obs_all = self.replay_buffer.obs1_buf[:ptr_location]
+        acts_all = self.replay_buffer.acts_buf[:ptr_location]
+        
+        # Convert to tensors
+        obs_tensor = torch.FloatTensor(obs_all).to(self.device)
+        acts_tensor = torch.FloatTensor(acts_all).to(self.device)
+        
+        # Process in batches to avoid memory issues
+        batch_size = 1000
+        num_transitions = len(obs_all)
+        
+        with torch.no_grad():
+            for i in range(0, num_transitions, batch_size):
+                end_idx = min(i + batch_size, num_transitions)
+                obs_batch = obs_tensor[i:end_idx]
+                acts_batch = acts_tensor[i:end_idx]
+                
+                # Get policy distribution parameters
+                h = obs_batch
+                for fc_layer in self.policy_net.hidden_layers:
+                    h = self.policy_net.hidden_activation(fc_layer(h))
+                mean = self.policy_net.last_fc_layer(h)
+                log_std = self.policy_net.last_fc_log_std(h)
+                log_std = torch.clamp(log_std, -20, 2)  # LOG_SIG_MIN, LOG_SIG_MAX
+                std = torch.exp(log_std)
+                
+                # Normalize action by action_limit to get tanh-normalized action
+                action_normalized = acts_batch / self.policy_net.action_limit
+                
+                # Invert tanh to get pre_tanh_value
+                action_normalized_clamped = torch.clamp(action_normalized, -0.999999, 0.999999)
+                pre_tanh_value = 0.5 * torch.log((1 + action_normalized_clamped) / (1 - action_normalized_clamped))
+                
+                # Compute log probability from normal distribution
+                normal = Normal(mean, std)
+                log_prob = normal.log_prob(pre_tanh_value)
+                
+                # Apply tanh correction
+                log_prob -= torch.log(1 - action_normalized_clamped.pow(2) + ACTION_BOUND_EPSILON)
+                
+                # Sum over action dimensions
+                log_prob = log_prob.sum(1, keepdim=False)
+                
+                # Clip log probability
+                clipped_log_prob = torch.clamp(log_prob, low, high)
+                
+                # Store in list
+                self.total_onpolicy_reward.extend(clipped_log_prob.cpu().numpy().tolist())
+        
+        # Compute maximum
+        if len(self.total_onpolicy_reward) > 0:
+            self.max_onpolicy_reward = max(self.total_onpolicy_reward)
+        else:
+            self.max_onpolicy_reward = 0.0
+        
+        return self.max_onpolicy_reward
 
     def train(self, logger):
         # Put conditional net in training mode
