@@ -118,7 +118,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
         if self.normalize_intrinsic_reward and self.discounted_return_rms.count > 1.0:
             # Normalize by std (not mean-subtracted, just scale normalization)
             std = np.sqrt(self.discounted_return_rms.var + 1e-8)
-            intrinsic_reward = intrinsic_reward / std
+            std_tensor = torch.tensor(std, device=intrinsic_reward.device, dtype=intrinsic_reward.dtype)
+            intrinsic_reward = intrinsic_reward / std_tensor
                 
         return intrinsic_reward
     

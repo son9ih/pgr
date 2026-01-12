@@ -360,7 +360,8 @@ class DiffusionModel(nn.Module):
             t = torch.zeros((bs,), dtype=self.dtype, device=device)
             dt = 1 / self.diffusion_steps
             
-           
+            # assumes that time t, when denoising, start from 0 to 1
+            # It means, when training, variance or betas are larger in t=1
             for i in range(self.diffusion_steps):
                 # Classifier-free guidance: combine unconditional and conditional scores
                 if cond is not None and cfg_scale is not None:
@@ -381,74 +382,27 @@ class DiffusionModel(nn.Module):
                     # No guidance: use conditional or unconditional score directly
                     epsilon = self(x, t, cond=cond)
                 
-                if self.predict == "epsilon":
-                    x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon) + torch.sqrt(
-                        self.beta_t[i]
-                    ) * torch.randn_like(x, dtype=self.dtype, device=device)
-                elif self.predict == "x0":
-                    x = (1 / torch.sqrt(self.alpha_t[i])) * (
-                        (1 - (1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * x
-                        + ((1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * self.sqrtab[i] * epsilon
-                    ) + torch.sqrt(self.beta_t[i]) * torch.randn_like(x, dtype=self.dtype, device=device)
+                # if it is the last step, no noise is added
+                if i < self.diffusion_steps - 1:
+                    if self.predict == "epsilon":
+                        x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon) + torch.sqrt(
+                            self.beta_t[i]
+                        ) * torch.randn_like(x, dtype=self.dtype, device=device)
+                    elif self.predict == "x0":
+                        x = (1 / torch.sqrt(self.alpha_t[i])) * (
+                            (1 - (1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * x
+                            + ((1 - self.alpha_t[i]) / (1 - self.alphabar_t[i])) * self.sqrtab[i] * epsilon
+                        ) + torch.sqrt(self.beta_t[i]) * torch.randn_like(x, dtype=self.dtype, device=device)
+                else:
+                    if self.predict == "epsilon":
+                        x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon)
+                    elif self.predict == "x0":
+                        raise ValueError("x0 prediction is not supported for the last step")
+                    
                 t += dt
                 
             
         return x
-    
-    
-    
-    # def sample(self, bs, device, cond=None, cfg_scale=None, eval=False):
-    #     with torch.no_grad():
-    #         # 초기 가우시안 노이즈
-    #         x = torch.randn(bs, self.x_dim, dtype=self.dtype, device=device)
-    #         t_val = torch.zeros((bs,), dtype=self.dtype, device=device)
-    #         dt = 1 / self.diffusion_steps
-
-    #         # 훈련 상태 저장 및 평가 모드 전환
-    #         was_training = self.training
-    #         if eval:
-    #             self.eval()
-
-    #         try:
-    #             for i in range(self.diffusion_steps):
-    #                 # 현재 타임스텝 텐서 생성 (i)
-    #                 t_curr = torch.full((bs,), i / self.diffusion_steps, dtype=self.dtype, device=device)
-    #                 # 다음 타임스텝 텐서 (i+1) - 교정용
-    #                 t_next = torch.full((bs,), (i + 1) / self.diffusion_steps, dtype=self.dtype, device=device)
-
-    #                 # --- [Step 1: Predictor] 현재 위치에서 기울기 f(x, t) 계산 ---
-    #                 # CFG가 적용된 에플실론 계산 (헬퍼 함수 호출)
-    #                 eps_curr = self._get_cfg_epsilon(x, t_curr, cond, cfg_scale)
-                    
-    #                 # DDPM의 결정론적 업데이트 방향 (Deterministic Velocity)
-    #                 # 수식: x_next = 1/sqrt(a) * (x - (1-a)/sqrt(1-ab)*eps)
-    #                 # 여기서 '속도' 성분만 추출합니다.
-    #                 v_curr = self._get_velocity(x, eps_curr, i)
-
-    #                 # --- [Step 2: Corrector] 2차 교정을 위한 예측 지점 계산 ---
-    #                 # Euler step으로 임시 x_next 계산
-    #                 x_prime = x + v_curr * dt
-                    
-    #                 # --- [Step 3: Second-order Correction] ---
-    #                 if i < self.diffusion_steps - 1:
-    #                     # 예측된 x_prime 지점에서의 기울기 계산
-    #                     eps_next = self._get_cfg_epsilon(x_prime, t_next, cond, cfg_scale)
-    #                     v_next = self._get_velocity(x_prime, eps_next, i + 1)
-                        
-    #                     # 현재 기울기와 미래 기울기의 평균 사용 (Heun's method)
-    #                     # 여기에 SDE의 확률적 항(노이즈)을 더해줍니다.
-    #                     noise = torch.sqrt(self.beta_t[i]) * torch.randn_like(x)
-    #                     x = x + 0.5 * (v_curr + v_next) * dt + noise
-    #                 else:
-    #                     # 마지막 스텝은 1차 예측값으로 처리
-    #                     noise = torch.sqrt(self.beta_t[i]) * torch.randn_like(x)
-    #                     x = x_prime + noise
-
-    #         finally:
-    #             if eval:
-    #                 self.train(was_training)
-
-    #         return x
 
     def _get_cfg_epsilon(self, x, t, cond, cfg_scale):
         """Classifier-Free Guidance를 적용한 에플실론 계산"""
@@ -478,9 +432,16 @@ class DiffusionModel(nn.Module):
     # code for training prior or on-policy posterior training
     def compute_loss(self, x, cond=None):
         t_idx = torch.randint(0, self.diffusion_steps, (x.shape[0], 1)).to(x.device)
+        # continuous time index 0 to 1
         t = t_idx.float().squeeze(1) / self.diffusion_steps
         epsilon = torch.randn_like(x, dtype=self.dtype).to(x.device)
+        # t_idx가 0일때, sqrtmab[t_idx]가 제일 커야함. 이게 중요함.
         x_t = self.sqrtab[t_idx] * x + self.sqrtmab[t_idx] * epsilon
+        # for debugging
+        # t: training is aligned with sampling
+        # t_idx_first = t_idx[0]
+        # print(f'self.sqrtab[{t_idx_first}]: {self.sqrtmab[t_idx_first]}')
+        # pdb.set_trace()
         # if cond is 1D tensor, we need to expand it to 2D tensor
         if cond is not None and cond.dim() == 1:
             cond = cond.unsqueeze(-1)
@@ -603,9 +564,23 @@ class QFlow(nn.Module):
                         q_epsilon, bc_epsilon = self(x, t, cond=cond)
 
                         epsilon = q_epsilon + bc_epsilon
-                        new_x = self.bc_net.oneover_sqrta[i] * (
+                        
+                        # if it is the last step, no noise is added
+                        if i < self.diffusion_steps - 1:
+                            new_x = self.bc_net.oneover_sqrta[i] * (
+                                x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
+                            ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
+                        else:
+                            new_x = self.bc_net.oneover_sqrta[i] * (
                             x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
-                        ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
+                            )
+                            
+                        # new_x = self.bc_net.oneover_sqrta[i] * (
+                        #     x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
+                        # ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
+                        
+                        
+                        
 
                         # pf_pi_dist = torch.distributions.Normal(
                         #     self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
@@ -859,7 +834,7 @@ class QFlow(nn.Module):
         # According to the measure of novelty, we use different code to compute q_r
         # TODO
         if self.novelty_measure == 'curiosity':
-            q_r = self.q_net(obs, next_obs, act, reward=None, done=None).squeeze()
+            q_r = self.q_net(obs, next_obs, act).squeeze()
         elif self.novelty_measure == 'rnd':
             q_r = self.agent.compute_intrinsic_reward(next_obs).squeeze()
         elif self.novelty_measure == 'eco':
@@ -868,16 +843,21 @@ class QFlow(nn.Module):
             raise ValueError(f'Invalid novelty measure: {self.novelty_measure}')
         
         q_r = (self.cond_normalizer.normalize(q_r) + 1) / 2
-        print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
-        print('Here is diffusion.py')
+        # Bound nice
+        # print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
+        # print('Here is diffusion.py')
         
         # combine novelty reward with on-policyness reward
         if self.inter_onpolicy > 0:
             with torch.no_grad():
                 # ranging from 0 to 1
                 on_policy_reward = self.agent.compute_onpolicy_reward(obs, act)
-                print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
-            q_r = q_r * (1 - self.inter_onpolicy) + self.inter_onpolicy * on_policy_reward
+                # print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
+            # convert numpy to tensor
+            on_policy_reward = torch.tensor(on_policy_reward, device=q_r.device, dtype=q_r.dtype)
+            # q_r = q_r * (1 - self.inter_onpolicy) + self.inter_onpolicy * on_policy_reward
+            inter_onpolicy_tensor = torch.tensor(self.inter_onpolicy, device=q_r.device, dtype=q_r.dtype)
+            q_r = q_r * (1 - inter_onpolicy_tensor) + inter_onpolicy_tensor * on_policy_reward
         else:
             q_r = q_r
         # q_r = self.q_net(next_obs).squeeze()
@@ -900,7 +880,8 @@ class QFlow(nn.Module):
         # Also, we need to unnormalize x here
         x_unnormalized = self.bc_net.normalizer.unnormalize(x)
         logr = self.posterior_log_reward(x_unnormalized).log()
-
+        
+        # going to noisy x
         for i in range(self.diffusion_steps - 1, -1, -1):
             pb_dist = torch.distributions.Normal(
                 torch.sqrt(self.bc_net.alpha_t[i]) * x,
@@ -938,6 +919,7 @@ class QFlow(nn.Module):
         x_unnormalized = self.bc_net.normalizer.unnormalize(x)
         # I think we need to log here
         logr = self.posterior_log_reward(x_unnormalized)
+        # logr = self.bc_net.cond_normalizer.unnormalize(logr*2-1)
         # print(f'logr: {logr}')
         logr = logr.log()
         # pdb.set_trace()

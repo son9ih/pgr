@@ -326,9 +326,9 @@ def redq_sac(
                               args.rnd)
     
     # Enable intrinsic reward normalization for PGRrnd
-    if args.algorithm == 'PGRrnd':
+    if args.novelty_measure == 'rnd':
         agent.set_normalize_intrinsic_reward(True)
-        print('Enabled intrinsic reward normalization for PGRrnd')
+        print('Enabled intrinsic reward normalization for rnd')
 
     # pbe for state entropy evaluation
     # if args.state_ent:
@@ -372,7 +372,7 @@ def redq_sac(
         agent.store_data(o, a, r, o2, d)
         
         # Accumulate intrinsic reward during episode (for PGRrnd normalization)
-        if args.algorithm == 'PGRrnd' and agent.normalize_intrinsic_reward:
+        if args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
             # Compute and accumulate intrinsic reward for this step
             o2_tensor = torch.FloatTensor(o2).unsqueeze(0).to(device)
             agent.pred_net.eval()
@@ -402,7 +402,7 @@ def redq_sac(
         # if d or (ep_len == max_ep_len):
         if (ep_len == max_ep_len):
             # Update discounted intrinsic return statistics at end of episode (for PGRrnd)
-            if args.algorithm == 'PGRrnd' and agent.normalize_intrinsic_reward:
+            if args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
                 agent.update_discounted_return_stats(gamma=gamma)
             
             # store episode return and length to logger
@@ -509,7 +509,7 @@ def redq_sac(
                 for i in range(0, ptr_location, batch_size_novelty):
                     batch_next_obs = all_next_obs[i:i+batch_size_novelty].to(device)
                     # set curiosity as a measure of novelty
-                    if args.algorithm == 'PGR':
+                    if args.novelty_measure == 'curiosity':
                         agent.cond_net.eval()
                         batch_next_obs = batch_next_obs.cpu().numpy()
                         batch_actions = all_actions[i:i+batch_size_novelty].cpu().numpy()
@@ -521,7 +521,8 @@ def redq_sac(
                         batch_novelty_tensor = agent.cond_net.compute_reward(batch_obs, batch_next_obs, batch_actions, batch_rewards, batch_done).squeeze().to(device)
                         agent.cond_net.train()
                     else:
-                        # PGRrnd
+                        # TODO: eco needed
+                        # rnd or eco
                         batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
                     batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
                     all_novelty_list.append(batch_novelty)
@@ -537,6 +538,7 @@ def redq_sac(
             prior_ema.ema_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
             
             # y의 통계량 계산
+            print(f'Novelty measure: {args.novelty_measure}')
             y_mean = test_function_y_tensor.mean().item()
             y_std = test_function_y_tensor.std().item()
             print(f'Mean of test function y: {y_mean}')
@@ -564,10 +566,15 @@ def redq_sac(
             agent.pred_net.eval()
             agent.fix_net.eval()
             # unnecessary except for PGR
-            if args.algorithm == 'PGR':
+            if args.novelty_measure == 'curiosity':
                 cond_distri = CondDistri(agent.cond_net, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
-            else:
+            elif args.novelty_measure == 'rnd':
                 cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
+            elif args.novelty_measure == 'eco':
+                # cond_distri = CondDistri_ECO(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
+                pass # TODO: implement eco reward
+            else:
+                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
             prior_model.update_cond_normalizer(cond_distri, device=device)
             prior_ema.ema_model.update_cond_normalizer(cond_distri, device=device)
             # round_num is not used in our settings
@@ -700,7 +707,7 @@ def redq_sac(
                 # For unity, each compute_intrinsic_reward and compute_reward should take the whole transition as input
                 # TODO
                 if args.novelty_measure == 'curiosity':
-                    proxy_model_ens = agent.cond_net.compute_reward
+                    proxy_model_ens = agent.cond_net.compute_reward_torch
                 elif args.novelty_measure == 'rnd':
                     proxy_model_ens = agent.compute_intrinsic_reward
                 elif args.novelty_measure == 'eco':
@@ -716,10 +723,15 @@ def redq_sac(
                 # add 1) onpolicy reward function, 2) args.novelty measure (curiosity, rnd, eco)
                 # TODO: We need to normalize the novelty, so that we can handle different scales of novelty measures with on-policy reward
                 # EMA: Instead of using original prior, we use EMA model
+                
+                # TODO: deep copy prior_ema.ema_model to prior_model
                 posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
                                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
                                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
                 # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
+                # posterior_model_optimizer = torch.optim.AdamW(posterior_model.parameters(), lr=args.finetune_lr)
+                
+                # special optimizer
                 no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
                 optimizer_grouped_parameters = [
                         {
@@ -732,6 +744,9 @@ def redq_sac(
                         },
                     ]
                 posterior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.finetune_lr, betas=args.rtb_adam_betas)
+                
+                
+                
                 # scheduler for posterior model
                 if args.rtb_lr_scheduler == 'linear':
                     print('using linear learning rate scheduler')
@@ -764,6 +779,8 @@ def redq_sac(
                 # reward proportional weighting
                 y_weights = torch.softmax(ys, dim=0)
                 
+                posterior_model.train()
+                
                 # fine-tuning loop
                 if num_posterior_epochs > 0:
                     # Initialize wandb table for posterior training logs
@@ -778,28 +795,48 @@ def redq_sac(
                         else: # off
                             s1 = 1
                             
+                            
                         if s1 == 0:
                             # on-policy
                             print(f'On-policy training')
-                            # return unnormalized samples x
+                            # return normalized samples x
                             loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=args.ft_batch_size)
                             # Extract next_obs from x for reward computation
                             x_unnormalized = prior_model.normalizer.unnormalize(x)
                             x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
                             # x_next_obs should be unnormalized as input of proxy_model_ens
-                            y = proxy_model_ens(x_next_obs_unnormalized, square=args.square, pow_reward=args.pow_reward).squeeze()
+                            if args.novelty_measure == 'rnd':
+                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
+                            elif args.novelty_measure == 'curiosity':
+                                x_obs_unnormalized = x_unnormalized[:, :obs_dim]
+                                x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
+                                y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
+                            elif args.novelty_measure == 'eco':
+                                pass # TODO: implement eco reward
+                            else:
+                                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                         else:
                             # off-policy (reward prioritization)
                             print(f'Off-policy training')
                             idx = torch.multinomial(y_weights.squeeze(), args.ft_batch_size, replacement=True)
                             # this is normalized samples x
                             x = xs[idx]
-                            x += torch.randn_like(x) * 0.01
+                            # [Optional] Add noise to x
+                            # x += torch.randn_like(x) * 0.01
                             loss, logZ = posterior_model.compute_loss_with_sample(x, device)
                             # Extract next_obs from x for reward computation
                             x_unnormalized = prior_model.normalizer.unnormalize(x)
                             x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-                            y = proxy_model_ens(x_next_obs_unnormalized, square=args.square, pow_reward=args.pow_reward).squeeze()
+                            if args.novelty_measure == 'rnd':
+                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
+                            elif args.novelty_measure == 'curiosity':
+                                x_obs_unnormalized = x_unnormalized[:, :obs_dim]
+                                x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
+                                y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
+                            elif args.novelty_measure == 'eco':
+                                pass # TODO: implement eco reward
+                            else:
+                                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                             
                             
                         xs = torch.cat([xs, x], dim=0)
@@ -826,6 +863,8 @@ def redq_sac(
                     # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
                     if args.wandb:
                         wandb.log({f"Posterior_Training_Log_Epoch_{cur_epoch}": posterior_log_table}, step=cur_epoch)
+                        
+                posterior_model.eval()
                         
             else:
                 print(f'No posterior training')
@@ -1103,7 +1142,7 @@ def redq_sac(
                         # if args.target_rnd_every > 0:
                         #     batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
                         # else:
-                        
+                        # TODO: measure by different novelty measures
                         batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
                         
                         # # Clip novelty values to topk_threshold if available
@@ -1415,7 +1454,7 @@ if __name__ == '__main__':
     parser.add_argument('--version', type=str, default='DDPM')
     
     parser.add_argument('--novelty_measure', type=str, default='curiosity') # 'curiosity', 'rnd', 'eco'
-    parser.add_arguemnt('--inter_onpolicy', type=float, default=0.1)
+    parser.add_argument('--inter_onpolicy', type=float, default=0.1)
     
 
     args = parser.parse_args()
@@ -1443,13 +1482,11 @@ if __name__ == '__main__':
         args.synther = False
         args.rnd = False
         args.rtb = False
-        args.novelty_measure = 'curiosity'
     if args.algorithm == 'PGRrnd':
         args.disable_diffusion = False
         args.synther = False
         args.rnd = True
         args.rtb = False
-        args.novelty_measure = 'rnd'
     if args.algorithm == 'ft':
         args.disable_diffusion = False
         args.synther = True
