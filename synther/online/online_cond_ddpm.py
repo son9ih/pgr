@@ -520,10 +520,15 @@ def redq_sac(
                         # TypeError: expected np.ndarray (got Tensor)
                         batch_novelty_tensor = agent.cond_net.compute_reward(batch_obs, batch_next_obs, batch_actions, batch_rewards, batch_done).squeeze().to(device)
                         agent.cond_net.train()
-                    else:
+                    elif args.novelty_measure == 'rnd':
                         # TODO: eco needed
                         # rnd or eco
                         batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
+                    elif args.novelty_measure == 'eco':
+                        # TODO
+                        pass
+                    else:
+                        raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                     batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
                     all_novelty_list.append(batch_novelty)
                 test_function_y = np.concatenate(all_novelty_list)    
