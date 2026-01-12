@@ -516,6 +516,7 @@ def redq_sac(
             all_next_obs = test_function_x[:, next_obs_start:next_obs_end]
             all_actions = test_function_x[:, obs_dim:obs_dim+act_dim]
             all_rewards = test_function_x[:, obs_dim+act_dim:obs_dim+act_dim+1]
+            # wrong indices for done, there is no done in the test_function_x
             all_done = test_function_x[:, obs_dim+act_dim+1:obs_dim+act_dim+2]
             all_obs = test_function_x[:, :obs_dim]
             
@@ -544,8 +545,13 @@ def redq_sac(
                         # ECO: Episodic Curiosity Objective
                         # According to paper: "takes the current observation o as input"
                         # Use current obs (obs at time t, before action was taken)
+                        # breakpoint()
                         batch_done_tensor = all_done[i:i+batch_size_novelty].to(device) if len(all_done.shape) > 0 else None
-                        batch_novelty_tensor = agent.compute_eco_reward(batch_obs, batch_done_tensor)
+                        # batch_done_tensor가 make_inputs_from_replay_buffer로 불러오면 done이 True라고 되어 있는듯
+                        # 그래서 현재 batch_novelty_tensor는 모두 0.0이 되고 있음음
+                        # batch_novelty_tensor = agent.compute_eco_reward(batch_obs, batch_done_tensor)
+                        # 지금은 done에 None을 해서 일부러 값을 출력하고 있는데, 이게 done 처리가 다른 muj에선 debugging이 요구될지도 모르겠음
+                        batch_novelty_tensor = agent.compute_eco_reward(batch_obs)
                     else:
                         raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                     batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
@@ -876,8 +882,8 @@ def redq_sac(
                             
                         xs = torch.cat([xs, x], dim=0)
                         ys = torch.cat([ys, y], dim=0)
+                        # breakpoint()
                         y_weights = torch.softmax(ys, dim=0)
-                        
                         posterior_model_optimizer.zero_grad()
                         loss.backward()
                         posterior_model_optimizer.step()                
