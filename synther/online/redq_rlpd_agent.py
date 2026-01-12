@@ -6,6 +6,7 @@ from redq.algos.core import (ReplayBuffer,
 from redq.algos.redq_sac import REDQSACAgent
 from synther.online.conditional_nets import Curiosity, Predictor
 from synther.online.utils import RunningMeanStd, RMS
+from synther.online.eco import ECO
 from torch import Tensor
 from torch.distributions import Normal
 from tqdm import trange
@@ -57,6 +58,9 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
         self.max_onpolicy_reward = 0.0
         self.total_onpolicy_reward = []
+        
+        # ECO (Episodic Curiosity Objective) - initialized if needed
+        self.eco = None
     
     def get_current_num_data(self):
         # used to determine whether we should get action from policy or take random starting actions
@@ -123,6 +127,39 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 
         return intrinsic_reward
     
+    def compute_eco_reward(self, current_obs, done=None):
+        """Compute ECO (Episodic Curiosity Objective) intrinsic reward.
+        
+        According to the paper: "The episodic curiosity (EC) module takes the current observation o as input"
+        
+        Args:
+            current_obs: [batch, obs_dim] or [obs_dim] tensor - current observation at time t
+            done: [batch] or scalar tensor indicating episode end (optional)
+        
+        Returns:
+            intrinsic_reward: [batch] or scalar tensor
+        """
+        if self.eco is None:
+            # Initialize ECO if not already initialized
+            self.eco = ECO(
+                obs_dim=self.obs_dim,
+                embedding_dim=512,
+                hidden_dim=512,
+                memory_capacity=200,
+                replacement='random',
+                alpha=0.03,
+                beta=0.5,
+                similarity_threshold=0.5,
+                similarity_aggregation='percentile',
+                device=self.device
+            )
+        
+        return self.eco.compute_reward(current_obs, done)
+    
+    def reset_eco_episode(self):
+        """Reset ECO episodic memory at episode start."""
+        if self.eco is not None:
+            self.eco.reset_episode()
     
     def compute_onpolicy_reward(self, obs, act, low=-12.0, high=7.0):
         """

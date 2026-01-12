@@ -838,13 +838,14 @@ class QFlow(nn.Module):
         elif self.novelty_measure == 'rnd':
             q_r = self.agent.compute_intrinsic_reward(next_obs).squeeze()
         elif self.novelty_measure == 'eco':
-            q_r = self.agent.compute_eco_reward(next_obs).squeeze()
+            # ECO uses current obs (according to paper: "takes the current observation o as input")
+            q_r = self.agent.compute_eco_reward(obs).squeeze()
         else:
             raise ValueError(f'Invalid novelty measure: {self.novelty_measure}')
         
         q_r = (self.cond_normalizer.normalize(q_r) + 1) / 2
         # Bound nice
-        # print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
+        print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
         # print('Here is diffusion.py')
         
         # combine novelty reward with on-policyness reward
@@ -852,7 +853,7 @@ class QFlow(nn.Module):
             with torch.no_grad():
                 # ranging from 0 to 1
                 on_policy_reward = self.agent.compute_onpolicy_reward(obs, act)
-                # print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
+                print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
             # convert numpy to tensor
             on_policy_reward = torch.tensor(on_policy_reward, device=q_r.device, dtype=q_r.dtype)
             # q_r = q_r * (1 - self.inter_onpolicy) + self.inter_onpolicy * on_policy_reward

@@ -16,7 +16,7 @@ from redq.algos.core import mbpo_epoches, test_agent
 from redq.utils.bias_utils import log_bias_evaluation
 from redq.utils.logx import EpochLogger
 from redq.utils.run_utils import setup_logger_kwargs
-from synther.diffusion.elucidated_diffusion import REDQCondTrainer, CondDistri_RND, CondDistri
+from synther.diffusion.elucidated_diffusion import REDQCondTrainer, CondDistri_RND, CondDistri, CondDistri_ECO
 from synther.diffusion.diffusion_generator import CondDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model, split_diffusion_samples
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
@@ -325,7 +325,7 @@ def redq_sac(
                               policy_update_delay,
                               args.rnd)
     
-    # Enable intrinsic reward normalization for PGRrnd
+    # Enable intrinsic reward normalization for algorithms using rnd
     if args.novelty_measure == 'rnd':
         agent.set_normalize_intrinsic_reward(True)
         print('Enabled intrinsic reward normalization for rnd')
@@ -349,7 +349,11 @@ def redq_sac(
 
     # o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
     # Because they truncate before 1000, never get to 1000
-    o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0   
+    o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+    
+    # Initialize ECO episodic memory at episode start
+    if args.novelty_measure == 'eco':
+        agent.reset_eco_episode()
 
     # One-time header registration guard for StateEnt to avoid header errors
     # state_ent_header_initialized = False
@@ -379,6 +383,13 @@ def redq_sac(
             _ = agent.compute_intrinsic_reward(o2_tensor, accumulate=True)
             agent.pred_net.train()
         
+        # Compute ECO reward for current observation (before action was taken)
+        # According to paper: "takes the current observation o as input"
+        # Note: o is the observation at time t (before action a was taken)
+        if args.novelty_measure == 'eco':
+            o_tensor = torch.FloatTensor(o).unsqueeze(0).to(device)
+            _ = agent.compute_eco_reward(o_tensor, torch.tensor([d]).to(device) if isinstance(d, (bool, np.bool_)) else None)
+        
         # let agent update
         agent.train(logger)
         # set obs to next obs
@@ -404,6 +415,10 @@ def redq_sac(
             # Update discounted intrinsic return statistics at end of episode (for PGRrnd)
             if args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
                 agent.update_discounted_return_stats(gamma=gamma)
+            
+            # Reset ECO episodic memory at episode end
+            if args.novelty_measure == 'eco':
+                agent.reset_eco_episode()
             
             # store episode return and length to logger
             logger.store(EpRet=ep_ret, EpLen=ep_len)
@@ -460,6 +475,7 @@ def redq_sac(
             
             prior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.prior_lr, betas=args.prior_adam_betas)
             # prior_model_optimizer = torch.optim.Adam(prior_model.parameters(), lr=args.prior_lr)
+            
             # scheduler for prior model
             if args.prior_lr_scheduler == 'linear':
                 print('using linear learning rate scheduler')
@@ -491,7 +507,7 @@ def redq_sac(
             test_function_x_np = make_inputs_from_replay_buffer(agent.replay_buffer, model_terminals=model_terminals)
             test_function_x = torch.from_numpy(test_function_x_np).float()
             
-            # Extract next_obs for novelty computation (needed for test_function_y)
+            # Extract obs and next_obs for novelty computation (needed for test_function_y)
             # Format: [obs, actions, rewards, next_obs] (or with terminals)
             obs_dim = env.observation_space.shape[0]
             act_dim = env.action_space.shape[0]
@@ -508,25 +524,28 @@ def redq_sac(
             with torch.no_grad():
                 for i in range(0, ptr_location, batch_size_novelty):
                     batch_next_obs = all_next_obs[i:i+batch_size_novelty].to(device)
+                    batch_obs = all_obs[i:i+batch_size_novelty].to(device)
                     # set curiosity as a measure of novelty
                     if args.novelty_measure == 'curiosity':
                         agent.cond_net.eval()
-                        batch_next_obs = batch_next_obs.cpu().numpy()
+                        batch_next_obs_np = batch_next_obs.cpu().numpy()
                         batch_actions = all_actions[i:i+batch_size_novelty].cpu().numpy()
                         batch_rewards = all_rewards[i:i+batch_size_novelty].cpu().numpy()
                         batch_done = all_done[i:i+batch_size_novelty].cpu().numpy()
-                        batch_obs = all_obs[i:i+batch_size_novelty].cpu().numpy()
+                        batch_obs_np = batch_obs.cpu().numpy()
                         
                         # TypeError: expected np.ndarray (got Tensor)
-                        batch_novelty_tensor = agent.cond_net.compute_reward(batch_obs, batch_next_obs, batch_actions, batch_rewards, batch_done).squeeze().to(device)
+                        batch_novelty_tensor = agent.cond_net.compute_reward(batch_obs_np, batch_next_obs_np, batch_actions, batch_rewards, batch_done).squeeze().to(device)
                         agent.cond_net.train()
                     elif args.novelty_measure == 'rnd':
-                        # TODO: eco needed
-                        # rnd or eco
+                        # RND uses next_obs
                         batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
                     elif args.novelty_measure == 'eco':
-                        # TODO
-                        pass
+                        # ECO: Episodic Curiosity Objective
+                        # According to paper: "takes the current observation o as input"
+                        # Use current obs (obs at time t, before action was taken)
+                        batch_done_tensor = all_done[i:i+batch_size_novelty].to(device) if len(all_done.shape) > 0 else None
+                        batch_novelty_tensor = agent.compute_eco_reward(batch_obs, batch_done_tensor)
                     else:
                         raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                     batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
@@ -546,8 +565,8 @@ def redq_sac(
             print(f'Novelty measure: {args.novelty_measure}')
             y_mean = test_function_y_tensor.mean().item()
             y_std = test_function_y_tensor.std().item()
-            print(f'Mean of test function y: {y_mean}')
-            print(f'Std of test function y: {y_std}')
+            print(f'Mean of test function y: {y_mean:.7f}')
+            print(f'Std of test function y: {y_std:.7f}')
             
             # define weights for weighted or uniform sampling 
             # if args.uniform:
@@ -576,8 +595,7 @@ def redq_sac(
             elif args.novelty_measure == 'rnd':
                 cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
             elif args.novelty_measure == 'eco':
-                # cond_distri = CondDistri_ECO(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
-                pass # TODO: implement eco reward
+                cond_distri = CondDistri_ECO(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
             else:
                 raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
             prior_model.update_cond_normalizer(cond_distri, device=device)
@@ -716,8 +734,7 @@ def redq_sac(
                 elif args.novelty_measure == 'rnd':
                     proxy_model_ens = agent.compute_intrinsic_reward
                 elif args.novelty_measure == 'eco':
-                    # proxy_model_ens = agent.compute_eco_reward
-                    pass # TODO: implement eco reward
+                    proxy_model_ens = agent.compute_eco_reward
                 else:
                     raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                 
@@ -730,7 +747,12 @@ def redq_sac(
                 # EMA: Instead of using original prior, we use EMA model
                 
                 # TODO: deep copy prior_ema.ema_model to prior_model
-                posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
+                # breakpoint()
+                # TODO: This is the main cause of not decreasing the loss
+                # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
+                #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
+                #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
+                posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
                                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
                                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
                 # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
@@ -749,6 +771,7 @@ def redq_sac(
                         },
                     ]
                 posterior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.finetune_lr, betas=args.rtb_adam_betas)
+                
                 
                 
                 
@@ -780,6 +803,7 @@ def redq_sac(
                 next_obs_end = next_obs_start + obs_dim
                 # xs_next_obs = xs[:, next_obs_start:next_obs_end]
                 # ys = proxy_model_ens(xs_next_obs, square=args.square, pow_reward=args.pow_reward)
+                # TODO: When eco, they are all zeros
                 ys = test_function_y_tensor.clone().detach().to(device)
                 # reward proportional weighting
                 y_weights = torch.softmax(ys, dim=0)
@@ -806,18 +830,21 @@ def redq_sac(
                             print(f'On-policy training')
                             # return normalized samples x
                             loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=args.ft_batch_size)
-                            # Extract next_obs from x for reward computation
+                            # Extract obs and next_obs from x for reward computation
                             x_unnormalized = prior_model.normalizer.unnormalize(x)
+                            x_obs_unnormalized = x_unnormalized[:, :obs_dim]
                             x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
                             # x_next_obs should be unnormalized as input of proxy_model_ens
                             if args.novelty_measure == 'rnd':
                                 y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
                             elif args.novelty_measure == 'curiosity':
-                                x_obs_unnormalized = x_unnormalized[:, :obs_dim]
                                 x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
                                 y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
                             elif args.novelty_measure == 'eco':
-                                pass # TODO: implement eco reward
+                                # ECO reward computation
+                                # According to paper: "takes the current observation o as input"
+                                # Use current obs (obs at time t, before action was taken)
+                                y = proxy_model_ens(x_obs_unnormalized).squeeze()
                             else:
                                 raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                         else:
@@ -829,17 +856,20 @@ def redq_sac(
                             # [Optional] Add noise to x
                             # x += torch.randn_like(x) * 0.01
                             loss, logZ = posterior_model.compute_loss_with_sample(x, device)
-                            # Extract next_obs from x for reward computation
+                            # Extract obs and next_obs from x for reward computation
                             x_unnormalized = prior_model.normalizer.unnormalize(x)
+                            x_obs_unnormalized = x_unnormalized[:, :obs_dim]
                             x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
                             if args.novelty_measure == 'rnd':
                                 y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
                             elif args.novelty_measure == 'curiosity':
-                                x_obs_unnormalized = x_unnormalized[:, :obs_dim]
                                 x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
                                 y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
                             elif args.novelty_measure == 'eco':
-                                pass # TODO: implement eco reward
+                                # ECO reward computation
+                                # According to paper: "takes the current observation o as input"
+                                # Use current obs (obs at time t, before action was taken)
+                                y = proxy_model_ens(x_obs_unnormalized).squeeze()
                             else:
                                 raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                             
@@ -1025,11 +1055,21 @@ def redq_sac(
                 real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
                 diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
-                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
-                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
-                # Combined 10k observations and novelty
-                combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
-                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()     
+                if args.novelty_measure == 'eco':
+                    # ECO uses compute_eco_reward with current obs
+                    # According to paper: "takes the current observation o as input"
+                    real_novelty = agent.compute_eco_reward(real_obs_tensor).cpu().numpy().squeeze()
+                    diffusion_novelty = agent.compute_eco_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
+                    # Combined 10k observations and novelty
+                    combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
+                    combined_novelty = agent.compute_eco_reward(combined_obs_tensor).cpu().numpy().squeeze()
+                else:
+                    # RND uses compute_intrinsic_reward
+                    real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                    diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                    # Combined 10k observations and novelty
+                    combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
+                    combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()     
 
 
             cur_epoch = t // steps_per_epoch
@@ -1135,6 +1175,7 @@ def redq_sac(
                 # =============================================================================
                 print('Computing novelty for full replay buffer...')
                 ptr_location = agent.replay_buffer.ptr
+                all_obs = agent.replay_buffer.obs1_buf[:ptr_location]
                 all_next_obs = agent.replay_buffer.obs2_buf[:ptr_location]
                 
                 # Compute novelty in batches to avoid memory issues
@@ -1143,12 +1184,18 @@ def redq_sac(
                 # topk_threshold = getattr(agent, 'topk_threshold', None)
                 with torch.no_grad():
                     for i in range(0, ptr_location, batch_size_novelty):
+                        batch_obs = torch.FloatTensor(all_obs[i:i+batch_size_novelty]).to(device)
                         batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
                         # if args.target_rnd_every > 0:
                         #     batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
                         # else:
-                        # TODO: measure by different novelty measures
-                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
+                        # Measure by different novelty measures
+                        if args.novelty_measure == 'eco':
+                            # ECO uses current obs (according to paper)
+                            batch_novelty_tensor = agent.compute_eco_reward(batch_obs)
+                        else:
+                            # RND uses next_obs
+                            batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
                         
                         # # Clip novelty values to topk_threshold if available
                         # if topk_threshold is not None:
