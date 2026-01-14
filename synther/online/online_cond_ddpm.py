@@ -130,8 +130,8 @@ def redq_sac(
 
             wandb.init(
             project = f'{env_name}',
-            group = f'{run_name.split("_")[-1]}',
-            name = f' {run_name}_square{args.square}_pow_reward{args.pow_reward}_alpha_rtb{args.alpha_rtb}_num_prior_epochs{args.num_prior_epochs}_num_posterior_epochs{args.num_posterior_epochs}_NoV{args.novelty_measure}_IoP{args.inter_onpolicy}',
+            group = f'{run_name.split("_")[-1]}+{args.novelty_measure}',
+            name = f' {run_name}_NoV{args.novelty_measure}_alpha_rtb{args.alpha_rtb}_IoP{args.inter_onpolicy}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -184,6 +184,65 @@ def redq_sac(
                 "novelty_measure": args.novelty_measure,
                 "inter_onpolicy": args.inter_onpolicy,
             })
+            
+        elif args.algorithm == 'PGR':
+            wandb.init(
+                project = f'{env_name}',
+                group = f'{run_name.split("_")[-1]}+{args.novelty_measure}',
+                name = f' {run_name}_NoV{args.novelty_measure}',
+                config={
+                "env_name": env_name,
+                "seed": seed,
+                "epochs": epochs,
+                "steps_per_epoch": steps_per_epoch,
+                "hidden_sizes": hidden_sizes,
+                "replay_size": replay_size,
+                "batch_size": batch_size,
+                "lr": lr,
+                "gamma": gamma,
+                "polyak": polyak,
+                "alpha": alpha,
+                "auto_alpha": auto_alpha,
+                "target_entropy": target_entropy,
+                "start_steps": start_steps,
+                "delay_update_steps": delay_update_steps,
+                "utd_ratio": utd_ratio,
+                "num_Q": num_Q,
+                "num_min": num_min,
+                "q_target_mode": q_target_mode,
+                "policy_update_delay": policy_update_delay,
+                "diffusion_buffer_size": diffusion_buffer_size,
+                "diffusion_sample_ratio": diffusion_sample_ratio,
+                "retrain_diffusion_every": retrain_diffusion_every,
+                "num_samples": num_samples,
+                "disable_diffusion": disable_diffusion,
+                "cfg_dropout": cfg_dropout,
+                "cond_top_frac": cond_top_frac,
+                "cfg_scale": cfg_scale,
+                "cond_hidden_size": cond_hidden_size,
+                "beta": args.beta,
+                # "backprop_iters": args.backprop_iters,
+                # "amplify": args.amplify,
+                "finetune_lr": args.finetune_lr,
+                "ft_batch_size": args.ft_batch_size,
+                "accumulation_steps": args.accumulation_steps,
+                # "uniform": args.uniform,
+                # "target_rnd_every": args.target_rnd_every,
+                "finetune_lr": args.finetune_lr,
+                "top_reward_exclude_ratio": args.top_reward_exclude_ratio,
+                "pow_reward": args.pow_reward,
+                "alpha_rtb": args.alpha_rtb,
+                "num_prior_epochs": args.num_prior_epochs,
+                "num_posterior_epochs": args.num_posterior_epochs,
+                "uniform": args.uniform,
+                # "sample_freq": args.sample_freq,
+                "gin_config_files": args.gin_config_files,
+                "version": args.version,
+                "diffusion_steps": args.diffusion_steps,
+                "novelty_measure": args.novelty_measure,
+                "inter_onpolicy": args.inter_onpolicy,
+                }
+            )
         else:
 
         # args.results_folder = run_name
@@ -1486,8 +1545,8 @@ if __name__ == '__main__':
     # ddqm
     parser.add_argument('--uniform', action='store_true', default=False)
     parser.add_argument('--diffusion_steps', type=int, default=128)
-    parser.add_argument('--num_prior_epochs', type=int, default=100)
-    parser.add_argument('--num_posterior_epochs', type=int, default=100)
+    parser.add_argument('--num_prior_epochs', type=int, default=100000)
+    parser.add_argument('--num_posterior_epochs', type=int, default=50)
     parser.add_argument('--training_posterior', type=str, default='both') # 'both', 'on', 'off'
     parser.add_argument('--filtering', action='store_true', default=False)
     parser.add_argument('--num_proposals', type=int, default=10)
@@ -1504,7 +1563,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--prior_lr', type=float, default=3e-4)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
-    parser.add_argument('--alpha_rtb', type=float, default=1e-5)
+    parser.add_argument('--alpha_rtb', type=float, default=1.0)
     parser.add_argument('--cond_top_frac', type=float, default=0.25)
     # parser.add_argument('--cfg_scale', type=float, default=2.0)
     
