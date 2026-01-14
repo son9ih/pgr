@@ -458,8 +458,8 @@ def redq_sac(
         # train RND predictor network, once in a epoch
         # if (t + 1) % steps_per_epoch == 0 and args.rnd:
         # if (t + 1) % steps_per_epoch == 0:
-        # if d or (ep_len == max_ep_len):
-        if (ep_len == max_ep_len):
+        if d or (ep_len == max_ep_len):
+        # if (ep_len == max_ep_len):
             # print(t)
             # print(d)
             # print(ep_len == max_ep_len)
@@ -469,8 +469,8 @@ def redq_sac(
             logger.store(PredLoss=pred_loss)
             logger.log_tabular('PredLoss', average_only=True)
 
-        # if d or (ep_len == max_ep_len):
-        if (ep_len == max_ep_len):
+        if d or (ep_len == max_ep_len):
+        # if (ep_len == max_ep_len):
             # Update discounted intrinsic return statistics at end of episode (for PGRrnd)
             if args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
                 agent.update_discounted_return_stats(gamma=gamma)
