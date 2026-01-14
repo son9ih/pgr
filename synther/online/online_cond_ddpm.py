@@ -753,7 +753,6 @@ def redq_sac(
                 # EMA: Instead of using original prior, we use EMA model
                 
                 # TODO: deep copy prior_ema.ema_model to prior_model
-                # breakpoint()
                 # TODO: This is the main cause of not decreasing the loss
                 # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
                 #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
