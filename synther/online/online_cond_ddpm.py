@@ -34,6 +34,7 @@ import pdb
 
 import matplotlib.pyplot as plt
 import os
+from scipy.stats import gaussian_kde
 
 from sklearn.manifold import TSNE
 
@@ -129,6 +130,7 @@ def redq_sac(
         if args.rtb:
 
             wandb.init(
+            entity="gda-for-orl",
             project = f'{env_name}',
             group = f'{run_name.split("_")[-1]}+{args.novelty_measure}',
             name = f' {run_name}_NoV{args.novelty_measure}_alpha_rtb{args.alpha_rtb}_IoP{args.inter_onpolicy}',
@@ -187,6 +189,7 @@ def redq_sac(
             
         elif args.algorithm == 'PGR':
             wandb.init(
+                entity="gda-for-orl",
                 project = f'{env_name}',
                 group = f'{run_name.split("_")[-1]}+{args.novelty_measure}',
                 name = f' {run_name}_NoV{args.novelty_measure}',
@@ -248,6 +251,7 @@ def redq_sac(
         # args.results_folder = run_name
 
             wandb.init(
+                entity="gda-for-orl",
                 project = f'{env_name}',
                 group = f'{run_name.split("_")[-1]}',
                 name = run_name,
@@ -1116,8 +1120,8 @@ def redq_sac(
             # Sample real and diffusion observations
             with torch.no_grad():
                 # Sample real data from replay buffer
-                real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
-                diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
+                real_obs_tensor, real_next_obs_tensor, real_act_tensor, _, _ = agent.sample_real_data(batch_size=5000)
+                diffusion_obs_tensor, diffusion_next_obs_tensor, diffusion_act_tensor, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
                 if args.novelty_measure == 'eco':
                     # ECO uses compute_eco_reward with current obs
@@ -1127,13 +1131,33 @@ def redq_sac(
                     # Combined 10k observations and novelty
                     combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
                     combined_novelty = agent.compute_eco_reward(combined_obs_tensor).cpu().numpy().squeeze()
-                else:
-                    # RND uses compute_intrinsic_reward
+                elif args.novelty_measure == 'curiosity':
+                    # real_novelty = agent.compute_curiosity_reward(real_obs_tensor).cpu().numpy().squeeze()
+                    # diffusion_novelty = agent.compute_curiosity_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
+                    # # Combined 10k observations and novelty
+                    # combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
+                    # combined_novelty = agent.compute_curiosity_reward(combined_obs_tensor).cpu().numpy().squeeze()
+                    real_novelty = agent.cond_net.compute_reward_torch(real_obs_tensor, real_next_obs_tensor, real_act_tensor).cpu().numpy().squeeze()
+                    diffusion_novelty = agent.cond_net.compute_reward_torch(diffusion_obs_tensor, diffusion_next_obs_tensor, diffusion_act_tensor).cpu().numpy().squeeze()
+                    # Combined 10k observations and novelty
+                    combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
+                    combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
+                    combined_act_tensor = torch.cat([real_act_tensor, diffusion_act_tensor], dim=0)
+                    combined_novelty = agent.cond_net.compute_reward_torch(combined_obs_tensor, combined_next_obs_tensor, combined_act_tensor).cpu().numpy().squeeze()
+                elif args.novelty_measure == 'rnd':
                     real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
                     diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
                     # Combined 10k observations and novelty
                     combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
-                    combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()     
+                    combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                else:
+                    # # RND uses compute_intrinsic_reward
+                    # real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                    # diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                    # # Combined 10k observations and novelty
+                    # combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
+                    # combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()     
+                    raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
 
 
             cur_epoch = t // steps_per_epoch
@@ -1144,95 +1168,135 @@ def redq_sac(
                 # Prepare output directory
                 out_dir = os.path.join(args.results_folder, 'histograms')
                 os.makedirs(out_dir, exist_ok=True)
-                # cur_epoch = t // steps_per_epoch
 
-                # # Build shared bins/ranges using the widest x-range across the three arrays
-                # x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
-                # x_max = float(max(real_novelty.max(), diffusion_novelty.max(), combined_novelty.max()))
-                # if x_min == x_max:
-                #     # avoid zero-width bins if all values are identical
-                #     x_min -= 1e-8
-                #     x_max += 1e-8
-                # num_bins = 100
-                # bins = np.linspace(x_min, x_max, num_bins + 1)
-                # Build shared bins/ranges using the widest x-range across the three arrays
-                x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
-                x_max = float(np.percentile(combined_novelty, 100))  # Top 100% threshold
+                # Compute statistics from full data (before filtering)
+                real_mean = float(real_novelty.mean())
+                diffusion_mean = float(diffusion_novelty.mean())
+                real_median = float(np.median(real_novelty))
+                diffusion_median = float(np.median(diffusion_novelty))
+
+                # Record statistics separately (print and optionally save to file)
+                stats_text = f'Epoch {cur_epoch} Statistics:\n'
+                stats_text += f'Real Obs - Mean: {real_mean:.7f}, Median: {real_median:.7f}\n'
+                stats_text += f'Diffusion Obs - Mean: {diffusion_mean:.7f}, Median: {diffusion_median:.7f}\n'
+                print(stats_text)
+                
+                # Save statistics to file
+                stats_file = os.path.join(out_dir, f'novelty_stats_epoch{cur_epoch:04d}.txt')
+                with open(stats_file, 'w') as f:
+                    f.write(stats_text)
+                print(f'Saved statistics to {stats_file}')
+                
+                include_percentile = 97
+
+                # Build bins using 95th percentile to exclude outliers for visualization
+                x_min = float(min(real_novelty.min(), diffusion_novelty.min()))
+                x_max = float(max(np.percentile(real_novelty, include_percentile), np.percentile(diffusion_novelty, include_percentile)))
                 if x_min == x_max:
                     # avoid zero-width bins if all values are identical
                     x_min -= 1e-8
                     x_max += 1e-8
-                num_bins = 100
+                num_bins = 60
                 bins = np.linspace(x_min, x_max, num_bins + 1)
 
-                # Pre-compute counts to unify y-axis range by the maximum count among the three
+                # Pre-compute counts to unify y-axis range
                 counts_real, _ = np.histogram(real_novelty, bins=bins)
                 counts_diff, _ = np.histogram(diffusion_novelty, bins=bins)
-                counts_comb, _ = np.histogram(combined_novelty, bins=bins)
-                y_max = int(max(counts_real.max(), counts_diff.max(), counts_comb.max()))
+                y_max = int(max(counts_real.max(), counts_diff.max()))
                 # small headroom on y-axis
                 y_max = max(1, int(np.ceil(y_max * 1.05)))
 
-                # Compute mean values
-                # real_mean = float(real_novelty.mean())
-                real_mean = float(real_novelty.mean())
-                # 12/24: 상위 10% reward를 제외한 평균 reward 사용, 즉 Stdnormalizer의 mean 사용
-                # real_mean = reward_mean
-                # real_mean = reward_mean
-                diffusion_mean = float(diffusion_novelty.mean())
-                # combined_mean = float(combined_novelty.mean())
-                combined_mean = float(combined_novelty.mean())
+                # Determine x-axis label based on novelty measure
+                novelty_label_map = {
+                    'rnd': 'RND',
+                    'eco': 'ECO',
+                    'curiosity': 'Curiosity'
+                }
+                xlabel = novelty_label_map.get(args.novelty_measure, 'Novelty')
+
+                # Plot combined histogram with both real and diffusion data
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.hist(real_novelty, bins=bins, color='tab:blue', alpha=0.6, label='Real Obs', edgecolor='black', linewidth=0.5)
+                ax.hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.6, label='Diffusion Obs', edgecolor='black', linewidth=0.5)
+                ax.set_xlabel(xlabel, fontsize=12)
+                ax.set_ylabel('Count', fontsize=12)
+                # ax.set_title(f'{xlabel} Distribution Comparison (Epoch {cur_epoch})', fontsize=14)
+                # ax.legend(loc='best', fontsize=10)
+                ax.grid(True, alpha=0.3)
                 
-                real_median = float(np.median(real_novelty))
-                diffusion_median = float(np.median(diffusion_novelty))
-                combined_median = float(np.median(combined_novelty))
-
-                print(f'Real novelty mean: {real_mean:.7f}')
-                print(f'Diffusion novelty mean: {diffusion_mean:.7f}')
-                print(f'Combined novelty mean: {combined_mean:.7f}')
-
-
-                # Plot and save combined histogram figure with shared axes
-                fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
-                axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
-                axes[0].axvline(real_mean, color='red', linestyle='--', linewidth=2)
-                axes[0].axvline(real_median, color='blue', linestyle='--', linewidth=2)
-                axes[0].set_title('Real Obs Novelty')
-                axes[0].set_xlabel('Novelty')
-                axes[0].set_ylabel('Count')
-
-                axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
-                axes[1].axvline(diffusion_mean, color='red', linestyle='--', linewidth=2)
-                axes[1].axvline(diffusion_median, color='blue', linestyle='--', linewidth=2)
-                axes[1].set_title('Diffusion Obs Novelty')
-                axes[1].set_xlabel('Novelty')
-                axes[1].set_ylabel('Count')
-
-                axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
-                # axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
-                axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
-                axes[2].axvline(combined_median, color='blue', linestyle='--', linewidth=2)
-                axes[2].set_title('Combined (10k) Novelty')
-                axes[2].set_xlabel('Novelty')
-                axes[2].set_ylabel('Count')
-
-                # Unify axis ranges across all three plots
-                for ax in axes:
-                    ax.set_xlim(bins[0], bins[-1])
-                    ax.set_ylim(0, y_max)
-
+                # Set x-axis limits and set 5 ticks
+                ax.set_xlim(bins[0], bins[-1])
+                ax.set_ylim(0, y_max)
+                ax.set_xticks(np.linspace(bins[0], bins[-1], 5))
+                
                 plt.tight_layout()
 
                 # Optionally log to Weights & Biases
                 if args.wandb:
                     wandb.log({
-                        'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
-                    # }, step=t+1)novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                        'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}'),
+                        'stats/real_novelty_mean': real_mean,
+                        'stats/real_novelty_median': real_median,
+                        'stats/diffusion_novelty_mean': diffusion_mean,
+                        'stats/diffusion_novelty_median': diffusion_median
                     }, step=cur_epoch)
                 out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
                 fig.savefig(out_path)
                 plt.close(fig)
                 print(f'Saved novelty histogram to {out_path}')
+
+                # Plot density plot version
+                fig_density, ax_density = plt.subplots(figsize=(10, 6))
+                
+                # Filter data to include_percentile for visualization
+                real_novelty_filtered = real_novelty[real_novelty <= np.percentile(real_novelty, include_percentile)]
+                diffusion_novelty_filtered = diffusion_novelty[diffusion_novelty <= np.percentile(diffusion_novelty, include_percentile)]
+                
+                # Create KDE for both distributions
+                density_max = 0
+                if len(real_novelty_filtered) > 1:
+                    kde_real = gaussian_kde(real_novelty_filtered)
+                    x_real = np.linspace(x_min, x_max, 200)
+                    density_real = kde_real(x_real)
+                    density_max = max(density_max, density_real.max())
+                    ax_density.plot(x_real, density_real, color='tab:blue', linewidth=2, alpha=0.8, label='Real Obs')
+                    ax_density.fill_between(x_real, density_real, alpha=0.3, color='tab:blue')
+                
+                if len(diffusion_novelty_filtered) > 1:
+                    kde_diffusion = gaussian_kde(diffusion_novelty_filtered)
+                    x_diffusion = np.linspace(x_min, x_max, 200)
+                    density_diffusion = kde_diffusion(x_diffusion)
+                    density_max = max(density_max, density_diffusion.max())
+                    ax_density.plot(x_diffusion, density_diffusion, color='tab:orange', linewidth=2, alpha=0.8, label='Diffusion Obs')
+                    ax_density.fill_between(x_diffusion, density_diffusion, alpha=0.3, color='tab:orange')
+                
+                ax_density.set_xlabel(xlabel, fontsize=12)
+                ax_density.set_ylabel('Density', fontsize=12)
+                ax_density.grid(True, alpha=0.3)
+                
+                # Set x-axis limits and set 5 ticks
+                ax_density.set_xlim(x_min, x_max)
+                ax_density.set_xticks(np.linspace(x_min, x_max, 5))
+                
+                # Set y-axis limits for density (with small headroom, ensure y starts at 0)
+                if density_max > 0:
+                    ax_density.set_ylim(bottom=0, top=density_max * 1.1)
+                else:
+                    ax_density.set_ylim(bottom=0)
+                # Format y-axis to show proper density values (not count-like integers)
+                ax_density.ticklabel_format(style='scientific', axis='y', scilimits=(0,0), useMathText=True)
+                
+                plt.tight_layout()
+
+                # Optionally log to Weights & Biases
+                if args.wandb:
+                    wandb.log({
+                        'images/novelty_density': wandb.Image(fig_density, caption=f'Epoch {cur_epoch}')
+                    }, step=cur_epoch)
+                out_path_density = os.path.join(out_dir, f'novelty_density_epoch{cur_epoch:04d}.png')
+                fig_density.savefig(out_path_density)
+                plt.close(fig_density)
+                print(f'Saved novelty density plot to {out_path_density}')
                 
                 # =============================================================================
                 # Full replay buffer novelty histogram
@@ -1553,7 +1617,7 @@ if __name__ == '__main__':
     parser.add_argument('--local_search', action='store_true', default=False)
     parser.add_argument('--local_search_epochs', type=int, default=10)
     
-    parser.add_argument('--train_batch_size', type=int, default=512)
+    parser.add_argument('--train_batch_size', type=int, default=256)
     parser.add_argument('--num_samples', type=int, default=1000000)
     parser.add_argument('--sample_batch_size', type=int, default=100000)
     parser.add_argument('--prior_lr_scheduler', type=str, default='cosine')
