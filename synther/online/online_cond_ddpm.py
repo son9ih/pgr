@@ -126,13 +126,16 @@ def redq_sac(
     disable_diffusion = args.disable_diffusion
 
     if args.wandb:
+        group_name = f'{run_name.split("_")[-1]}'
+        if args.inter_onpolicy > 0:
+            group_name += f'+{args.novelty_measure}'
 
         if args.rtb:
 
             wandb.init(
             entity="gda-for-orl",
             project = f'{env_name}',
-            group = f'{run_name.split("_")[-1]}+{args.novelty_measure}',
+            group = group_name,
             name = f' {run_name}_NoV{args.novelty_measure}_alpha_rtb{args.alpha_rtb}_IoP{args.inter_onpolicy}',
             config={
                 "env_name": env_name,
