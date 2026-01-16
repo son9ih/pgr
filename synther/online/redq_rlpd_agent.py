@@ -148,7 +148,9 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 memory_capacity=200,
                 replacement='random',
                 alpha=0.03,
-                beta=0.5,
+                # In order to always get positive reward, we set beta to 1.0
+                # beta=0.5,
+                beta=1.0,
                 similarity_threshold=0.5,
                 similarity_aggregation='percentile',
                 device=self.device
