@@ -919,6 +919,45 @@ class REDQCondTrainer(Trainer):
         
         return cond_distri
     
+    def train_from_redq_buffer_eco(self, buffer: ReplayBuffer, agent, top_frac, 
+                               curr_epoch: int,
+                               num_steps: Optional[int] = None):
+        # ECO uses r_network, not pred_net/fix_net
+        if agent.eco is not None and hasattr(agent.eco, 'r_network'):
+            agent.eco.r_network.eval()
+        cond_distri = CondDistri_ECO(agent, self.batch_size, buffer, top_frac)
+        self.update_cond_normalizer(cond_distri, device=self.accelerator.device)
+
+        # Set diffusion model to training mode
+        self.model.train()
+        
+        num_steps = num_steps or self.train_num_steps
+        for j in range(num_steps):
+            b = cond_distri.sample_batch(self.batch_size)
+            obs = b['obs1']
+            next_obs = b['obs2']
+            actions = b['acts']
+            rewards = b['rews'][:, None]
+            done = b['done'][:, None]
+            cond_signal = b['irews'][:, None]
+
+            data = [obs, actions, rewards, next_obs]
+            if self.model_terminals:
+                data.append(done)
+            data = np.concatenate(data, axis=1)
+            data = torch.from_numpy(data).float()
+            cond_signal = torch.from_numpy(cond_signal).float()
+            if self.args.synther:
+                loss = self.train_on_batch(data, cond=None)
+            else:
+                loss = self.train_on_batch(data, cond=cond_signal)
+            if j % 1000 == 0:
+                print(f'[{j}/{num_steps}] loss: {loss:.4f}')
+        
+        # self.save_final(cond_distri, curr_epoch, num_steps)
+        
+        return cond_distri
+    
     def update_cond_normalizer(self, cond_distri, device=None):
         data = cond_distri.irews_buf[:, None]
         data = torch.from_numpy(data).float()

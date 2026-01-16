@@ -16,13 +16,13 @@ from redq.algos.core import mbpo_epoches, test_agent
 from redq.utils.bias_utils import log_bias_evaluation
 from redq.utils.logx import EpochLogger
 from redq.utils.run_utils import setup_logger_kwargs
-from synther.diffusion.elucidated_diffusion import REDQCondTrainer
+from synther.diffusion.elucidated_diffusion import REDQCondTrainer, CondDistri_RND, CondDistri, CondDistri_ECO
 from synther.diffusion.diffusion_generator import CondDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model, split_diffusion_samples
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
 
 import wandb
-from synther.online.utils import PBE, RMS, compute_intr_reward
+from synther.online.utils import PBE, RMS, compute_intr_reward, make_inputs_from_replay_buffer
 import pdb
 
 import copy
@@ -34,6 +34,7 @@ import pdb
 
 import matplotlib.pyplot as plt
 import os
+from scipy.stats import gaussian_kde
 
 from sklearn.manifold import TSNE
 
@@ -162,6 +163,8 @@ def redq_sac(
                 "pow_reward": args.pow_reward,
                 # "sample_freq": args.sample_freq,
                 "gin_config_files": args.gin_config_files,
+                "novelty_measure": args.novelty_measure,
+                # "inter_onpolicy": args.inter_onpolicy,
             })
 
         elif args.finetune:
@@ -239,6 +242,8 @@ def redq_sac(
                     "cond_top_frac": cond_top_frac,
                     "cfg_scale": cfg_scale,
                     "cond_hidden_size": cond_hidden_size,
+                    "novelty_measure": args.novelty_measure,
+                    # "inter_onpolicy": args.inter_onpolicy,
                 }
             )
         print(f'Initialized wandb with run name {run_name}')
@@ -320,6 +325,11 @@ def redq_sac(
                               utd_ratio, num_Q, num_min, q_target_mode,
                               policy_update_delay,
                               args.rnd)
+    
+    # Enable intrinsic reward normalization for algorithms using rnd
+    if args.novelty_measure == 'rnd':
+        agent.set_normalize_intrinsic_reward(True)
+        print('Enabled intrinsic reward normalization for rnd')
 
     # pbe for state entropy evaluation
     # if args.state_ent:
@@ -339,7 +349,11 @@ def redq_sac(
 
     # o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
     # Because they truncate before 1000, never get to 1000
-    o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0   
+    o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+    
+    # Initialize ECO episodic memory at episode start
+    if args.novelty_measure == 'eco':
+        agent.reset_eco_episode()
 
     # One-time header registration guard for StateEnt to avoid header errors
     # state_ent_header_initialized = False
@@ -360,6 +374,22 @@ def redq_sac(
 
         # give new data to replay buffer
         agent.store_data(o, a, r, o2, d)
+        
+        # Accumulate intrinsic reward during episode (for PGRrnd normalization)
+        if args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
+            # Compute and accumulate intrinsic reward for this step
+            o2_tensor = torch.FloatTensor(o2).unsqueeze(0).to(device)
+            agent.pred_net.eval()
+            _ = agent.compute_intrinsic_reward(o2_tensor, accumulate=True)
+            agent.pred_net.train()
+        
+        # Compute ECO reward for current observation (before action was taken)
+        # According to paper: "takes the current observation o as input"
+        # Note: o is the observation at time t (before action a was taken)
+        if args.novelty_measure == 'eco':
+            o_tensor = torch.FloatTensor(o).unsqueeze(0).to(device)
+            _ = agent.compute_eco_reward(o_tensor, torch.tensor([d]).to(device) if isinstance(d, (bool, np.bool_)) else None)
+        
         # let agent update
         agent.train(logger)
         # set obs to next obs
@@ -381,13 +411,25 @@ def redq_sac(
             logger.log_tabular('PredLoss', average_only=True)
 
         # if d or (ep_len == max_ep_len):
-        if (ep_len == max_ep_len):
+        if d or (ep_len == max_ep_len):
+            # Update discounted intrinsic return statistics at end of episode (for PGRrnd)
+            if args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
+                agent.update_discounted_return_stats(gamma=gamma)
+            
+            # Reset ECO episodic memory at episode end
+            if args.novelty_measure == 'eco':
+                agent.reset_eco_episode()
+            
             # store episode return and length to logger
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             # reset environment
             # o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
             # Because they truncate before 1000, never get to 1000
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+            
+            # Initialize ECO episodic memory at episode start
+            if args.novelty_measure == 'eco':
+                agent.reset_eco_episode()
 
         # Retrain diffusion model periodically, then finetune if specified
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
@@ -414,12 +456,17 @@ def redq_sac(
                 args=args,
             )
             diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
-            if not args.rnd:
+            if args.novelty_measure == 'curiosity':
                 cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
                                                                    curr_epoch=(t // steps_per_epoch) + 1)
-            else:
+            elif args.novelty_measure == 'rnd':
                 cond_distri = diffusion_trainer.train_from_redq_buffer_rnd(agent.replay_buffer, agent, top_frac=cond_top_frac,
                                                                    curr_epoch=(t // steps_per_epoch) + 1)
+            elif args.novelty_measure == 'eco':
+                cond_distri = diffusion_trainer.train_from_redq_buffer_eco(agent.replay_buffer, agent, top_frac=cond_top_frac,
+                                                                   curr_epoch=(t // steps_per_epoch) + 1)
+            else:
+                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
             agent.reset_diffusion_buffer()
 
             # if args.finetune:
@@ -501,6 +548,8 @@ def redq_sac(
                 # load Data from replay buffer
                 ptr_location = agent.replay_buffer.ptr
                 all_next_obs = torch.FloatTensor(agent.replay_buffer.obs2_buf[:ptr_location]).to(device)
+                all_obs = torch.FloatTensor(agent.replay_buffer.obs1_buf[:ptr_location]).to(device)
+                all_actions = torch.FloatTensor(agent.replay_buffer.acts_buf[:ptr_location]).to(device)
 
                 # Compute average of total rewards in batch-level computation
                 all_rewards = []
@@ -508,7 +557,16 @@ def redq_sac(
                 with torch.no_grad():
                     for i in range(0, ptr_location, batch_size_stat):
                         batch_next_obs = all_next_obs[i:i+batch_size_stat]
-                        batch_rewards = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
+                        batch_obs = all_obs[i:i+batch_size_stat]
+                        batch_actions = all_actions[i:i+batch_size_stat]
+                        if args.novelty_measure == 'rnd':
+                            batch_rewards = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
+                        elif args.novelty_measure == 'curiosity':
+                            batch_rewards = agent.cond_net.compute_reward_torch(batch_obs, batch_next_obs, batch_actions)
+                        elif args.novelty_measure == 'eco':
+                            batch_rewards = agent.compute_eco_reward(batch_obs)
+                        else:
+                            raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                         all_rewards.append(batch_rewards)
                     # calculate reward of one batch
                     all_rewards = torch.cat(all_rewards, dim=0)
@@ -650,7 +708,15 @@ def redq_sac(
                         # Normalize x1
                         x1_normalized = backprop_model.normalizer.normalize(x1)
                         with torch.no_grad():
-                            rewards = agent.compute_intrinsic_reward(next_obs, square=args.square,pow_reward=args.pow_reward)  # r(x1)
+                            # Compute reward based on novelty measure
+                            if args.novelty_measure == 'rnd':
+                                rewards = agent.compute_intrinsic_reward(next_obs, accumulate=False)
+                            elif args.novelty_measure == 'curiosity':
+                                rewards = agent.cond_net.compute_reward_torch(obs, next_obs, act)
+                            elif args.novelty_measure == 'eco':
+                                rewards = agent.compute_eco_reward(obs)
+                            else:
+                                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                             # Clamp rewards to [5th percentile, 95th percentile]
                             rewards = torch.clamp(rewards, min=reward_percentile_5, max=reward_percentile_95)
                             # Normalize rewards using average and std computed from entire buffer
@@ -711,12 +777,19 @@ def redq_sac(
                                     pre_trained_model=pre_trained_model
                                 )
 
-                                # Extract obs_next_x from chunk
-                                _, _, _, obs_next_x_chunk = split_diffusion_samples(x_chunk, env)
+                                # Extract obs and next_obs from chunk
+                                obs_x_chunk, act_x_chunk, _, obs_next_x_chunk = split_diffusion_samples(x_chunk, env)
 
                                 # Compute reward for sampled x chunk
                                 with torch.no_grad():
-                                    rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk, square=args.square, pow_reward=args.pow_reward)
+                                    if args.novelty_measure == 'rnd':
+                                        rewards_sample_chunk = agent.compute_intrinsic_reward(obs_next_x_chunk, accumulate=False)
+                                    elif args.novelty_measure == 'curiosity':
+                                        rewards_sample_chunk = agent.cond_net.compute_reward_torch(obs_x_chunk, obs_next_x_chunk, act_x_chunk)
+                                    elif args.novelty_measure == 'eco':
+                                        rewards_sample_chunk = agent.compute_eco_reward(obs_x_chunk)
+                                    else:
+                                        raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                                     # Clamp rewards to [5th percentile, 95th percentile]
                                     rewards_sample_chunk = torch.clamp(rewards_sample_chunk, min=reward_percentile_5, max=reward_percentile_95)
                                 rewards_sample_norm_chunk = (rewards_sample_chunk - reward_mean) / (reward_std + 1e-8)
@@ -996,6 +1069,8 @@ def redq_sac(
                 # Sync EMA model with fine-tuned weights
                 diffusion_trainer.ema.ema_model.load_state_dict(backprop_model.state_dict())
                 print('RTB fine-tuning complete. Synced EMA model with fine-tuned weights.')
+                
+                # =======================================finish rtb fine-tuning=======================================
 
 
             # Add samples to agent replay buffer
@@ -1034,14 +1109,33 @@ def redq_sac(
             # Sample real and diffusion observations
             with torch.no_grad():
                 # Sample real data from replay buffer
-                real_obs_tensor, real_next_obs_tensor, _, _, _ = agent.sample_real_data(batch_size=5000)
-                diffusion_obs_tensor, diffusion_next_obs_tensor, _, _, _ = agent.sample_diffusion_data(batch_size=5000)
+                real_obs_tensor, real_next_obs_tensor, real_act_tensor, _, _ = agent.sample_real_data(batch_size=5000)
+                diffusion_obs_tensor, diffusion_next_obs_tensor, diffusion_act_tensor, _, _ = agent.sample_diffusion_data(batch_size=5000)
                 # Compute novelty (squeezed)
-                real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()
-                diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()
-                # Combined 10k observations and novelty
-                combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
-                combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, square=args.square, pow_reward=args.pow_reward).cpu().numpy().squeeze()     
+                if args.novelty_measure == 'eco':
+                    # ECO uses compute_eco_reward with current obs
+                    # According to paper: "takes the current observation o as input"
+                    real_novelty = agent.compute_eco_reward(real_obs_tensor).cpu().numpy().squeeze()
+                    diffusion_novelty = agent.compute_eco_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
+                    # Combined 10k observations and novelty
+                    combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
+                    combined_novelty = agent.compute_eco_reward(combined_obs_tensor).cpu().numpy().squeeze()
+                elif args.novelty_measure == 'curiosity':
+                    real_novelty = agent.cond_net.compute_reward_torch(real_obs_tensor, real_next_obs_tensor, real_act_tensor).cpu().numpy().squeeze()
+                    diffusion_novelty = agent.cond_net.compute_reward_torch(diffusion_obs_tensor, diffusion_next_obs_tensor, diffusion_act_tensor).cpu().numpy().squeeze()
+                    # Combined 10k observations and novelty
+                    combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
+                    combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
+                    combined_act_tensor = torch.cat([real_act_tensor, diffusion_act_tensor], dim=0)
+                    combined_novelty = agent.cond_net.compute_reward_torch(combined_obs_tensor, combined_next_obs_tensor, combined_act_tensor).cpu().numpy().squeeze()
+                elif args.novelty_measure == 'rnd':
+                    real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                    diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                    # Combined 10k observations and novelty
+                    combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
+                    combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                else:
+                    raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')     
 
 
             cur_epoch = t // steps_per_epoch
@@ -1063,90 +1157,141 @@ def redq_sac(
                 #     x_max += 1e-8
                 # num_bins = 100
                 # bins = np.linspace(x_min, x_max, num_bins + 1)
-                # Build shared bins/ranges using the widest x-range across the three arrays
-                x_min = float(min(real_novelty.min(), diffusion_novelty.min(), combined_novelty.min()))
-                x_max = float(np.percentile(combined_novelty, 100))  # Top 100% threshold
+                # Compute statistics from full data (before filtering)
+                real_mean = float(real_novelty.mean())
+                diffusion_mean = float(diffusion_novelty.mean())
+                real_median = float(np.median(real_novelty))
+                diffusion_median = float(np.median(diffusion_novelty))
+
+                # Record statistics separately (print and optionally save to file)
+                stats_text = f'Epoch {cur_epoch} Statistics:\n'
+                stats_text += f'Real Obs - Mean: {real_mean:.7f}, Median: {real_median:.7f}\n'
+                stats_text += f'Diffusion Obs - Mean: {diffusion_mean:.7f}, Median: {diffusion_median:.7f}\n'
+                print(stats_text)
+                
+                # Save statistics to file
+                stats_file = os.path.join(out_dir, f'novelty_stats_epoch{cur_epoch:04d}.txt')
+                with open(stats_file, 'w') as f:
+                    f.write(stats_text)
+                print(f'Saved statistics to {stats_file}')
+                
+                include_percentile = 97
+
+                # Build bins using 95th percentile to exclude outliers for visualization
+                x_min = float(min(real_novelty.min(), diffusion_novelty.min()))
+                x_max = float(max(np.percentile(real_novelty, include_percentile), np.percentile(diffusion_novelty, include_percentile)))
                 if x_min == x_max:
                     # avoid zero-width bins if all values are identical
                     x_min -= 1e-8
                     x_max += 1e-8
-                num_bins = 100
+                num_bins = 60
                 bins = np.linspace(x_min, x_max, num_bins + 1)
 
-                # Pre-compute counts to unify y-axis range by the maximum count among the three
+                # Pre-compute counts to unify y-axis range
                 counts_real, _ = np.histogram(real_novelty, bins=bins)
                 counts_diff, _ = np.histogram(diffusion_novelty, bins=bins)
-                counts_comb, _ = np.histogram(combined_novelty, bins=bins)
-                y_max = int(max(counts_real.max(), counts_diff.max(), counts_comb.max()))
+                y_max = int(max(counts_real.max(), counts_diff.max()))
                 # small headroom on y-axis
                 y_max = max(1, int(np.ceil(y_max * 1.05)))
 
-                # Compute mean values
-                # real_mean = float(real_novelty.mean())
-                real_mean = float(real_novelty.mean())
-                # 12/24: 상위 10% reward를 제외한 평균 reward 사용, 즉 Stdnormalizer의 mean 사용
-                # real_mean = reward_mean
-                # real_mean = reward_mean
-                diffusion_mean = float(diffusion_novelty.mean())
-                # combined_mean = float(combined_novelty.mean())
-                combined_mean = float(combined_novelty.mean())
+                # Determine x-axis label based on novelty measure
+                novelty_label_map = {
+                    'rnd': 'RND',
+                    'eco': 'ECO',
+                    'curiosity': 'Curiosity'
+                }
+                xlabel = novelty_label_map.get(args.novelty_measure, 'Novelty')
+
+                # Plot combined histogram with both real and diffusion data
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.hist(real_novelty, bins=bins, color='tab:blue', alpha=0.6, label='Real Obs', edgecolor='black', linewidth=0.5)
+                ax.hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.6, label='Diffusion Obs', edgecolor='black', linewidth=0.5)
+                ax.set_xlabel(xlabel, fontsize=12)
+                ax.set_ylabel('Count', fontsize=12)
+                # ax.set_title(f'{xlabel} Distribution Comparison (Epoch {cur_epoch})', fontsize=14)
+                # ax.legend(loc='best', fontsize=10)
+                ax.grid(True, alpha=0.3)
                 
-                real_median = float(np.median(real_novelty))
-                diffusion_median = float(np.median(diffusion_novelty))
-                combined_median = float(np.median(combined_novelty))
-
-                print(f'Real novelty mean: {real_mean:.7f}')
-                print(f'Diffusion novelty mean: {diffusion_mean:.7f}')
-                print(f'Combined novelty mean: {combined_mean:.7f}')
-
-
-                # Plot and save combined histogram figure with shared axes
-                fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
-                axes[0].hist(real_novelty, bins=bins, color='tab:blue', alpha=0.8)
-                axes[0].axvline(real_mean, color='red', linestyle='--', linewidth=2)
-                axes[0].axvline(real_median, color='blue', linestyle='--', linewidth=2)
-                axes[0].set_title('Real Obs Novelty')
-                axes[0].set_xlabel('Novelty')
-                axes[0].set_ylabel('Count')
-
-                axes[1].hist(diffusion_novelty, bins=bins, color='tab:orange', alpha=0.8)
-                axes[1].axvline(diffusion_mean, color='red', linestyle='--', linewidth=2)
-                axes[1].axvline(diffusion_median, color='blue', linestyle='--', linewidth=2)
-                axes[1].set_title('Diffusion Obs Novelty')
-                axes[1].set_xlabel('Novelty')
-                axes[1].set_ylabel('Count')
-
-                axes[2].hist(combined_novelty, bins=bins, color='tab:green', alpha=0.8)
-                # axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
-                axes[2].axvline(combined_mean, color='red', linestyle='--', linewidth=2)
-                axes[2].axvline(combined_median, color='blue', linestyle='--', linewidth=2)
-                axes[2].set_title('Combined (10k) Novelty')
-                axes[2].set_xlabel('Novelty')
-                axes[2].set_ylabel('Count')
-
-                # Unify axis ranges across all three plots
-                for ax in axes:
-                    ax.set_xlim(bins[0], bins[-1])
-                    ax.set_ylim(0, y_max)
-
+                # Set x-axis limits and set 5 ticks
+                ax.set_xlim(bins[0], bins[-1])
+                ax.set_ylim(0, y_max)
+                ax.set_xticks(np.linspace(bins[0], bins[-1], 5))
+                
                 plt.tight_layout()
 
                 # Optionally log to Weights & Biases
                 if args.wandb:
                     wandb.log({
-                        'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
-                    # }, step=t+1)novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}')
+                        'images/novelty_hist': wandb.Image(fig, caption=f'Epoch {cur_epoch}'),
+                        'stats/real_novelty_mean': real_mean,
+                        'stats/real_novelty_median': real_median,
+                        'stats/diffusion_novelty_mean': diffusion_mean,
+                        'stats/diffusion_novelty_median': diffusion_median
                     }, step=cur_epoch)
                 out_path = os.path.join(out_dir, f'novelty_hist_epoch{cur_epoch:04d}.png')
                 fig.savefig(out_path)
                 plt.close(fig)
                 print(f'Saved novelty histogram to {out_path}')
+
+                # Plot density plot version
+                fig_density, ax_density = plt.subplots(figsize=(10, 6))
+                
+                # Filter data to include_percentile for visualization
+                real_novelty_filtered = real_novelty[real_novelty <= np.percentile(real_novelty, include_percentile)]
+                diffusion_novelty_filtered = diffusion_novelty[diffusion_novelty <= np.percentile(diffusion_novelty, include_percentile)]
+                
+                # Create KDE for both distributions
+                density_max = 0
+                if len(real_novelty_filtered) > 1:
+                    kde_real = gaussian_kde(real_novelty_filtered)
+                    x_real = np.linspace(x_min, x_max, 200)
+                    density_real = kde_real(x_real)
+                    density_max = max(density_max, density_real.max())
+                    ax_density.plot(x_real, density_real, color='tab:blue', linewidth=2, alpha=0.8, label='Real Obs')
+                    ax_density.fill_between(x_real, density_real, alpha=0.3, color='tab:blue')
+                
+                if len(diffusion_novelty_filtered) > 1:
+                    kde_diffusion = gaussian_kde(diffusion_novelty_filtered)
+                    x_diffusion = np.linspace(x_min, x_max, 200)
+                    density_diffusion = kde_diffusion(x_diffusion)
+                    density_max = max(density_max, density_diffusion.max())
+                    ax_density.plot(x_diffusion, density_diffusion, color='tab:orange', linewidth=2, alpha=0.8, label='Diffusion Obs')
+                    ax_density.fill_between(x_diffusion, density_diffusion, alpha=0.3, color='tab:orange')
+                
+                ax_density.set_xlabel(xlabel, fontsize=12)
+                ax_density.set_ylabel('Density', fontsize=12)
+                ax_density.grid(True, alpha=0.3)
+                
+                # Set x-axis limits and set 5 ticks
+                ax_density.set_xlim(x_min, x_max)
+                ax_density.set_xticks(np.linspace(x_min, x_max, 5))
+                
+                # Set y-axis limits for density (with small headroom, ensure y starts at 0)
+                if density_max > 0:
+                    ax_density.set_ylim(bottom=0, top=density_max * 1.1)
+                else:
+                    ax_density.set_ylim(bottom=0)
+                # Format y-axis to show proper density values (not count-like integers)
+                ax_density.ticklabel_format(style='scientific', axis='y', scilimits=(0,0), useMathText=True)
+                
+                plt.tight_layout()
+
+                # Optionally log to Weights & Biases
+                if args.wandb:
+                    wandb.log({
+                        'images/novelty_density': wandb.Image(fig_density, caption=f'Epoch {cur_epoch}')
+                    }, step=cur_epoch)
+                out_path_density = os.path.join(out_dir, f'novelty_density_epoch{cur_epoch:04d}.png')
+                fig_density.savefig(out_path_density)
+                plt.close(fig_density)
+                print(f'Saved novelty density plot to {out_path_density}')
                 
                 # =============================================================================
                 # Full replay buffer novelty histogram
                 # =============================================================================
                 print('Computing novelty for full replay buffer...')
                 ptr_location = agent.replay_buffer.ptr
+                all_obs = agent.replay_buffer.obs1_buf[:ptr_location]
                 all_next_obs = agent.replay_buffer.obs2_buf[:ptr_location]
                 
                 # Compute novelty in batches to avoid memory issues
@@ -1155,12 +1300,20 @@ def redq_sac(
                 # topk_threshold = getattr(agent, 'topk_threshold', None)
                 with torch.no_grad():
                     for i in range(0, ptr_location, batch_size_novelty):
+                        batch_obs = torch.FloatTensor(all_obs[i:i+batch_size_novelty]).to(device)
                         batch_next_obs = torch.FloatTensor(all_next_obs[i:i+batch_size_novelty]).to(device)
-                        # if args.target_rnd_every > 0:
-                        #     batch_novelty_tensor = agent.compute_intrinsic_reward_temp(batch_next_obs)
-                        # else:
-                        
-                        batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, square=args.square, pow_reward=args.pow_reward)
+                        # Measure by different novelty measures
+                        if args.novelty_measure == 'eco':
+                            # ECO uses current obs (according to paper)
+                            batch_novelty_tensor = agent.compute_eco_reward(batch_obs)
+                        elif args.novelty_measure == 'rnd':
+                            # RND uses next_obs
+                            batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
+                        elif args.novelty_measure == 'curiosity':
+                            batch_actions = torch.FloatTensor(agent.replay_buffer.acts_buf[i:i+batch_size_novelty]).to(device)
+                            batch_novelty_tensor = agent.cond_net.compute_reward_torch(batch_obs, batch_next_obs, batch_actions)
+                        else:
+                            raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                         
                         # # Clip novelty values to topk_threshold if available
                         # if topk_threshold is not None:
@@ -1280,6 +1433,10 @@ def redq_sac(
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
             epoch = t // steps_per_epoch
+
+            # Update next_obs statistics from original buffer (for input normalization)
+            # This uses statistics from previous epoch's data
+            agent.update_next_obs_stats()
 
             # Test the performance of the deterministic version of the agent.
             returns = test_agent(agent, test_env, max_ep_len, logger, n_evals_per_epoch)  # add logging here
@@ -1624,6 +1781,9 @@ if __name__ == '__main__':
                         help='Ratio of top rewards to exclude when computing reward statistics and threshold (default: 0.3)')
     
     parser.add_argument('--pow_reward', type=float, default=1.0)
+    
+    parser.add_argument('--novelty_measure', type=str, default='curiosity') # 'curiosity', 'rnd', 'eco'
+    # parser.add_argument('--inter_onpolicy', type=float, default=0.1)
 
     args = parser.parse_args()
 
