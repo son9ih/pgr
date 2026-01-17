@@ -286,23 +286,21 @@ class ECO:
         
         # Initialize episodic memory
         self.episodic_memory = EpisodicMemory(capacity=memory_capacity, replacement=replacement)
-        
-        # Track episode state
-        self.current_episode_done = False
     
     def reset_episode(self):
         """Reset episodic memory at the start of a new episode."""
         self.episodic_memory.reset()
-        self.current_episode_done = False
     
     def compute_reward(self, current_obs: torch.Tensor, done: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute ECO intrinsic reward for current observation.
         
         According to the paper: "The episodic curiosity (EC) module takes the current observation o as input"
         
+        Note: For fixed-length episodes, done signal is not used.
+        
         Args:
             current_obs: [batch, obs_dim] or [obs_dim] tensor - current observation at time t
-            done: [batch] or scalar tensor indicating episode end (optional)
+            done: Ignored (kept for API compatibility with other novelty measures)
         
         Returns:
             intrinsic_reward: [batch] or scalar tensor
@@ -319,7 +317,6 @@ class ECO:
         
         for i in range(batch_size):
             obs_i = current_obs[i]
-            done_i = done[i].item() if done is not None and len(done.shape) > 0 else (done.item() if done is not None else False)
             
             # Embed observation
             with torch.no_grad():
@@ -333,19 +330,11 @@ class ECO:
             )
             
             # Compute intrinsic reward: α (β - similarity)
-            if done_i:
-                intrinsic_reward = 0.0
-            else:
-                intrinsic_reward = self.alpha * (self.beta - similarity)
+            # For fixed-length episodes, we don't need to check done signal
+            intrinsic_reward = self.alpha * (self.beta - similarity)
             
-            # Update episodic memory
-            if not done_i:
-                # Only add if similarity is below threshold
-                if similarity < self.similarity_threshold:
-                    self.episodic_memory.add(embedding_np)
-            else:
-                # Episode ended: reset memory and add first state of new episode
-                self.episodic_memory.reset()
+            # Update episodic memory: only add if similarity is below threshold
+            if similarity < self.similarity_threshold:
                 self.episodic_memory.add(embedding_np)
             
             rewards.append(intrinsic_reward)

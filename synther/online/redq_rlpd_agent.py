@@ -132,9 +132,11 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
         According to the paper: "The episodic curiosity (EC) module takes the current observation o as input"
         
+        Note: For fixed-length episodes, done signal is ignored.
+        
         Args:
             current_obs: [batch, obs_dim] or [obs_dim] tensor - current observation at time t
-            done: [batch] or scalar tensor indicating episode end (optional)
+            done: Ignored (kept for API compatibility)
         
         Returns:
             intrinsic_reward: [batch] or scalar tensor
@@ -156,7 +158,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 device=self.device
             )
         
-        return self.eco.compute_reward(current_obs, done)
+        # For fixed-length episodes, done is ignored
+        return self.eco.compute_reward(current_obs, done=None)
     
     def reset_eco_episode(self):
         """Reset ECO episodic memory at episode start."""
