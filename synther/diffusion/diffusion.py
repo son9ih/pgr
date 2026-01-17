@@ -556,6 +556,8 @@ class QFlow(nn.Module):
         self.qflow = copy.deepcopy(bc_net.policy)
         # Convert qflow to the correct dtype to match QFlow's dtype
         self.qflow = self.qflow.to(dtype=dtype)
+        for p in self.qflow.parameters():
+            p.requires_grad_(True)
         # self.qflow.is_qflow = True  # This makes things more than 1.5x slower
         # This appears to be not used
         self.qflow.q = q_net
@@ -993,6 +995,10 @@ class QFlow(nn.Module):
         else:
             q_r = q_r
         # q_r = self.q_net(next_obs).squeeze()
+        
+        # print("q_r min/max:", q_r.min().item(), q_r.max().item())
+        # print("q_r <= 0 count:", (q_r <= 0).sum().item())
+        # print("q_r finite:", torch.isfinite(q_r).all().item())
         return q_r
     
     def combined_posterior_log_reward(self, x, alpha=0.1):
@@ -1054,6 +1060,9 @@ class QFlow(nn.Module):
         # logr = self.bc_net.cond_normalizer.unnormalize(logr*2-1)
         # print(f'logr: {logr}')
         logr = logr.log()
+        
+        # print("logr finite:", torch.isfinite(logr).all().item())
+        # breakpoint()
         # pdb.set_trace()
         loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()
         return loss, self.logZ, x, logr

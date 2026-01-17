@@ -823,12 +823,22 @@ def redq_sac(
                 
                 # TODO: deep copy prior_ema.ema_model to prior_model
                 # TODO: This is the main cause of not decreasing the loss
-                # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
-                #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-                #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
-                posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
+                posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
                                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
                                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
+                
+                # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
+                #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
+                #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
+                
+                # def n_trainable(m):
+                #     return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+                # print("qflow trainable params:", n_trainable(posterior_model.qflow))
+                # print("bc_net policy trainable params:", n_trainable(posterior_model.bc_net.policy))
+                # print("logZ requires_grad:", posterior_model.logZ.requires_grad)
+                
+                # breakpoint()
                 # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
                 # posterior_model_optimizer = torch.optim.AdamW(posterior_model.parameters(), lr=args.finetune_lr)
                 
