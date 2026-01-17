@@ -1027,7 +1027,7 @@ def redq_sac(
                 # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
                 if args.algorithm == 'Ours':
                     posterior_model.eval()
-                    X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
+                    X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True, ddim=True)
                 elif args.algorithm == 'PGRrnd' or args.algorithm == 'PGR':
                     # prior_model.eval()
                     # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
@@ -1037,12 +1037,12 @@ def redq_sac(
                     prior_ema.ema_model.eval()
                     cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
                     cond = prior_ema.ema_model.cond_normalizer.normalize(cond)
-                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale)
+                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale, ddim=True)
                 elif args.algorithm == 'SER':
                     # prior_model.eval()
                     # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
                     prior_ema.ema_model.eval()
-                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
+                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None, ddim=True)
                 else:
                     raise ValueError(f'Invalid algorithm: {args.algorithm}')
                 
