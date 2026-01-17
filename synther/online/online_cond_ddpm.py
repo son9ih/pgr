@@ -977,8 +977,8 @@ def redq_sac(
                                 total_logZ += logZ.item()
                             else:
                                 total_logZ += logZ
-                            all_x_list.append(x)
-                            all_y_list.append(y)
+                            # all_x_list.append(x)
+                            # all_y_list.append(y)
                         
                         # Update weights after accumulating all gradients
                         posterior_model_optimizer.step()                
@@ -986,15 +986,15 @@ def redq_sac(
                             posterior_model_lr_scheduler.step()
                         
                         # Concatenate all samples
-                        x = torch.cat(all_x_list, dim=0)
-                        y = torch.cat(all_y_list, dim=0)
+                        # x = torch.cat(all_x_list, dim=0)
+                        # y = torch.cat(all_y_list, dim=0)
                         loss = total_loss / accumulation_steps  # Average loss for logging
                         logZ = total_logZ / accumulation_steps  # Average logZ for logging
                         
-                        xs = torch.cat([xs, x], dim=0)
-                        ys = torch.cat([ys, y], dim=0)
+                        # xs = torch.cat([xs, x], dim=0)
+                        # ys = torch.cat([ys, y], dim=0)
                         # breakpoint()
-                        y_weights = torch.softmax(ys, dim=0)
+                        # y_weights = torch.softmax(ys, dim=0)
                         print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss:.9f}')
                         
                         # Add data to wandb table
@@ -1655,7 +1655,7 @@ if __name__ == '__main__':
     parser.add_argument('--uniform', action='store_true', default=False)
     parser.add_argument('--diffusion_steps', type=int, default=500)
     parser.add_argument('--num_prior_epochs', type=int, default=100000)
-    parser.add_argument('--num_posterior_epochs', type=int, default=100)
+    parser.add_argument('--num_posterior_epochs', type=int, default=60)
     parser.add_argument('--training_posterior', type=str, default='both') # 'both', 'on', 'off'
     parser.add_argument('--filtering', action='store_true', default=False)
     parser.add_argument('--num_proposals', type=int, default=10)
