@@ -95,7 +95,7 @@ def redq_sac(
         # conditional generation hyperparameters
         cfg_dropout=0.25,
         cond_top_frac=0.05,
-        cfg_scale=1.0,
+        cfg_scale=2.0,
         cond_hidden_size=128,
         # following are bias evaluation related
         evaluate_bias=True,
@@ -188,6 +188,7 @@ def redq_sac(
                 "diffusion_steps": args.diffusion_steps,
                 "novelty_measure": args.novelty_measure,
                 "inter_onpolicy": args.inter_onpolicy,
+                "train_batch_size": args.train_batch_size,
             })
             
         elif args.algorithm == 'PGR':
@@ -247,6 +248,7 @@ def redq_sac(
                 "diffusion_steps": args.diffusion_steps,
                 "novelty_measure": args.novelty_measure,
                 "inter_onpolicy": args.inter_onpolicy,
+                "train_batch_size": args.train_batch_size,
                 }
             )
         else:
@@ -309,6 +311,7 @@ def redq_sac(
                 "diffusion_steps": args.diffusion_steps,
                 "novelty_measure": args.novelty_measure,
                 "inter_onpolicy": args.inter_onpolicy,
+                "train_batch_size": args.train_batch_size,
             }
             )
         print(f'Initialized wandb with run name {run_name}')
@@ -896,7 +899,7 @@ def redq_sac(
                             s1 = 1
                         
                         # Gradient accumulation settings
-                        accumulation_steps = 2
+                        accumulation_steps = 8
                         micro_batch_size = args.ft_batch_size // accumulation_steps
                         posterior_model_optimizer.zero_grad()
                         
@@ -1612,7 +1615,7 @@ if __name__ == '__main__':
     parser.add_argument('--backprop_epochs', type=int, default=10)
     parser.add_argument('--backprop_iters', type=int, default=10)
     parser.add_argument('--reward_coef', type=float, default=1.0)
-    parser.add_argument('--ft_batch_size', type=int, default=256)
+    parser.add_argument('--ft_batch_size', type=int, default=1024)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--kl_weight', type=float, default=10.0)
@@ -1640,16 +1643,16 @@ if __name__ == '__main__':
     
     # ddqm
     parser.add_argument('--uniform', action='store_true', default=False)
-    parser.add_argument('--diffusion_steps', type=int, default=128)
+    parser.add_argument('--diffusion_steps', type=int, default=500)
     parser.add_argument('--num_prior_epochs', type=int, default=100000)
-    parser.add_argument('--num_posterior_epochs', type=int, default=50)
+    parser.add_argument('--num_posterior_epochs', type=int, default=100)
     parser.add_argument('--training_posterior', type=str, default='both') # 'both', 'on', 'off'
     parser.add_argument('--filtering', action='store_true', default=False)
     parser.add_argument('--num_proposals', type=int, default=10)
     parser.add_argument('--local_search', action='store_true', default=False)
     parser.add_argument('--local_search_epochs', type=int, default=10)
     
-    parser.add_argument('--train_batch_size', type=int, default=256)
+    parser.add_argument('--train_batch_size', type=int, default=1024)
     parser.add_argument('--num_samples', type=int, default=1000000)
     parser.add_argument('--sample_batch_size', type=int, default=100000)
     parser.add_argument('--prior_lr_scheduler', type=str, default='cosine')
