@@ -451,10 +451,10 @@ def redq_sac(
         
         # Compute ECO reward for current observation (before action was taken)
         # According to paper: "takes the current observation o as input"
-        # Note: o is the observation at time t (before action a was taken)
+        # Note: For fixed-length episodes, done signal is ignored
         if args.novelty_measure == 'eco':
             o_tensor = torch.FloatTensor(o).unsqueeze(0).to(device)
-            _ = agent.compute_eco_reward(o_tensor, torch.tensor([d]).to(device) if isinstance(d, (bool, np.bool_)) else None)
+            _ = agent.compute_eco_reward(o_tensor)
         
         # let agent update
         agent.train(logger)
@@ -894,75 +894,104 @@ def redq_sac(
                             s1 = 0
                         else: # off
                             s1 = 1
-                            
-                            
-                        if s1 == 0:
-                            # on-policy
-                            print(f'On-policy training')
-                            # return normalized samples x
-                            loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=args.ft_batch_size)
-                            # Extract obs and next_obs from x for reward computation
-                            x_unnormalized = prior_model.normalizer.unnormalize(x)
-                            x_obs_unnormalized = x_unnormalized[:, :obs_dim]
-                            x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-                            # x_next_obs should be unnormalized as input of proxy_model_ens
-                            if args.novelty_measure == 'rnd':
-                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
-                            elif args.novelty_measure == 'curiosity':
-                                x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
-                                y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
-                            elif args.novelty_measure == 'eco':
-                                # ECO reward computation
-                                # According to paper: "takes the current observation o as input"
-                                # Use current obs (obs at time t, before action was taken)
-                                y = proxy_model_ens(x_obs_unnormalized).squeeze()
+                        
+                        # Gradient accumulation settings
+                        accumulation_steps = 2
+                        micro_batch_size = args.ft_batch_size // accumulation_steps
+                        posterior_model_optimizer.zero_grad()
+                        
+                        # Accumulate gradients over micro-batches
+                        total_loss = 0.0
+                        total_logZ = 0.0
+                        all_x_list = []
+                        all_y_list = []
+                        
+                        for acc_step in range(accumulation_steps):
+                            if s1 == 0:
+                                # on-policy
+                                if acc_step == 0:
+                                    print(f'On-policy training (gradient accumulation: {accumulation_steps} steps)')
+                                # return normalized samples x
+                                loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=micro_batch_size)
+                                # Extract obs and next_obs from x for reward computation
+                                x_unnormalized = prior_model.normalizer.unnormalize(x)
+                                x_obs_unnormalized = x_unnormalized[:, :obs_dim]
+                                x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
+                                # x_next_obs should be unnormalized as input of proxy_model_ens
+                                if args.novelty_measure == 'rnd':
+                                    y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
+                                elif args.novelty_measure == 'curiosity':
+                                    x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
+                                    y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
+                                elif args.novelty_measure == 'eco':
+                                    # ECO reward computation
+                                    # According to paper: "takes the current observation o as input"
+                                    # Use current obs (obs at time t, before action was taken)
+                                    y = proxy_model_ens(x_obs_unnormalized).squeeze()
+                                else:
+                                    raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                             else:
-                                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-                        else:
-                            # off-policy (reward prioritization)
-                            print(f'Off-policy training')
-                            idx = torch.multinomial(y_weights.squeeze(), args.ft_batch_size, replacement=True)
-                            # this is normalized samples x
-                            x = xs[idx]
-                            # [Optional] Add noise to x
-                            # x += torch.randn_like(x) * 0.01
-                            loss, logZ = posterior_model.compute_loss_with_sample(x, device)
-                            # Extract obs and next_obs from x for reward computation
-                            x_unnormalized = prior_model.normalizer.unnormalize(x)
-                            x_obs_unnormalized = x_unnormalized[:, :obs_dim]
-                            x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-                            if args.novelty_measure == 'rnd':
-                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
-                            elif args.novelty_measure == 'curiosity':
-                                x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
-                                y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
-                            elif args.novelty_measure == 'eco':
-                                # ECO reward computation
-                                # According to paper: "takes the current observation o as input"
-                                # Use current obs (obs at time t, before action was taken)
-                                y = proxy_model_ens(x_obs_unnormalized).squeeze()
+                                # off-policy (reward prioritization)
+                                if acc_step == 0:
+                                    print(f'Off-policy training (gradient accumulation: {accumulation_steps} steps)')
+                                idx = torch.multinomial(y_weights.squeeze(), micro_batch_size, replacement=True)
+                                # this is normalized samples x
+                                x = xs[idx]
+                                # [Optional] Add noise to x
+                                # x += torch.randn_like(x) * 0.01
+                                loss, logZ = posterior_model.compute_loss_with_sample(x, device)
+                                # Extract obs and next_obs from x for reward computation
+                                x_unnormalized = prior_model.normalizer.unnormalize(x)
+                                x_obs_unnormalized = x_unnormalized[:, :obs_dim]
+                                x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
+                                if args.novelty_measure == 'rnd':
+                                    y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
+                                elif args.novelty_measure == 'curiosity':
+                                    x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
+                                    y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
+                                elif args.novelty_measure == 'eco':
+                                    # ECO reward computation
+                                    # According to paper: "takes the current observation o as input"
+                                    # Use current obs (obs at time t, before action was taken)
+                                    y = proxy_model_ens(x_obs_unnormalized).squeeze()
+                                else:
+                                    raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
+                            
+                            # Scale loss by accumulation_steps to maintain same effective learning rate
+                            (loss / accumulation_steps).backward()
+                            total_loss += loss.item()
+                            if isinstance(logZ, torch.Tensor):
+                                total_logZ += logZ.item()
                             else:
-                                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-                            
-                            
+                                total_logZ += logZ
+                            all_x_list.append(x)
+                            all_y_list.append(y)
+                        
+                        # Update weights after accumulating all gradients
+                        posterior_model_optimizer.step()                
+                        if posterior_model_lr_scheduler is not None:
+                            posterior_model_lr_scheduler.step()
+                        
+                        # Concatenate all samples
+                        x = torch.cat(all_x_list, dim=0)
+                        y = torch.cat(all_y_list, dim=0)
+                        loss = total_loss / accumulation_steps  # Average loss for logging
+                        logZ = total_logZ / accumulation_steps  # Average logZ for logging
+                        
                         xs = torch.cat([xs, x], dim=0)
                         ys = torch.cat([ys, y], dim=0)
                         # breakpoint()
                         y_weights = torch.softmax(ys, dim=0)
-                        posterior_model_optimizer.zero_grad()
-                        loss.backward()
-                        posterior_model_optimizer.step()                
-                        if posterior_model_lr_scheduler is not None:
-                            posterior_model_lr_scheduler.step()
-                        print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss.item():.9f}')
+                        print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss:.9f}')
                         
                         # Add data to wandb table
                         if args.wandb:
+                            loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
                             logZ_value = logZ.item() if isinstance(logZ, torch.Tensor) else logZ
                             posterior_log_table.add_data(
                                 cur_epoch,
                                 epoch + 1,
-                                f"{loss.item():.9f}",
+                                f"{loss_value:.9f}",
                                 f"{logZ_value:.9f}"
                             )
                     
