@@ -831,6 +831,10 @@ def redq_sac(
                 #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
                 #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
                 
+                # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
+                #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
+                #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
+                
                 # def n_trainable(m):
                 #     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
@@ -909,7 +913,7 @@ def redq_sac(
                             s1 = 1
                         
                         # Gradient accumulation settings
-                        accumulation_steps = 8
+                        accumulation_steps = 2
                         micro_batch_size = args.ft_batch_size // accumulation_steps
                         posterior_model_optimizer.zero_grad()
                         
@@ -977,8 +981,8 @@ def redq_sac(
                                 total_logZ += logZ.item()
                             else:
                                 total_logZ += logZ
-                            # all_x_list.append(x)
-                            # all_y_list.append(y)
+                            all_x_list.append(x)
+                            all_y_list.append(y)
                         
                         # Update weights after accumulating all gradients
                         posterior_model_optimizer.step()                
@@ -986,15 +990,15 @@ def redq_sac(
                             posterior_model_lr_scheduler.step()
                         
                         # Concatenate all samples
-                        # x = torch.cat(all_x_list, dim=0)
-                        # y = torch.cat(all_y_list, dim=0)
+                        x = torch.cat(all_x_list, dim=0)
+                        y = torch.cat(all_y_list, dim=0)
                         loss = total_loss / accumulation_steps  # Average loss for logging
                         logZ = total_logZ / accumulation_steps  # Average logZ for logging
                         
-                        # xs = torch.cat([xs, x], dim=0)
-                        # ys = torch.cat([ys, y], dim=0)
+                        xs = torch.cat([xs, x], dim=0)
+                        ys = torch.cat([ys, y], dim=0)
                         # breakpoint()
-                        # y_weights = torch.softmax(ys, dim=0)
+                        y_weights = torch.softmax(ys, dim=0)
                         print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss:.9f}')
                         
                         # Add data to wandb table
@@ -1625,7 +1629,7 @@ if __name__ == '__main__':
     parser.add_argument('--backprop_epochs', type=int, default=10)
     parser.add_argument('--backprop_iters', type=int, default=10)
     parser.add_argument('--reward_coef', type=float, default=1.0)
-    parser.add_argument('--ft_batch_size', type=int, default=1024)
+    parser.add_argument('--ft_batch_size', type=int, default=256)
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--kl_weight', type=float, default=10.0)
