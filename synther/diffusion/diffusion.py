@@ -544,6 +544,7 @@ class QFlow(nn.Module):
         novelty_measure=None,
         agent=None,
         inter_onpolicy=0.1,
+        reward_percentile=None,
     ):
         super(QFlow, self).__init__()
         self.x_dim = x_dim
@@ -583,6 +584,12 @@ class QFlow(nn.Module):
         self.inter_onpolicy = inter_onpolicy
         
         self.cond_normalizer = bc_net.cond_normalizer
+        self.reward_percentile = reward_percentile
+        print(f'Before replacing max: {self.cond_normalizer.max}')
+        if self.reward_percentile is not None:
+            new_max = self.reward_percentile
+            self.cond_normalizer.max.copy_(new_max.reshape_as(self.cond_normalizer.max))
+        print(f'After replacing max: {self.cond_normalizer.max}')
 
     def forward(self, x, t, cond=None):
         # problem: needs debugging
@@ -602,7 +609,7 @@ class QFlow(nn.Module):
                 if ddim:
                     # --- DDIM hyperparams ---
                     ddim_steps = 128
-                    eta = 0.0
+                    eta = 0.2
                     # ------------------------
 
                     normal_dist = torch.distributions.Normal(
@@ -976,7 +983,14 @@ class QFlow(nn.Module):
         else:
             raise ValueError(f'Invalid novelty measure: {self.novelty_measure}')
         
-        q_r = (self.cond_normalizer.normalize(q_r) + 1) / 2
+        if self.reward_percentile is not None:
+            q_r = self.cond_normalizer.normalize(q_r)
+            q_r = torch.clamp(q_r, -1.0, 1.0)
+            q_r = (q_r + 1) / 2
+        else:
+            q_r = (self.cond_normalizer.normalize(q_r) + 1) / 2
+        
+        
         # Bound nice
         print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
         # print('Here is diffusion.py')
@@ -986,12 +1000,16 @@ class QFlow(nn.Module):
             with torch.no_grad():
                 # ranging from 0 to 1
                 on_policy_reward = self.agent.compute_onpolicy_reward(obs, act)
+                # on_policy_reward = on_policy_reward.pow(self.inter_onpolicy)
+                on_policy_reward = np.power(on_policy_reward, self.inter_onpolicy)
                 print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
             # convert numpy to tensor
             on_policy_reward = torch.tensor(on_policy_reward, device=q_r.device, dtype=q_r.dtype)
-            # q_r = q_r * (1 - self.inter_onpolicy) + self.inter_onpolicy * on_policy_reward
-            inter_onpolicy_tensor = torch.tensor(self.inter_onpolicy, device=q_r.device, dtype=q_r.dtype)
-            q_r = q_r * (1 - inter_onpolicy_tensor) + inter_onpolicy_tensor * on_policy_reward
+            # inter_onpolicy_tensor = torch.tensor(self.inter_onpolicy, device=q_r.device, dtype=q_r.dtype)
+            # # 1.
+            # q_r = q_r * (1 - inter_onpolicy_tensor) + inter_onpolicy_tensor * on_policy_reward
+            # 2.
+            q_r = q_r * on_policy_reward
         else:
             q_r = q_r
         # q_r = self.q_net(next_obs).squeeze()

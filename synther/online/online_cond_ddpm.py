@@ -136,7 +136,7 @@ def redq_sac(
             entity="gda-for-orl",
             project = f'{env_name}',
             group = group_name,
-            name = f' {run_name}_NoV{args.novelty_measure}_alpha_rtb{args.alpha_rtb}_IoP{args.inter_onpolicy}',
+            name = f' {run_name}_NoV{args.novelty_measure}_diffusion_steps{args.diffusion_steps}_alpha_rtb{args.alpha_rtb}_IoP{args.inter_onpolicy}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -189,6 +189,7 @@ def redq_sac(
                 "novelty_measure": args.novelty_measure,
                 "inter_onpolicy": args.inter_onpolicy,
                 "train_batch_size": args.train_batch_size,
+                "ddim": args.ddim,
             })
             
         elif args.algorithm == 'PGR':
@@ -196,7 +197,7 @@ def redq_sac(
                 entity="gda-for-orl",
                 project = f'{env_name}',
                 group = f'{run_name.split("_")[-1]}+{args.novelty_measure}',
-                name = f' {run_name}_NoV{args.novelty_measure}',
+                name = f' {run_name}_NoV{args.novelty_measure}_diffusion_steps{args.diffusion_steps}',
                 config={
                 "env_name": env_name,
                 "seed": seed,
@@ -249,6 +250,7 @@ def redq_sac(
                 "novelty_measure": args.novelty_measure,
                 "inter_onpolicy": args.inter_onpolicy,
                 "train_batch_size": args.train_batch_size,
+                "ddim": args.ddim,
                 }
             )
         else:
@@ -259,7 +261,7 @@ def redq_sac(
                 entity="gda-for-orl",
                 project = f'{env_name}',
                 group = f'{run_name.split("_")[-1]}',
-                name = run_name,
+                name = f' {run_name}_diffusion_steps{args.diffusion_steps}',
                 config={
                 "env_name": env_name,
                 "seed": seed,
@@ -312,6 +314,7 @@ def redq_sac(
                 "novelty_measure": args.novelty_measure,
                 "inter_onpolicy": args.inter_onpolicy,
                 "train_batch_size": args.train_batch_size,
+                "ddim": args.ddim,
             }
             )
         print(f'Initialized wandb with run name {run_name}')
@@ -631,6 +634,13 @@ def redq_sac(
             test_function_x_tensor = test_function_x
             test_function_y_tensor = torch.FloatTensor(test_function_y)
             
+            # compute 95-percentile of test_function_y
+            if args.clip_reward:
+                test_function_y_percentile = torch.quantile(test_function_y_tensor, 0.95)
+                print(f'95-percentile of test function y: {test_function_y_percentile:.7f}')
+            else:
+                test_function_y_percentile = None
+            
             # define data normalizer (x의 통계량 계산을 대체)
             # Now test_function_x uses the same format as update_normalizer, so they are consistent
             prior_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
@@ -825,7 +835,7 @@ def redq_sac(
                 # TODO: This is the main cause of not decreasing the loss
                 posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
                                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-                                        agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
+                                        agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile).to(device=device)
                 
                 # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
                 #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
@@ -902,7 +912,9 @@ def redq_sac(
                 if num_posterior_epochs > 0:
                     # Initialize wandb table for posterior training logs
                     if args.wandb:
-                        posterior_log_table = wandb.Table(columns=["Epoch", "Training_Epoch", "Loss", "logZ"])
+                        posterior_log_table = wandb.Table(
+                            columns=["Epoch", "Training_Epoch", "Loss", "logZ", "OnPolicy_Reward"]
+                        )
                     
                     for epoch in tqdm(range(num_posterior_epochs), dynamic_ncols=True):
                         if args.training_posterior == "both":
@@ -913,16 +925,17 @@ def redq_sac(
                             s1 = 1
                         
                         # Gradient accumulation settings
-                        accumulation_steps = 2
+                        accumulation_steps = args.accumulation_steps
                         micro_batch_size = args.ft_batch_size // accumulation_steps
                         posterior_model_optimizer.zero_grad()
                         
                         # Accumulate gradients over micro-batches
                         total_loss = 0.0
                         total_logZ = 0.0
-                        all_x_list = []
-                        all_y_list = []
+                        # all_x_list = []
+                        # all_y_list = []
                         
+                        on_policy_rewards = []
                         for acc_step in range(accumulation_steps):
                             if s1 == 0:
                                 # on-policy
@@ -947,6 +960,7 @@ def redq_sac(
                                     y = proxy_model_ens(x_obs_unnormalized).squeeze()
                                 else:
                                     raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
+                                on_policy_rewards.append(y.detach().mean().item())
                             else:
                                 # off-policy (reward prioritization)
                                 if acc_step == 0:
@@ -981,8 +995,8 @@ def redq_sac(
                                 total_logZ += logZ.item()
                             else:
                                 total_logZ += logZ
-                            all_x_list.append(x)
-                            all_y_list.append(y)
+                            # all_x_list.append(x)
+                            # all_y_list.append(y)
                         
                         # Update weights after accumulating all gradients
                         posterior_model_optimizer.step()                
@@ -990,26 +1004,32 @@ def redq_sac(
                             posterior_model_lr_scheduler.step()
                         
                         # Concatenate all samples
-                        x = torch.cat(all_x_list, dim=0)
-                        y = torch.cat(all_y_list, dim=0)
+                        # x = torch.cat(all_x_list, dim=0)
+                        # y = torch.cat(all_y_list, dim=0)
                         loss = total_loss / accumulation_steps  # Average loss for logging
                         logZ = total_logZ / accumulation_steps  # Average logZ for logging
                         
-                        xs = torch.cat([xs, x], dim=0)
-                        ys = torch.cat([ys, y], dim=0)
+                        # xs = torch.cat([xs, x], dim=0)
+                        # ys = torch.cat([ys, y], dim=0)
                         # breakpoint()
-                        y_weights = torch.softmax(ys, dim=0)
+                        # y_weights = torch.softmax(ys, dim=0)
                         print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss:.9f}')
                         
                         # Add data to wandb table
                         if args.wandb:
                             loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
                             logZ_value = logZ.item() if isinstance(logZ, torch.Tensor) else logZ
+                            if on_policy_rewards:
+                                on_policy_reward_value = torch.tensor(on_policy_rewards).mean().item()
+                                on_policy_reward_value = f"{on_policy_reward_value:.9f}"
+                            else:
+                                on_policy_reward_value = "NA"
                             posterior_log_table.add_data(
                                 cur_epoch,
                                 epoch + 1,
                                 f"{loss_value:.9f}",
-                                f"{logZ_value:.9f}"
+                                f"{logZ_value:.9f}",
+                                on_policy_reward_value
                             )
                     
                     # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
@@ -1044,7 +1064,7 @@ def redq_sac(
                 # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
                 if args.algorithm == 'Ours':
                     posterior_model.eval()
-                    X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True, ddim=True)
+                    X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True, ddim=args.ddim)
                 elif args.algorithm == 'PGRrnd' or args.algorithm == 'PGR':
                     # prior_model.eval()
                     # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
@@ -1424,13 +1444,93 @@ def redq_sac(
                 ax_full.grid(True, alpha=0.3)
                 plt.tight_layout()
                 
-                # Log to wandb
+                # =============================================================================
+                # Full replay buffer on-policy reward histogram
+                # =============================================================================
+                # Compute on-policy reward for full replay buffer using agent.compute_onpolicy_reward
+                print('Computing on-policy reward for full replay buffer...')
+                ptr_location = agent.replay_buffer.ptr
+                all_obs_full = agent.replay_buffer.obs1_buf[:ptr_location]
+                all_acts_full = agent.replay_buffer.acts_buf[:ptr_location]
+                
+                batch_size_onpolicy = 5000
+                all_onpolicy_list = []
+                for i in range(0, ptr_location, batch_size_onpolicy):
+                    obs_batch_np = all_obs_full[i:i+batch_size_onpolicy]
+                    acts_batch_np = all_acts_full[i:i+batch_size_onpolicy]
+                    batch_onpolicy = agent.compute_onpolicy_reward(obs_batch_np, acts_batch_np)
+                    # Ensure numpy array
+                    if isinstance(batch_onpolicy, np.ndarray):
+                        batch_onpolicy_np = batch_onpolicy.reshape(-1)
+                    else:
+                        batch_onpolicy_np = np.array(batch_onpolicy).reshape(-1)
+                    all_onpolicy_list.append(batch_onpolicy_np)
+                
+                all_onpolicy = np.concatenate(all_onpolicy_list) if len(all_onpolicy_list) > 0 else np.array([])
+                # Apply power transform (4th-root): x -> x^0.25
+                # NumPy supports this directly via ** or np.power.
+                all_onpolicy = np.power(all_onpolicy, args.inter_onpolicy)
+                
+                if all_onpolicy.size > 0:
+                    # Basic statistics
+                    onpolicy_mean = float(all_onpolicy.mean())
+                    print(f'Full replay buffer on-policy reward mean: {onpolicy_mean:.7f}')
+                    
+                    # Percentiles for reference
+                    onpolicy_percentiles = [95, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5]
+                    onpolicy_percentile_values = {p: float(np.percentile(all_onpolicy, p)) for p in onpolicy_percentiles}
+                    for p, val in onpolicy_percentile_values.items():
+                        print(f'Full replay buffer on-policy reward {p}th percentile: {val:.7f}')
+                    
+                    # Histogram bins
+                    x_min_on = float(all_onpolicy.min())
+                    x_max_on = float(all_onpolicy.max())
+                    if x_min_on == x_max_on:
+                        x_min_on -= 1e-8
+                        x_max_on += 1e-8
+                    num_bins_on = 100
+                    bins_on = np.linspace(x_min_on, x_max_on, num_bins_on + 1)
+                    
+                    # Create histogram figure for on-policy rewards
+                    fig_on, ax_on = plt.subplots(figsize=(8, 6))
+                    ax_on.hist(all_onpolicy, bins=bins_on, color='tab:green', alpha=0.8)
+                    ax_on.axvline(onpolicy_mean, color='red', linestyle='--', linewidth=2, label=f'Mean: {onpolicy_mean:.7f}')
+                    
+                    # Add vertical lines for percentiles
+                    colors_on = plt.cm.plasma(np.linspace(0, 1, len(onpolicy_percentiles)))
+                    for i, p in enumerate(onpolicy_percentiles):
+                        val = onpolicy_percentile_values[p]
+                        ax_on.axvline(val, color=colors_on[i], linestyle=':', linewidth=1.5,
+                                       label=f'{p}th perc: {val:.7f}', alpha=0.8)
+                    
+                    ax_on.set_title(f'Full Replay Buffer On-Policy Reward (Epoch {cur_epoch})')
+                    ax_on.set_xlabel('On-Policy Reward')
+                    ax_on.set_ylabel('Count')
+                    ax_on.legend(loc='best', fontsize=8)
+                    ax_on.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    
+                    # Log on-policy histogram to wandb
+                    if args.wandb:
+                        wandb.log({
+                            'images/full_replay_buffer_onpolicy_hist': wandb.Image(fig_on, caption=f'Epoch {cur_epoch}')
+                        }, step=cur_epoch)
+                    
+                    # Save on-policy histogram to disk
+                    out_path_on = os.path.join(out_dir, f'full_replay_buffer_onpolicy_hist_epoch{cur_epoch:04d}.png')
+                    fig_on.savefig(out_path_on)
+                    plt.close(fig_on)
+                    print(f'Saved full replay buffer on-policy reward histogram to {out_path_on}')
+                else:
+                    print('Replay buffer is empty. Skipping on-policy reward computation.')
+                
+                # Log novelty histogram to wandb
                 if args.wandb:
                     wandb.log({
                         'images/full_replay_buffer_novelty_hist': wandb.Image(fig_full, caption=f'Epoch {cur_epoch}')
                     }, step=cur_epoch)
                 
-                # Save to disk
+                # Save novelty histogram to disk
                 out_path_full = os.path.join(out_dir, f'full_replay_buffer_novelty_hist_epoch{cur_epoch:04d}.png')
                 fig_full.savefig(out_path_full)
                 plt.close(fig_full)
@@ -1633,7 +1733,7 @@ if __name__ == '__main__':
     parser.add_argument('--rtb', action='store_true', default=False)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--kl_weight', type=float, default=10.0)
-    parser.add_argument('--accumulation_steps', type=int, default=4)
+    parser.add_argument('--accumulation_steps', type=int, default=2)
 
     # REDQ
     parser.add_argument('--disable_diffusion', action='store_true', default=False)
@@ -1684,6 +1784,9 @@ if __name__ == '__main__':
     
     parser.add_argument('--novelty_measure', type=str, default='curiosity') # 'curiosity', 'rnd', 'eco'
     parser.add_argument('--inter_onpolicy', type=float, default=0.1)
+    
+    parser.add_argument('--ddim', action='store_true', default=False)
+    parser.add_argument('--clip_reward', action='store_true', default=False)
     
 
     args = parser.parse_args()
