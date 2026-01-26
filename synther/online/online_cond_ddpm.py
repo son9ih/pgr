@@ -134,9 +134,9 @@ def redq_sac(
 
             wandb.init(
             entity="gda-for-orl",
-            project = f'{env_name}',
+            project = f'{env_name}-v1',
             group = group_name,
-            name = f' {run_name}_NoV{args.novelty_measure}_diffusion_steps{args.diffusion_steps}_alpha_rtb{args.alpha_rtb}_IoP{args.inter_onpolicy}',
+            name = f' {run_name}_NoV{args.novelty_measure}_DS{args.diffusion_steps}_ddim{args.ddim}_eta{args.eta}_CR{args.clip_reward}_rtb{args.alpha_rtb}_IoP{args.inter_onpolicy}',
             config={
                 "env_name": env_name,
                 "seed": seed,
@@ -190,6 +190,7 @@ def redq_sac(
                 "inter_onpolicy": args.inter_onpolicy,
                 "train_batch_size": args.train_batch_size,
                 "ddim": args.ddim,
+                "eta": args.eta,
             })
             
         elif args.algorithm == 'PGR':
@@ -197,7 +198,7 @@ def redq_sac(
                 entity="gda-for-orl",
                 project = f'{env_name}',
                 group = f'{run_name.split("_")[-1]}+{args.novelty_measure}',
-                name = f' {run_name}_NoV{args.novelty_measure}_diffusion_steps{args.diffusion_steps}',
+                name = f' {run_name}_NoV{args.novelty_measure}_DS{args.diffusion_steps}_ddim{args.ddim}_CR{args.clip_reward}',
                 config={
                 "env_name": env_name,
                 "seed": seed,
@@ -251,6 +252,7 @@ def redq_sac(
                 "inter_onpolicy": args.inter_onpolicy,
                 "train_batch_size": args.train_batch_size,
                 "ddim": args.ddim,
+                "eta": args.eta,
                 }
             )
         else:
@@ -261,7 +263,7 @@ def redq_sac(
                 entity="gda-for-orl",
                 project = f'{env_name}',
                 group = f'{run_name.split("_")[-1]}',
-                name = f' {run_name}_diffusion_steps{args.diffusion_steps}',
+                name = f' {run_name}_DS{args.diffusion_steps}_ddim{args.ddim}',
                 config={
                 "env_name": env_name,
                 "seed": seed,
@@ -516,7 +518,7 @@ def redq_sac(
             dtype = torch.float
             
             # define prior model and optimizer
-            prior_model = DiffusionModel(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, inputs=inputs, skip_dims=skip_dims, disable_terminal_norm=model_terminals).to(dtype=dtype, device=device)
+            prior_model = DiffusionModel(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, inputs=inputs, skip_dims=skip_dims, disable_terminal_norm=model_terminals, eta=args.eta).to(dtype=dtype, device=device)
             num_params = sum(p.numel() for p in prior_model.parameters() if p.requires_grad)
             print(f'Number of trainable parameters in prior model: {num_params}.')
             prior_model.dtype=dtype
@@ -835,7 +837,7 @@ def redq_sac(
                 # TODO: This is the main cause of not decreasing the loss
                 posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb, beta=beta,
                                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-                                        agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile).to(device=device)
+                                        agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim).to(device=device)
                 
                 # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
                 #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
@@ -1031,6 +1033,7 @@ def redq_sac(
                                 f"{logZ_value:.9f}",
                                 on_policy_reward_value
                             )
+                            print(f'On-policy reward (Mean): {on_policy_reward_value}')
                     
                     # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
                     if args.wandb:
@@ -1064,7 +1067,7 @@ def redq_sac(
                 # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
                 if args.algorithm == 'Ours':
                     posterior_model.eval()
-                    X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True, ddim=args.ddim)
+                    X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
                 elif args.algorithm == 'PGRrnd' or args.algorithm == 'PGR':
                     # prior_model.eval()
                     # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
@@ -1074,12 +1077,12 @@ def redq_sac(
                     prior_ema.ema_model.eval()
                     cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
                     cond = prior_ema.ema_model.cond_normalizer.normalize(cond)
-                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale, ddim=True)
+                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale, ddim=args.ddim)
                 elif args.algorithm == 'SER':
                     # prior_model.eval()
                     # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
                     prior_ema.ema_model.eval()
-                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None, ddim=True)
+                    X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None, ddim=args.ddim)
                 else:
                     raise ValueError(f'Invalid algorithm: {args.algorithm}')
                 
@@ -1199,7 +1202,7 @@ def redq_sac(
                     diffusion_novelty = agent.compute_eco_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
                     # Combined 10k observations and novelty
                     combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
-                    combined_novelty = agent.compute_eco_reward(combined_obs_tensor).cpu().numpy().squeeze()
+                    # combined_novelty = agent.compute_eco_reward(combined_obs_tensor).cpu().numpy().squeeze()
                 elif args.novelty_measure == 'curiosity':
                     # real_novelty = agent.compute_curiosity_reward(real_obs_tensor).cpu().numpy().squeeze()
                     # diffusion_novelty = agent.compute_curiosity_reward(diffusion_obs_tensor).cpu().numpy().squeeze()
@@ -1212,13 +1215,13 @@ def redq_sac(
                     combined_obs_tensor = torch.cat([real_obs_tensor, diffusion_obs_tensor], dim=0)
                     combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
                     combined_act_tensor = torch.cat([real_act_tensor, diffusion_act_tensor], dim=0)
-                    combined_novelty = agent.cond_net.compute_reward_torch(combined_obs_tensor, combined_next_obs_tensor, combined_act_tensor).cpu().numpy().squeeze()
+                    # combined_novelty = agent.cond_net.compute_reward_torch(combined_obs_tensor, combined_next_obs_tensor, combined_act_tensor).cpu().numpy().squeeze()
                 elif args.novelty_measure == 'rnd':
                     real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
                     diffusion_novelty = agent.compute_intrinsic_reward(diffusion_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
                     # Combined 10k observations and novelty
                     combined_next_obs_tensor = torch.cat([real_next_obs_tensor, diffusion_next_obs_tensor], dim=0)
-                    combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
+                    # combined_novelty = agent.compute_intrinsic_reward(combined_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
                 else:
                     # # RND uses compute_intrinsic_reward
                     # real_novelty = agent.compute_intrinsic_reward(real_next_obs_tensor, accumulate=False).cpu().numpy().squeeze()
@@ -1757,16 +1760,16 @@ if __name__ == '__main__':
     
     # ddqm
     parser.add_argument('--uniform', action='store_true', default=False)
-    parser.add_argument('--diffusion_steps', type=int, default=500)
+    parser.add_argument('--diffusion_steps', type=int, default=1000)
     parser.add_argument('--num_prior_epochs', type=int, default=100000)
-    parser.add_argument('--num_posterior_epochs', type=int, default=60)
+    parser.add_argument('--num_posterior_epochs', type=int, default=50)
     parser.add_argument('--training_posterior', type=str, default='both') # 'both', 'on', 'off'
     parser.add_argument('--filtering', action='store_true', default=False)
     parser.add_argument('--num_proposals', type=int, default=10)
     parser.add_argument('--local_search', action='store_true', default=False)
     parser.add_argument('--local_search_epochs', type=int, default=10)
     
-    parser.add_argument('--train_batch_size', type=int, default=1024)
+    parser.add_argument('--train_batch_size', type=int, default=256)
     parser.add_argument('--num_samples', type=int, default=1000000)
     parser.add_argument('--sample_batch_size', type=int, default=100000)
     parser.add_argument('--prior_lr_scheduler', type=str, default='cosine')
@@ -1786,6 +1789,7 @@ if __name__ == '__main__':
     parser.add_argument('--inter_onpolicy', type=float, default=0.1)
     
     parser.add_argument('--ddim', action='store_true', default=False)
+    parser.add_argument('--eta', type=float, default=0.0)
     parser.add_argument('--clip_reward', action='store_true', default=False)
     
 

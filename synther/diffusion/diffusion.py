@@ -277,7 +277,8 @@ class QFlowMLP(nn.Module):
     
 
 class DiffusionModel(nn.Module):
-    def __init__(self, x_dim, diffusion_steps, inputs, skip_dims, disable_terminal_norm=False, schedule="linear", predict="epsilon", policy_net="mlp", hidden_dim=1024, dtype=torch.float32, cond_dim=1, cfg_dropout=0.25):
+    def __init__(self, x_dim, diffusion_steps, inputs, skip_dims, disable_terminal_norm=False, schedule="linear", predict="epsilon", policy_net="mlp", 
+                 hidden_dim=1024, dtype=torch.float32, cond_dim=1, cfg_dropout=0.25, eta=0.0):
         super(DiffusionModel, self).__init__()
         # ================================
         # new things
@@ -328,7 +329,9 @@ class DiffusionModel(nn.Module):
         self.register_buffer("oneover_sqrta", torch.flip(oneover_sqrta, dims=[0]))
         self.register_buffer("sqrtmab", torch.flip(sqrtmab, dims=[0]))
         self.register_buffer("mab_over_sqrtmab_inv", torch.flip(mab_over_sqrtmab_inv, dims=[0]))
-
+        self.eta = eta
+        self.ddim_steps = 100
+        
     def forward(self, x, t, cond=None):
         # conditional generation
         epsilon = self.policy(x, t, cond=cond)
@@ -361,8 +364,8 @@ class DiffusionModel(nn.Module):
             #     pass
             if ddim:
                 # --- DDIM hyperparams ---
-                ddim_steps = 128        # 원하는 step 수 (1000 -> 128)
-                eta = 0.0               # 0.0: deterministic DDIM, >0.0: stochastic DDIM
+                ddim_steps = self.ddim_steps        # 원하는 step 수 (1000 -> 128)
+                eta = self.eta              # 0.0: deterministic DDIM, >0.0: stochastic DDIM
                 # ------------------------
 
                 x = torch.randn(bs, self.x_dim, dtype=self.dtype, device=device)
@@ -545,6 +548,8 @@ class QFlow(nn.Module):
         agent=None,
         inter_onpolicy=0.1,
         reward_percentile=None,
+        eta=0.0,
+        ddim=False,
     ):
         super(QFlow, self).__init__()
         self.x_dim = x_dim
@@ -590,6 +595,10 @@ class QFlow(nn.Module):
             new_max = self.reward_percentile
             self.cond_normalizer.max.copy_(new_max.reshape_as(self.cond_normalizer.max))
         print(f'After replacing max: {self.cond_normalizer.max}')
+        
+        self.eta = eta
+        self.ddim = ddim
+        self.ddim_steps = 100
 
     def forward(self, x, t, cond=None):
         # problem: needs debugging
@@ -598,7 +607,7 @@ class QFlow(nn.Module):
             bc_epsilon = self.bc_net(x, t, cond=cond).detach()
         return q_epsilon, bc_epsilon
 
-    def sample(self, bs, device, extra=False, eval=False, cond=None, ddim=True):
+    def sample(self, bs, device, extra=False, eval=False, cond=None):
         if eval:
             with torch.no_grad():
                 # if ddim:
@@ -606,11 +615,7 @@ class QFlow(nn.Module):
                 #     pass
                 
                 #     # return x
-                if ddim:
-                    # --- DDIM hyperparams ---
-                    ddim_steps = 128
-                    eta = 0.2
-                    # ------------------------
+                if self.ddim:
 
                     normal_dist = torch.distributions.Normal(
                         torch.zeros((bs, self.x_dim), device=device, dtype=self.dtype),
@@ -619,18 +624,18 @@ class QFlow(nn.Module):
                     x = normal_dist.sample()
 
                     T = self.diffusion_steps
-                    assert ddim_steps <= T
+                    assert self.ddim_steps <= T
 
                     # 1000-step index 중 128개 선택 (0 noisy -> T-1 clean)
-                    idxs = torch.linspace(0, T - 1, steps=ddim_steps, device=device).long()
+                    idxs = torch.linspace(0, T - 1, steps=self.ddim_steps, device=device).long()
 
                     extra_steps = 1
                     if extra:
                         extra_steps = 20
 
-                    for k in range(ddim_steps):
+                    for k in range(self.ddim_steps):
                         i = idxs[k].item()
-                        j = idxs[k + 1].item() if k < ddim_steps - 1 else None
+                        j = idxs[k + 1].item() if k < self.ddim_steps - 1 else None
 
                         # 학습과 동일한 t 정의
                         t = torch.full((bs,), float(i) / float(T), dtype=self.dtype, device=device)
@@ -656,8 +661,8 @@ class QFlow(nn.Module):
                             abar_j = self.bc_net.alphabar_t[j]
                             sqrt_abar_j = torch.sqrt(abar_j)
 
-                            if eta > 0.0:
-                                sigma = eta * torch.sqrt(
+                            if self.eta > 0.0:
+                                sigma = self.eta * torch.sqrt(
                                     torch.clamp(
                                         (1.0 - abar_j) / (1.0 - abar_i + 1e-12) * (1.0 - abar_i / (abar_j + 1e-12)),
                                         min=0.0,
@@ -667,7 +672,7 @@ class QFlow(nn.Module):
                                 sigma = torch.zeros((), dtype=self.dtype, device=device)
 
                             c = torch.sqrt(torch.clamp(1.0 - abar_j - sigma * sigma, min=0.0))
-                            noise = torch.randn_like(x, dtype=self.dtype, device=device) if eta > 0.0 else 0.0
+                            noise = torch.randn_like(x, dtype=self.dtype, device=device) if self.eta > 0.0 else 0.0
 
                             # DDIM update
                             x = sqrt_abar_j * x0 + c * eps + sigma * noise
@@ -743,49 +748,160 @@ class QFlow(nn.Module):
         
         # This is for training   
         else:
-            normal_dist = torch.distributions.Normal(
-                torch.zeros((bs, self.x_dim), device=device, dtype=self.dtype), 
-                torch.ones((bs, self.x_dim), device=device, dtype=self.dtype)
+            if self.ddim:
+                normal_dist = torch.distributions.Normal(
+                    torch.zeros((bs, self.x_dim), device=device, dtype=self.dtype),
+                    torch.ones((bs, self.x_dim), device=device, dtype=self.dtype),
                 )
-            x = normal_dist.sample()
-            t = torch.zeros((bs,), device=device, dtype=self.dtype)
-            dt = 1 / self.diffusion_steps
+                x = normal_dist.sample()
+                T = self.diffusion_steps
+                assert self.ddim_steps <= T
+                # 1000-step index 중 128개 선택 (0 noisy -> T-1 clean)
+                
+                logpf_pi = normal_dist.log_prob(x).sum(1)
+                logpf_p = normal_dist.log_prob(x).sum(1)
+                
+                # idx = 0, 8 ,16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,...
+                idxs = torch.linspace(0, T - 1, steps=self.ddim_steps, device=device).long()
+                extra_steps = 1
+                if extra:
+                    extra_steps = 20
+                for k in range(self.ddim_steps):
+                    # i=0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,...
+                    i = idxs[k].item()
+                    # j=8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, None,...
+                    j = idxs[k + 1].item() if k < self.ddim_steps - 1 else None
+                    # 학습과 동일한 t 정의
+                    t = torch.full((bs,), float(i) / float(T), dtype=self.dtype, device=device)
+                    # 원래 코드처럼 extra refinement를 유지하고 싶으면,
+                    # 같은 t에서 여러 번 epsilon을 재평가할 수 있음.
+                    # (DDIM은 원래 1회 업데이트가 일반적이지만, 너 코드는 extra 옵션이 있으니 보존)
+                    for _ in range(extra_steps):
+                        q_eps, bc_eps = self(x, t, cond=cond)
+                        eps = (q_eps + bc_eps).detach()
+                        
+                        abar_i = self.bc_net.alphabar_t[i]
+                        sqrt_abar_i = torch.sqrt(abar_i)
+                        sqrt_one_m_abar_i = torch.sqrt(1.0 - abar_i)
+                        
+                        # x0 prediction
+                        x0 = (x - sqrt_one_m_abar_i * eps) / (sqrt_abar_i + 1e-12)
+                        x0_bc = (x - sqrt_one_m_abar_i * bc_eps) / (sqrt_abar_i + 1e-12)
+                        
+                        if j is None:
+                            x = x0
+                            break
+                        
+                        # abar_j = self.bc_net.alphabar_t[j]
+                        #     sqrt_abar_j = torch.sqrt(abar_j)
 
-            logpf_pi = normal_dist.log_prob(x).sum(1)
-            logpf_p = normal_dist.log_prob(x).sum(1)
-            # print(logpf_pi[:4])
-            extra_steps = 1
-            if extra:
-                extra_steps = 20
-            for i in range(self.diffusion_steps):
-                for j in range(extra_steps):
-                    # problem: needs debugging
-                    q_epsilon, bc_epsilon = self(x, t)
+                        #     if eta > 0.0:
+                        #         sigma = eta * torch.sqrt(
+                        #             torch.clamp(
+                        #                 (1.0 - abar_j) / (1.0 - abar_i + 1e-12) * (1.0 - abar_i / (abar_j + 1e-12)),
+                        #                 min=0.0,
+                        #             )
+                        #         )
+                        #     else:
+                        #         sigma = torch.zeros((), dtype=self.dtype, device=device)
 
-                    epsilon = q_epsilon + bc_epsilon
-                    new_x = self.bc_net.oneover_sqrta[i] * (
-                        x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
-                    ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
+                        #     c = torch.sqrt(torch.clamp(1.0 - abar_j - sigma * sigma, min=0.0))
+                        #     noise = torch.randn_like(x, dtype=self.dtype, device=device) if eta > 0.0 else 0.0
 
-                    pf_pi_dist = torch.distributions.Normal(
-                        self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
-                        torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
-                    )
-                    logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
+                        #     # DDIM update
+                        #     x = sqrt_abar_j * x0 + c * eps + sigma * noise
+                        
+                        abar_j = self.bc_net.alphabar_t[j]
+                        sqrt_abar_j = torch.sqrt(abar_j)
+                        
+                        if self.eta > 0.0:
+                            sigma = self.eta * torch.sqrt(
+                                torch.clamp(
+                                    (1.0 - abar_j) / (1.0 - abar_i + 1e-12) * (1.0 - abar_i / (abar_j + 1e-12)),
+                                    min=0.0,
+                                )
+                            )
+                        else:
+                            sigma = torch.zeros((), dtype=self.dtype, device=device)
+                            
+                        c = torch.sqrt(torch.clamp(1.0 - abar_j - sigma * sigma, min=0.0))
+                        noise = torch.randn_like(x, dtype=self.dtype, device=device) if self.eta > 0.0 else 0.0
+                        
+                        # DDIM update
+                        x = sqrt_abar_j * x0 + c * eps + sigma * noise
+                        
+                        pf_pi_dist = torch.distributions.Normal(
+                            sqrt_abar_j * x0_bc + c * bc_eps,
+                            sigma * torch.ones_like(x, dtype=self.dtype),
+                            # self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
+                            # torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
+                        )
+                        logpf_pi += pf_pi_dist.log_prob(x).sum(1)
+                        
+                        pf_p_dist = torch.distributions.Normal(
+                            sqrt_abar_j * x0 + c * eps,
+                            sigma * torch.ones_like(x, dtype=self.dtype),
+                            # self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
+                            # torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
+                        )
+                        logpf_p += pf_p_dist.log_prob(x).sum(1)
 
-                    pf_p_dist = torch.distributions.Normal(
-                        self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
-                        torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
-                    )
-                    logpf_p += pf_p_dist.log_prob(new_x).sum(1)
-
-                    x = new_x
-                    if i < self.diffusion_steps - 1:
+                        
+                        
+                        # DDIM에서는 보통 extra loop를 돌 필요가 없어서,
+                        # extra_steps>1을 쓸 거면 "같은 i->j 이동을 여러 번 반복"하게 되는데,
+                        # 너 의도(약간 더 refine)라면 괜찮고, 아니라면 아래 break로 1회만 하자.
+                        if not extra:
+                            break
+                    if j is None:
                         break
-                t = t + dt
+                    
+                return x, logpf_pi, logpf_p
             
-            # we don't need logpf_pi and logpf_p
-            return x, logpf_pi, logpf_p
+            else:
+                normal_dist = torch.distributions.Normal(
+                    torch.zeros((bs, self.x_dim), device=device, dtype=self.dtype), 
+                    torch.ones((bs, self.x_dim), device=device, dtype=self.dtype)
+                    )
+                x = normal_dist.sample()
+                t = torch.zeros((bs,), device=device, dtype=self.dtype)
+                dt = 1 / self.diffusion_steps
+
+                logpf_pi = normal_dist.log_prob(x).sum(1)
+                logpf_p = normal_dist.log_prob(x).sum(1)
+                # print(logpf_pi[:4])
+                extra_steps = 1
+                if extra:
+                    extra_steps = 20
+                for i in range(self.diffusion_steps):
+                    for j in range(extra_steps):
+                        # problem: needs debugging
+                        q_epsilon, bc_epsilon = self(x, t)
+
+                        epsilon = q_epsilon + bc_epsilon
+                        new_x = self.bc_net.oneover_sqrta[i] * (
+                            x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
+                        ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
+
+                        pf_pi_dist = torch.distributions.Normal(
+                            self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
+                            torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
+                        )
+                        logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
+
+                        pf_p_dist = torch.distributions.Normal(
+                            self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
+                            torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
+                        )
+                        logpf_p += pf_p_dist.log_prob(new_x).sum(1)
+
+                        x = new_x
+                        if i < self.diffusion_steps - 1:
+                            break
+                    t = t + dt
+                
+                # we don't need logpf_pi and logpf_p
+                return x, logpf_pi, logpf_p
             # return x
     
     def back_and_forth(self, x, ratio, device):
@@ -1025,47 +1141,166 @@ class QFlow(nn.Module):
         return 0.0
 
     def compute_loss_with_sample(self, x, device):
-        bs = x.shape[0]
-        # minlogvar, maxlogvar = -4, 4
-        t = torch.zeros((bs,), device=device, dtype=self.dtype)
-        dt = 1 / self.diffusion_steps
-
-        logpf_pi = torch.zeros((bs,), device=device, dtype=self.dtype)
-        logpf_p = torch.zeros((bs,), device=device, dtype=self.dtype)
-        # I think we need to log here
-        # Also, we need to unnormalize x here
-        x_unnormalized = self.bc_net.normalizer.unnormalize(x)
-        logr = self.posterior_log_reward(x_unnormalized).log()
+        if self.ddim:
+            bs = x.shape[0]
+            # --- DDIM hyperparams ---
+            ddim_steps = 100
+            eta = self.eta
+            # ------------------------
+            
+            logpf_pi = torch.zeros((bs,), device=device, dtype=self.dtype)
+            logpf_p = torch.zeros((bs,), device=device, dtype=self.dtype)
+            # I think we need to log here
+            # Also, we need to unnormalize x here
+            x_unnormalized = self.bc_net.normalizer.unnormalize(x)
+            logr = self.posterior_log_reward(x_unnormalized).log()
+            
+            T = self.diffusion_steps
+            assert ddim_steps <= T
+            
+            # 역방향으로 DDIM 인덱스 선택 (T-1 clean -> 0 noisy)
+            idxs = torch.linspace(T - 1, 0, steps=ddim_steps, device=device).long()
+            
+            # going to noisy x (reverse direction)
+            for k in range(ddim_steps):
+                # i는 더 clean한 상태, j는 더 noisy한 상태
+                i = idxs[k].item()
+                j = idxs[k + 1].item() if k < ddim_steps - 1 else None
+                
+                # 학습과 동일한 t 정의
+                t = torch.full((bs,), float(i) / float(T), dtype=self.dtype, device=device)
+                
+                # pb_dist: x에서 new_x로 가는 forward diffusion (더 noisy하게)
+                # 원래 non-DDIM 버전과 동일한 방식으로 구현
+                # DDIM에서는 여러 스텝을 건너뛰지만, forward kernel은 원래 방식과 동일하게 유지
+                if j is not None:
+                    # i에서 j로 가는 forward diffusion을 순차적으로 수행
+                    # 원래 non-DDIM 버전: x_{i-1} ~ N(sqrt(alpha_t[i]) * x_i, sqrt(beta_t[i]))
+                    # DDIM 버전: i에서 j로 가는 모든 스텝을 순차적으로 수행
+                    current_x = x
+                    # i > j이므로, i-1부터 j까지 순차적으로 forward diffusion
+                    for step_idx in range(i - 1, j - 1, -1):
+                        pb_dist = torch.distributions.Normal(
+                            torch.sqrt(self.bc_net.alpha_t[step_idx]) * current_x,
+                            torch.sqrt(self.bc_net.beta_t[step_idx]) * torch.ones_like(current_x, dtype=self.dtype),
+                        )
+                        current_x = pb_dist.sample()
+                    new_x = current_x
+                else:
+                    # 마지막 단계: i에서 0까지 모든 스텝을 순차적으로 수행
+                    current_x = x
+                    for step_idx in range(i - 1, -1, -1):
+                        pb_dist = torch.distributions.Normal(
+                            torch.sqrt(self.bc_net.alpha_t[step_idx]) * current_x,
+                            torch.sqrt(self.bc_net.beta_t[step_idx]) * torch.ones_like(current_x, dtype=self.dtype),
+                        )
+                        current_x = pb_dist.sample()
+                    new_x = current_x
+                
+                # new_x에서 epsilon 예측 (new_x는 j 상태이므로 j의 시간을 사용해야 함)
+                if j is not None:
+                    t_j = torch.full((bs,), float(j) / float(T), dtype=self.dtype, device=device)
+                    q_epsilon, bc_epsilon = self(new_x, t_j)
+                    epsilon = q_epsilon + bc_epsilon
+                    
+                    # DDIM 업데이트를 역으로 사용하여 proposal 분포 계산
+                    # new_x (x_j)에서 x (x_i)로 가는 proposal
+                    abar_i = self.bc_net.alphabar_t[i]
+                    abar_j = self.bc_net.alphabar_t[j]
+                    sqrt_abar_i = torch.sqrt(abar_i)
+                    sqrt_abar_j = torch.sqrt(abar_j)
+                    sqrt_one_m_abar_j = torch.sqrt(1.0 - abar_j)
+                    
+                    # x0 prediction from new_x (x_j 상태에서)
+                    x0 = (new_x - sqrt_one_m_abar_j * epsilon) / (sqrt_abar_j + 1e-12)
+                    x0_bc = (new_x - sqrt_one_m_abar_j * bc_epsilon) / (sqrt_abar_j + 1e-12)
+                    
+                    if eta > 0.0:
+                        sigma = eta * torch.sqrt(
+                            torch.clamp(
+                                (1.0 - abar_i) / (1.0 - abar_j + 1e-12) * (1.0 - abar_j / (abar_i + 1e-12)),
+                                min=0.0,
+                            )
+                        )
+                    else:
+                        sigma = torch.zeros((), dtype=self.dtype, device=device)
+                    
+                    c = torch.sqrt(torch.clamp(1.0 - abar_i - sigma * sigma, min=0.0))
+                    
+                    # DDIM proposal: new_x (x_j)에서 x (x_i)로 가는 proposal
+                    # pf_pi_dist와 pf_p_dist는 x (현재 상태 x_i)에 대한 분포
+                    pf_pi_dist = torch.distributions.Normal(
+                        sqrt_abar_i * x0_bc + c * bc_epsilon,
+                        sigma * torch.ones_like(x, dtype=self.dtype),
+                    )
+                    logpf_pi += pf_pi_dist.log_prob(x).sum(1)
+                    
+                    pf_p_dist = torch.distributions.Normal(
+                        sqrt_abar_i * x0 + c * epsilon,
+                        sigma * torch.ones_like(x, dtype=self.dtype),
+                    )
+                    logpf_p += pf_p_dist.log_prob(x).sum(1)
+                else:
+                    # 마지막 단계: prior 분포
+                    prior_dist = torch.distributions.Normal(
+                        torch.zeros_like(x, dtype=self.dtype),
+                        torch.ones_like(x, dtype=self.dtype)
+                    )
+                    logpf_pi += prior_dist.log_prob(x).sum(1)
+                    logpf_p += prior_dist.log_prob(x).sum(1)
+                
+                x = new_x
+                if j is None:
+                    break
+            
+            loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()
+            return loss, self.logZ
         
-        # going to noisy x
-        for i in range(self.diffusion_steps - 1, -1, -1):
-            pb_dist = torch.distributions.Normal(
-                torch.sqrt(self.bc_net.alpha_t[i]) * x,
-                torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
-            )
-            new_x = pb_dist.sample()
+        else:
+            bs = x.shape[0]
+            # minlogvar, maxlogvar = -4, 4
+            t = torch.zeros((bs,), device=device, dtype=self.dtype)
+            dt = 1 / self.diffusion_steps
 
-            q_epsilon, bc_epsilon = self(new_x, t + i * dt)
-            epsilon = q_epsilon + bc_epsilon
+            logpf_pi = torch.zeros((bs,), device=device, dtype=self.dtype)
+            logpf_p = torch.zeros((bs,), device=device, dtype=self.dtype)
+            # I think we need to log here
+            # Also, we need to unnormalize x here
+            x_unnormalized = self.bc_net.normalizer.unnormalize(x)
+            logr = self.posterior_log_reward(x_unnormalized).log()
+            
+            # going to noisy x
+            for i in range(self.diffusion_steps - 1, -1, -1):
+                pb_dist = torch.distributions.Normal(
+                    torch.sqrt(self.bc_net.alpha_t[i]) * x,
+                    torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
+                )
+                new_x = pb_dist.sample()
 
-            pf_pi_dist = torch.distributions.Normal(
-                self.bc_net.oneover_sqrta[i] * (new_x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
-                torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
-            )
-            logpf_pi += pf_pi_dist.log_prob(x).sum(1)
+                q_epsilon, bc_epsilon = self(new_x, t + i * dt)
+                epsilon = q_epsilon + bc_epsilon
+                
+                # noised 샘플로 만든 proposal이 필요함
+                # 이걸 만드려면 j가 필요함
 
-            pf_p_dist = torch.distributions.Normal(
-                self.bc_net.oneover_sqrta[i] * (new_x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
-                torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
-            )
-            logpf_p += pf_p_dist.log_prob(x).sum(1)
+                pf_pi_dist = torch.distributions.Normal(
+                    self.bc_net.oneover_sqrta[i] * (new_x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
+                    torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
+                )
+                logpf_pi += pf_pi_dist.log_prob(x).sum(1)
 
-            x = new_x
-        prior_dist = torch.distributions.Normal(torch.zeros_like(x, dtype=self.dtype), torch.ones_like(x, dtype=self.dtype))
-        logpf_pi += prior_dist.log_prob(x).sum(1)
-        logpf_p += prior_dist.log_prob(x).sum(1)
-        loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()
-        return loss, self.logZ
+                pf_p_dist = torch.distributions.Normal(
+                    self.bc_net.oneover_sqrta[i] * (new_x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
+                    torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
+                )
+                logpf_p += pf_p_dist.log_prob(x).sum(1)
+
+                x = new_x
+            prior_dist = torch.distributions.Normal(torch.zeros_like(x, dtype=self.dtype), torch.ones_like(x, dtype=self.dtype))
+            logpf_pi += prior_dist.log_prob(x).sum(1)
+            logpf_p += prior_dist.log_prob(x).sum(1)
+            loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()
+            return loss, self.logZ
 
     def compute_loss(self, device, gfn_batch_size=512):
         # return normalized samples x
