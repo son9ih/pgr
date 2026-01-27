@@ -82,14 +82,14 @@ class ElucidatedDiffusion(nn.Module):
         self.P_mean = P_mean
         self.P_std = P_std
         # self.num_sample_steps = num_sample_steps  # otherwise known as N in the paper
-        self.num_sample_steps = 128
+        self.num_sample_steps = num_sample_steps
         self.S_churn = S_churn
         self.S_tmin = S_tmin
         self.S_tmax = S_tmax
         self.S_noise = S_noise
         
         
-        
+        print(f'(Training) num_sample_steps: {self.num_sample_steps}')
         # self.sigmas = self.sample_schedule(self.num_sample_steps).to(self.device)
         self.sigmas = self.sample_schedule(self.num_sample_steps).to(self.device)
         
@@ -193,6 +193,7 @@ class ElucidatedDiffusion(nn.Module):
     ):
 
         num_sample_steps = default(num_sample_steps, self.num_sample_steps)
+        print(f'(Sampling) num_sample_steps: {num_sample_steps}')
         shape = (batch_size, *self.event_shape)
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
@@ -923,13 +924,10 @@ class REDQCondTrainer(Trainer):
                                curr_epoch: int,
                                num_steps: Optional[int] = None):
         # ECO uses r_network, not pred_net/fix_net
-        if agent.eco is not None and hasattr(agent.eco, 'r_network'):
-            agent.eco.r_network.eval()
+        # if agent.eco is not None and hasattr(agent.eco, 'r_network'):
+        #     agent.eco.r_network.eval()
         cond_distri = CondDistri_ECO(agent, self.batch_size, buffer, top_frac)
         self.update_cond_normalizer(cond_distri, device=self.accelerator.device)
-
-        # Set diffusion model to training mode
-        self.model.train()
         
         num_steps = num_steps or self.train_num_steps
         for j in range(num_steps):
@@ -1093,9 +1091,9 @@ class CondDistri_ECO(object):
             done = self.buffer.done_buf[idxs][:, None]
             with torch.no_grad():
                 obs_tensor = Tensor(obs).to(self.device)
-                done_tensor = Tensor(done).to(self.device) if len(done.shape) > 0 else None
                 # ECO uses current obs (according to paper: "takes the current observation o as input")
-                self.irews_buf[idxs] = agent.compute_eco_reward(obs_tensor, done_tensor).squeeze().cpu().numpy()
+                # For fixed-length episodes, done signal is ignored
+                self.irews_buf[idxs] = agent.compute_eco_reward(obs_tensor).squeeze().cpu().numpy()
         self.top_frac_indices = np.argsort(self.irews_buf, axis=0)[-int(top_frac * buffer.size):]
 
     def sample_batch(self, batch_size=32, idxs=None):

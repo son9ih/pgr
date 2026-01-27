@@ -51,14 +51,8 @@ def construct_diffusion_model(
         skip_dims: List[int] = [],
         cond_dim: Optional[int] = None,
         cfg_dropout: float = 0.0,
+        num_sample_steps: int = 1000,
 ) -> ElucidatedDiffusion:
-    # construct_diffusion_model(
-    #                 inputs=inputs,
-    #                 skip_dims=skip_dims,
-    #                 disable_terminal_norm=model_terminals,
-    #                 cond_dim=1,
-    #                 cfg_dropout=cfg_dropout,
-    #             ),
     event_dim = inputs.shape[1]
     model = denoising_network(d_in=event_dim, activation=activation, 
                               cond_dim=cond_dim, cfg_dropout=cfg_dropout)
@@ -86,6 +80,7 @@ def construct_diffusion_model(
         normalizer=normalizer,
         cond_normalizer=cond_normalizer,
         event_shape=[event_dim],
+        num_sample_steps=num_sample_steps,
     )
 
     # Counter number of parameters in diffusion model

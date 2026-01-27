@@ -127,8 +127,8 @@ def redq_sac(
 
     if args.wandb:
         group_name = f'{run_name.split("_")[-1]}'
-        if args.inter_onpolicy > 0:
-            group_name += f'+{args.novelty_measure}'
+        # if args.inter_onpolicy > 0:
+        group_name += f'+{args.novelty_measure}'
 
         if args.rtb:
 

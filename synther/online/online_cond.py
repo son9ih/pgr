@@ -827,7 +827,7 @@ def redq_sac(
                             
                             # Gradient clipping to prevent parameter explosion and NaN weights
                             torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
-                            torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+                            # torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
                             
                             # Update optimizer after accumulating gradients from all chunks
                             optimizer.step()
@@ -971,7 +971,7 @@ def redq_sac(
                         
                         # Gradient clipping to prevent parameter explosion
                         torch.nn.utils.clip_grad_norm_(backprop_model.parameters(), max_norm=1.0)
-                        torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
+                        # torch.nn.utils.clip_grad_norm_([log_Z], max_norm=1.0)
                         
                         # Update optimizer after accumulating gradients from all chunks
                         optimizer.step()
@@ -1094,7 +1094,7 @@ def redq_sac(
             cur_epoch = t // steps_per_epoch
             
             # 1. Histogram plotting
-            if (args.algorithm == 'PGRrnd' or args.algorithm == 'PGR' or args.algorithm == 'Ours'):
+            if (args.algorithm == 'PGRrnd' or args.algorithm == 'PGR' or args.algorithm == 'Ours' or args.algorithm == 'SER'):
 
                 # Prepare output directory
                 out_dir = os.path.join(args.results_folder, 'histograms')

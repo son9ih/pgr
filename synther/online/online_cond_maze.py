@@ -52,7 +52,8 @@ def redq_sac(
         # steps_per_epoch=300,
         # max_ep_len=300,
         # 학습 과정에서 에이전트가 truncated (500스텝 도달)되는 비율보다 terminated (골 도달)되는 비율이 훨씬 높아진다면, 그때 이 값을 300 정도로 줄여서 학습 효율을 높이는 것을 고려해 볼 수 있습니다.
-        max_ep_len=500,
+        # max_ep_len=500,
+        max_ep_len=150,
         n_evals_per_epoch=1,
         logger_kwargs=dict(),
         # following are agent related hyperparameters
@@ -634,21 +635,21 @@ def redq_sac(
                 
                 # Only draw interior walls (exclude outer boundary)
                 # Actual playable area is 6x6 interior, excluding i=0,7 and j=0,7
-                for i in range(1, 7):  # Skip outermost rows (0 and 7)
-                    for j in range(1, 7):  # Skip outermost cols (0 and 7)
-                        if MEDIUM_MAZE[i][j] == 1:  # Wall
-                            # Transform grid coordinates to Mujoco coordinates
-                            # Grid: i=row (0 at top), j=col (0 at left)
-                            # Mujoco: x increases right, y increases up
-                            # Transform: (col-4)*0.75 for x, (4-row)*0.75 for y (flip y-axis)
-                            x_mujoco = (j - 4) * 0.75
-                            y_mujoco = (4 - i) * 0.75  # Flip y-axis
-                            rect = patches.Rectangle(
-                                (x_mujoco, y_mujoco), 0.75, 0.75,
-                                linewidth=0, facecolor=wall_color, 
-                                alpha=1.0, zorder=1
-                            )
-                            ax.add_patch(rect)
+                # for i in range(1, 7):  # Skip outermost rows (0 and 7)
+                #     for j in range(1, 7):  # Skip outermost cols (0 and 7)
+                #         if MEDIUM_MAZE[i][j] == 1:  # Wall
+                #             # Transform grid coordinates to Mujoco coordinates
+                #             # Grid: i=row (0 at top), j=col (0 at left)
+                #             # Mujoco: x increases right, y increases up
+                #             # Transform: (col-4)*0.75 for x, (4-row)*0.75 for y (flip y-axis)
+                #             x_mujoco = (j - 4) * 0.75
+                #             y_mujoco = (4 - i) * 0.75  # Flip y-axis
+                #             rect = patches.Rectangle(
+                #                 (x_mujoco, y_mujoco), 0.75, 0.75,
+                #                 linewidth=0, facecolor=wall_color, 
+                #                 alpha=1.0, zorder=1
+                #             )
+                #             ax.add_patch(rect)
                 
                 # Mark initial position
                 ax.scatter(initial_pos[0], initial_pos[1], c='cyan', marker='^', s=200, 
@@ -973,13 +974,15 @@ class MazeCustomWrapper(gym.Wrapper):
             np.array([2.458, 2.739]),    # Grid [1,6] - Top-left
             np.array([2.524, -2.475]),   # Grid [6,6] - Top-right
         ]
-        self.goal_rewards = [1.2, 1.4, 1.0, 1.6]
+        # self.goal_rewards = [1.2, 1.4, 1.0, 1.6]
+        # self.goal_rewards = [1.2, 1.6, 1.0, 1.4]
+        self.goal_rewards = [1.5, 4.5, 23.4, 6.1]
         # self.goal_threshold = 0.5  # Distance threshold in Mujoco units
         self.goal_threshold = 0.2  # Distance threshold in Mujoco units
         
         # Initial position - center cell [3, 4] -> Mujoco [0.295, 0.306]
         self.initial_position_coord = np.array([0.295, 0.306])
-        self.initial_position_cell = np.array([3, 4])   
+        self.initial_position_cell = np.array([3, 4])
         
     def reset(self, **kwargs):
         if 'options' not in kwargs or kwargs['options'] is None:
