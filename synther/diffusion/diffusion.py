@@ -1253,7 +1253,7 @@ class QFlow(nn.Module):
                 if j is None:
                     break
             
-            loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()
+            loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
             return loss, self.logZ
         
         else:
@@ -1299,7 +1299,7 @@ class QFlow(nn.Module):
             prior_dist = torch.distributions.Normal(torch.zeros_like(x, dtype=self.dtype), torch.ones_like(x, dtype=self.dtype))
             logpf_pi += prior_dist.log_prob(x).sum(1)
             logpf_p += prior_dist.log_prob(x).sum(1)
-            loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()
+            loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
             return loss, self.logZ
 
     def compute_loss(self, device, gfn_batch_size=512):
@@ -1317,5 +1317,6 @@ class QFlow(nn.Module):
         # print("logr finite:", torch.isfinite(logr).all().item())
         # breakpoint()
         # pdb.set_trace()
-        loss = 0.5 * ((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) ** 2).mean()
+        # logpf_p는 지금 1D tensor, 따라서 loss는 데이터 하나 당 평균 loss임, 이러면 data dimension이 큰 환경에서 loss가 커질 수 밖에 없는데
+        loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
         return loss, self.logZ, x, logr
