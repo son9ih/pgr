@@ -1,9 +1,11 @@
 import numpy as np
 import torch
-from redq.algos.core import (ReplayBuffer,
-                             soft_update_model1_with_model2,
-                             ACTION_BOUND_EPSILON)
-from redq.algos.redq_sac import REDQSACAgent
+from redq.algos.core import (
+    ReplayBuffer,
+    soft_update_model1_with_model2,
+    ACTION_BOUND_EPSILON,
+)
+from redq.algos.redq_sac import REDQSACAgent, get_probabilistic_num_min
 from synther.online.conditional_nets import Curiosity, Predictor
 from synther.online.utils import RunningMeanStd, RMS
 from synther.online.eco import ECO
@@ -480,5 +482,426 @@ class REDQRLPDCondAgent(REDQSACAgent):
         # Convert to torch tensor and update RMS
         next_obs_tensor = torch.FloatTensor(next_obs_all).to(self.device)
         self.next_obs_rms(next_obs_tensor)
-              
 
+
+class REDQRLPDCondAgent_visual(REDQRLPDCondAgent):
+    """
+    Variant of REDQRLPDCondAgent for visual encodings where each observation is
+    concat(actor_state, critic_state). The policy should only depend on actor_state,
+    and Q-networks should only depend on critic_state. We achieve this by zeroing
+    out the unused half of the observation when feeding into policy / Q nets.
+    """
+
+    def __init__(
+        self,
+        cond_hidden_size,
+        diffusion_buffer_size=int(1e6),
+        diffusion_sample_ratio=0.5,
+        actor_dim=None,
+        critic_dim=None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(
+            cond_hidden_size,
+            diffusion_buffer_size,
+            diffusion_sample_ratio,
+            *args,
+            **kwargs,
+        )
+        assert actor_dim is not None and critic_dim is not None, "actor_dim and critic_dim must be provided"
+        assert actor_dim + critic_dim == self.obs_dim, "actor_dim + critic_dim must equal obs_dim"
+        self.actor_dim = int(actor_dim)
+        self.critic_dim = int(critic_dim)
+
+    # ----- helpers -----
+    def _split_obs(self, obs_tensor: torch.Tensor):
+        """Split concat(obs) into (actor_state, critic_state)."""
+        actor = obs_tensor[:, : self.actor_dim]
+        critic = obs_tensor[:, self.actor_dim :]
+        return actor, critic
+
+    def _obs_for_policy(self, obs_tensor: torch.Tensor):
+        """Build observation vector for policy: [actor_state, 0_critic]."""
+        actor, _ = self._split_obs(obs_tensor)
+        zeros_critic = torch.zeros(
+            actor.size(0),
+            self.critic_dim,
+            dtype=actor.dtype,
+            device=self.device,
+        )
+        return torch.cat([actor, zeros_critic], dim=1)
+
+    def _obs_for_q(self, obs_tensor: torch.Tensor):
+        """Build observation vector for Q nets: [0_actor, critic_state]."""
+        _, critic = self._split_obs(obs_tensor)
+        zeros_actor = torch.zeros(
+            critic.size(0),
+            self.actor_dim,
+            dtype=critic.dtype,
+            device=self.device,
+        )
+        return torch.cat([zeros_actor, critic], dim=1)
+
+    # ----- exploration / evaluation -----
+    def get_exploration_action(self, obs, env):
+        # same API as parent but use actor_state only
+        with torch.no_grad():
+            if self.get_current_num_data() > self.start_steps:
+                obs_tensor = torch.as_tensor(
+                    obs, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
+                obs_policy = self._obs_for_policy(obs_tensor)
+                action_tensor = self.policy_net.forward(
+                    obs_policy, deterministic=False, return_log_prob=False
+                )[0]
+                action = action_tensor.cpu().numpy().reshape(-1)
+            else:
+                action = env.action_space.sample()
+        return action
+
+    def get_test_action(self, obs):
+        # deterministic action for evaluation, using actor_state only
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(
+                obs, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
+            obs_policy = self._obs_for_policy(obs_tensor)
+            action_tensor = self.policy_net.forward(
+                obs_policy, deterministic=True, return_log_prob=False
+            )[0]
+            action = action_tensor.cpu().numpy().reshape(-1)
+        return action
+
+    def get_action_and_logprob_for_bias_evaluation(self, obs):
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(
+                obs, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
+            obs_policy = self._obs_for_policy(obs_tensor)
+            action_tensor, _, _, log_prob_a_tilda, _, _ = self.policy_net.forward(
+                obs_policy, deterministic=False, return_log_prob=True
+            )
+            action = action_tensor.cpu().numpy().reshape(-1)
+        return action, log_prob_a_tilda
+
+    def get_ave_q_prediction_for_bias_evaluation(self, obs_tensor, acts_tensor):
+        """Use critic_state-only observation for Q prediction."""
+        obs_tensor = obs_tensor.to(self.device)
+        acts_tensor = acts_tensor.to(self.device)
+        obs_q = self._obs_for_q(obs_tensor)
+        q_prediction_list = []
+        for q_i in range(self.num_Q):
+            q_prediction = self.q_net_list[q_i](
+                torch.cat([obs_q, acts_tensor], 1)
+            )
+            q_prediction_list.append(q_prediction)
+        q_prediction_cat = torch.cat(q_prediction_list, dim=1)
+        average_q_prediction = torch.mean(q_prediction_cat, dim=1)
+        return average_q_prediction
+
+    # ----- REDQ Q-target with split obs -----
+    def get_redq_q_target_no_grad(self, obs_next_tensor, rews_tensor, done_tensor):
+        """
+        Same as base but:
+          - policy sees only actor_state
+          - Q targets see only critic_state.
+        """
+        num_mins_to_use = get_probabilistic_num_min(self.num_min)
+        sample_idxs = np.random.choice(self.num_Q, num_mins_to_use, replace=False)
+        with torch.no_grad():
+            obs_next_policy = self._obs_for_policy(obs_next_tensor)
+            obs_next_q = self._obs_for_q(obs_next_tensor)
+
+            if self.q_target_mode == "min":
+                a_tilda_next, _, _, log_prob_a_tilda_next, _, _ = self.policy_net.forward(
+                    obs_next_policy
+                )
+                q_prediction_next_list = []
+                for sample_idx in sample_idxs:
+                    q_prediction_next = self.q_target_net_list[sample_idx](
+                        torch.cat([obs_next_q, a_tilda_next], 1)
+                    )
+                    q_prediction_next_list.append(q_prediction_next)
+                q_prediction_next_cat = torch.cat(q_prediction_next_list, 1)
+                min_q, _ = torch.min(q_prediction_next_cat, dim=1, keepdim=True)
+                next_q_with_log_prob = min_q - self.alpha * log_prob_a_tilda_next
+                y_q = rews_tensor + self.gamma * (1 - done_tensor) * next_q_with_log_prob
+
+            elif self.q_target_mode == "ave":
+                a_tilda_next, _, _, log_prob_a_tilda_next, _, _ = self.policy_net.forward(
+                    obs_next_policy
+                )
+                q_prediction_next_list = []
+                for q_i in range(self.num_Q):
+                    q_prediction_next = self.q_target_net_list[q_i](
+                        torch.cat([obs_next_q, a_tilda_next], 1)
+                    )
+                    q_prediction_next_list.append(q_prediction_next)
+                q_prediction_next_ave = (
+                    torch.cat(q_prediction_next_list, 1)
+                    .mean(dim=1)
+                    .reshape(-1, 1)
+                )
+                next_q_with_log_prob = (
+                    q_prediction_next_ave - self.alpha * log_prob_a_tilda_next
+                )
+                y_q = rews_tensor + self.gamma * (1 - done_tensor) * next_q_with_log_prob
+
+            elif self.q_target_mode == "rem":
+                a_tilda_next, _, _, log_prob_a_tilda_next, _, _ = self.policy_net.forward(
+                    obs_next_policy
+                )
+                q_prediction_next_list = []
+                for q_i in range(self.num_Q):
+                    q_prediction_next = self.q_target_net_list[q_i](
+                        torch.cat([obs_next_q, a_tilda_next], 1)
+                    )
+                    q_prediction_next_list.append(q_prediction_next)
+                q_prediction_next_cat = torch.cat(q_prediction_next_list, 1)
+                rem_weight = Tensor(
+                    np.random.uniform(0, 1, q_prediction_next_cat.shape)
+                ).to(device=self.device)
+                normalize_sum = rem_weight.sum(1).reshape(-1, 1).expand(-1, self.num_Q)
+                rem_weight = rem_weight / normalize_sum
+                q_prediction_next_rem = (
+                    q_prediction_next_cat * rem_weight
+                ).sum(dim=1).reshape(-1, 1)
+                next_q_with_log_prob = (
+                    q_prediction_next_rem - self.alpha * log_prob_a_tilda_next
+                )
+                y_q = rews_tensor + self.gamma * (1 - done_tensor) * next_q_with_log_prob
+            else:
+                raise ValueError(f"Invalid q_target_mode: {self.q_target_mode}")
+
+        return y_q, sample_idxs
+
+    # ----- main training loop (split obs usage) -----
+    def train(self, logger):
+        # Put conditional net in training mode
+        self.cond_net.train()
+        num_update = 0 if self.get_current_num_data() <= self.delay_update_steps else self.utd_ratio
+
+        for i_update in range(num_update):
+            obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor = self.sample_data(
+                self.batch_size
+            )
+
+            obs_q = self._obs_for_q(obs_tensor)
+            obs_next_q = self._obs_for_q(obs_next_tensor)
+            obs_policy = self._obs_for_policy(obs_tensor)
+
+            # Q loss
+            y_q, sample_idxs = self.get_redq_q_target_no_grad(
+                obs_next_tensor, rews_tensor, done_tensor
+            )
+            q_prediction_list = []
+            for q_i in range(self.num_Q):
+                q_prediction = self.q_net_list[q_i](
+                    torch.cat([obs_q, acts_tensor], 1)
+                )
+                q_prediction_list.append(q_prediction)
+            q_prediction_cat = torch.cat(q_prediction_list, dim=1)
+            y_q = y_q.expand((-1, self.num_Q)) if y_q.shape[1] == 1 else y_q
+            q_loss_all = self.mse_criterion(q_prediction_cat, y_q) * self.num_Q
+
+            for q_i in range(self.num_Q):
+                self.q_optimizer_list[q_i].zero_grad()
+            q_loss_all.backward()
+
+            # policy and alpha loss
+            if ((i_update + 1) % self.policy_update_delay == 0) or i_update == num_update - 1:
+                a_tilda, mean_a_tilda, log_std_a_tilda, log_prob_a_tilda, _, pretanh = self.policy_net.forward(
+                    obs_policy
+                )
+                q_a_tilda_list = []
+                for sample_idx in range(self.num_Q):
+                    self.q_net_list[sample_idx].requires_grad_(False)
+                    q_a_tilda = self.q_net_list[sample_idx](
+                        torch.cat([obs_q, a_tilda], 1)
+                    )
+                    q_a_tilda_list.append(q_a_tilda)
+                q_a_tilda_cat = torch.cat(q_a_tilda_list, 1)
+                ave_q = torch.mean(q_a_tilda_cat, dim=1, keepdim=True)
+                policy_loss = (self.alpha * log_prob_a_tilda - ave_q).mean()
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                for sample_idx in range(self.num_Q):
+                    self.q_net_list[sample_idx].requires_grad_(True)
+
+                if self.auto_alpha:
+                    alpha_loss = -(
+                        self.log_alpha * (log_prob_a_tilda + self.target_entropy).detach()
+                    ).mean()
+                    self.alpha_optim.zero_grad()
+                    alpha_loss.backward()
+                    self.alpha_optim.step()
+                    self.alpha = self.log_alpha.cpu().exp().item()
+                else:
+                    alpha_loss = Tensor([0])
+
+            # update networks
+            for q_i in range(self.num_Q):
+                self.q_optimizer_list[q_i].step()
+
+            if ((i_update + 1) % self.policy_update_delay == 0) or i_update == num_update - 1:
+                self.policy_optimizer.step()
+
+            # polyak averaged Q target networks
+            for q_i in range(self.num_Q):
+                soft_update_model1_with_model2(
+                    self.q_target_net_list[q_i], self.q_net_list[q_i], self.polyak
+                )
+
+            # Update Cond Net (same as parent)
+            if i_update == num_update - 1:
+                if self.cond_optimizer is not None:
+                    (
+                        cond_obs_tensor,
+                        cond_obs_next_tensor,
+                        cond_acts_tensor,
+                        _,
+                        _,
+                    ) = self.sample_real_data(self.batch_size)
+                    self.cond_optimizer.zero_grad()
+                    cond_loss = self.cond_net.forward_loss(
+                        cond_obs_tensor, cond_obs_next_tensor, cond_acts_tensor
+                    )
+                    cond_loss.backward()
+                    self.cond_optimizer.step()
+                else:
+                    cond_loss = Tensor([0])
+            else:
+                cond_loss = Tensor([0])
+
+            if i_update == num_update - 1:
+                logger.store(
+                    LossCond=cond_loss.cpu().item(),
+                    LossPi=policy_loss.cpu().item(),
+                    LossQ1=q_loss_all.cpu().item() / self.num_Q,
+                    LossAlpha=alpha_loss.cpu().item(),
+                    Q1Vals=q_prediction.detach().cpu().numpy(),
+                    Alpha=self.alpha,
+                    LogPi=log_prob_a_tilda.detach().cpu().numpy(),
+                    PreTanh=pretanh.abs().detach().cpu().numpy().reshape(-1),
+                )
+
+        if num_update == 0:
+            logger.store(
+                LossCond=0,
+                LossPi=0,
+                LossQ1=0,
+                LossAlpha=0,
+                Q1Vals=0,
+                Alpha=0,
+                LogPi=0,
+                PreTanh=0,
+            )
+
+    # ----- on-policy reward (actor_state only) -----
+    def compute_onpolicy_reward(self, obs, act, low=-12.0, high=7.0):
+        if isinstance(obs, np.ndarray):
+            obs = torch.FloatTensor(obs).to(self.device)
+        if isinstance(act, np.ndarray):
+            act = torch.FloatTensor(act).to(self.device)
+
+        if len(obs.shape) == 1:
+            obs = obs.unsqueeze(0)
+        if len(act.shape) == 1:
+            act = act.unsqueeze(0)
+
+        obs_policy = self._obs_for_policy(obs)
+
+        with torch.no_grad():
+            h = obs_policy
+            for fc_layer in self.policy_net.hidden_layers:
+                h = self.policy_net.hidden_activation(fc_layer(h))
+            mean = self.policy_net.last_fc_layer(h)
+            log_std = self.policy_net.last_fc_log_std(h)
+            log_std = torch.clamp(log_std, -20, 2)
+            std = torch.exp(log_std)
+
+            action_normalized = act / self.policy_net.action_limit
+            action_normalized_clamped = torch.clamp(
+                action_normalized, -0.999999, 0.999999
+            )
+            pre_tanh_value = 0.5 * torch.log(
+                (1 + action_normalized_clamped) / (1 - action_normalized_clamped)
+            )
+
+            normal = Normal(mean, std)
+            log_prob = normal.log_prob(pre_tanh_value)
+            log_prob -= torch.log(
+                1 - action_normalized_clamped.pow(2) + ACTION_BOUND_EPSILON
+            )
+            log_prob = log_prob.sum(1, keepdim=True)
+
+            clipped_log_prob = torch.clamp(log_prob, low, high)
+            onpolicy_reward = torch.exp(clipped_log_prob - self.max_onpolicy_reward)
+
+            if len(onpolicy_reward.shape) > 1 and onpolicy_reward.shape[-1] == 1:
+                onpolicy_reward = onpolicy_reward.squeeze(-1)
+
+            if onpolicy_reward.numel() == 1:
+                onpolicy_reward = onpolicy_reward.item()
+            else:
+                onpolicy_reward = onpolicy_reward.cpu().numpy()
+
+        return onpolicy_reward
+
+    def update_onpolicy_reward(self, low=-12.0, high=7.0):
+        self.total_onpolicy_reward = []
+        ptr_location = self.replay_buffer.ptr
+        if ptr_location == 0:
+            self.max_onpolicy_reward = 0.0
+            return self.max_onpolicy_reward
+
+        obs_all = self.replay_buffer.obs1_buf[:ptr_location]
+        acts_all = self.replay_buffer.acts_buf[:ptr_location]
+
+        obs_tensor = torch.FloatTensor(obs_all).to(self.device)
+        acts_tensor = torch.FloatTensor(acts_all).to(self.device)
+
+        batch_size = 1000
+        num_transitions = len(obs_all)
+
+        with torch.no_grad():
+            for i in range(0, num_transitions, batch_size):
+                end_idx = min(i + batch_size, num_transitions)
+                obs_batch = obs_tensor[i:end_idx]
+                acts_batch = acts_tensor[i:end_idx]
+
+                obs_policy = self._obs_for_policy(obs_batch)
+
+                h = obs_policy
+                for fc_layer in self.policy_net.hidden_layers:
+                    h = self.policy_net.hidden_activation(fc_layer(h))
+                mean = self.policy_net.last_fc_layer(h)
+                log_std = self.policy_net.last_fc_log_std(h)
+                log_std = torch.clamp(log_std, -20, 2)
+                std = torch.exp(log_std)
+
+                action_normalized = acts_batch / self.policy_net.action_limit
+                action_normalized_clamped = torch.clamp(
+                    action_normalized, -0.999999, 0.999999
+                )
+                pre_tanh_value = 0.5 * torch.log(
+                    (1 + action_normalized_clamped) / (1 - action_normalized_clamped)
+                )
+
+                normal = Normal(mean, std)
+                log_prob = normal.log_prob(pre_tanh_value)
+                log_prob -= torch.log(
+                    1 - action_normalized_clamped.pow(2) + ACTION_BOUND_EPSILON
+                )
+                log_prob = log_prob.sum(1, keepdim=False)
+
+                clipped_log_prob = torch.clamp(log_prob, low, high)
+                self.total_onpolicy_reward.extend(
+                    clipped_log_prob.cpu().numpy().tolist()
+                )
+
+        if len(self.total_onpolicy_reward) > 0:
+            self.max_onpolicy_reward = max(self.total_onpolicy_reward)
+        else:
+            self.max_onpolicy_reward = 0.0
