@@ -758,8 +758,11 @@ class QFlow(nn.Module):
                 assert self.ddim_steps <= T
                 # 1000-step index 중 128개 선택 (0 noisy -> T-1 clean)
                 
+                # original:
                 logpf_pi = normal_dist.log_prob(x).sum(1)
                 logpf_p = normal_dist.log_prob(x).sum(1)
+                # logpf_pi = normal_dist.log_prob(x).sum(1).clamp(min=-12.0, max=7.0)
+                # logpf_p = normal_dist.log_prob(x).sum(1).clamp(min=-12.0, max=7.0)
                 
                 # idx = 0, 8 ,16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,...
                 idxs = torch.linspace(0, T - 1, steps=self.ddim_steps, device=device).long()
@@ -830,21 +833,36 @@ class QFlow(nn.Module):
                         # DDIM update
                         x = sqrt_abar_j * x0 + c * eps + sigma * noise
                         
+                        # original:
                         pf_pi_dist = torch.distributions.Normal(
                             sqrt_abar_j * x0_bc + c * bc_eps,
                             sigma * torch.ones_like(x, dtype=self.dtype),
-                            # self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
-                            # torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
                         )
                         logpf_pi += pf_pi_dist.log_prob(x).sum(1)
                         
                         pf_p_dist = torch.distributions.Normal(
                             sqrt_abar_j * x0 + c * eps,
                             sigma * torch.ones_like(x, dtype=self.dtype),
-                            # self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
-                            # torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
                         )
                         logpf_p += pf_p_dist.log_prob(x).sum(1)
+
+                        # pf_pi_dist = torch.distributions.Normal(
+                        #     sqrt_abar_j * x0_bc + c * bc_eps,
+                        #     sigma * torch.ones_like(x, dtype=self.dtype),
+                        #     # self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
+                        #     # torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
+                        # )
+                        # logpf_pi_step = pf_pi_dist.log_prob(x).sum(1)
+                        # logpf_pi += logpf_pi_step.clamp(min=-12.0, max=7.0)
+                        
+                        # pf_p_dist = torch.distributions.Normal(
+                        #     sqrt_abar_j * x0 + c * eps,
+                        #     sigma * torch.ones_like(x, dtype=self.dtype),
+                        #     # self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
+                        #     # torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
+                        # )
+                        # logpf_p_step = pf_p_dist.log_prob(x).sum(1)
+                        # logpf_p += logpf_p_step.clamp(min=-12.0, max=7.0)
 
                         
                         
@@ -1229,6 +1247,7 @@ class QFlow(nn.Module):
                     
                     # DDIM proposal: new_x (x_j)에서 x (x_i)로 가는 proposal
                     # pf_pi_dist와 pf_p_dist는 x (현재 상태 x_i)에 대한 분포
+                    # original:
                     pf_pi_dist = torch.distributions.Normal(
                         sqrt_abar_i * x0_bc + c * bc_epsilon,
                         sigma * torch.ones_like(x, dtype=self.dtype),
@@ -1240,20 +1259,40 @@ class QFlow(nn.Module):
                         sigma * torch.ones_like(x, dtype=self.dtype),
                     )
                     logpf_p += pf_p_dist.log_prob(x).sum(1)
+
+                    # pf_pi_dist = torch.distributions.Normal(
+                    #     sqrt_abar_i * x0_bc + c * bc_epsilon,
+                    #     sigma * torch.ones_like(x, dtype=self.dtype),
+                    # )
+                    # logpf_pi_step = pf_pi_dist.log_prob(x).sum(1)
+                    # logpf_pi += logpf_pi_step.clamp(min=-12.0, max=7.0)
+                    
+                    # pf_p_dist = torch.distributions.Normal(
+                    #     sqrt_abar_i * x0 + c * epsilon,
+                    #     sigma * torch.ones_like(x, dtype=self.dtype),
+                    # )
+                    # logpf_p_step = pf_p_dist.log_prob(x).sum(1)
+                    # logpf_p += logpf_p_step.clamp(min=-12.0, max=7.0)
                 else:
                     # 마지막 단계: prior 분포
                     prior_dist = torch.distributions.Normal(
                         torch.zeros_like(x, dtype=self.dtype),
                         torch.ones_like(x, dtype=self.dtype)
                     )
+                    # original:
                     logpf_pi += prior_dist.log_prob(x).sum(1)
                     logpf_p += prior_dist.log_prob(x).sum(1)
+                    # prior_logpf_pi = prior_dist.log_prob(x).sum(1)
+                    # prior_logpf_p = prior_dist.log_prob(x).sum(1)
+                    # logpf_pi += prior_logpf_pi.clamp(min=-12.0, max=7.0)
+                    # logpf_p += prior_logpf_p.clamp(min=-12.0, max=7.0)
                 
                 x = new_x
                 if j is None:
                     break
             
             loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
+            # loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha)) ** 2).mean()
             return loss, self.logZ
         
         else:
@@ -1300,6 +1339,7 @@ class QFlow(nn.Module):
             logpf_pi += prior_dist.log_prob(x).sum(1)
             logpf_p += prior_dist.log_prob(x).sum(1)
             loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
+            # loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha)) ** 2).mean()
             return loss, self.logZ
 
     def compute_loss(self, device, gfn_batch_size=512):
@@ -1319,4 +1359,5 @@ class QFlow(nn.Module):
         # pdb.set_trace()
         # logpf_p는 지금 1D tensor, 따라서 loss는 데이터 하나 당 평균 loss임, 이러면 data dimension이 큰 환경에서 loss가 커질 수 밖에 없는데
         loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
+        # loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha)) ** 2).mean()
         return loss, self.logZ, x, logr

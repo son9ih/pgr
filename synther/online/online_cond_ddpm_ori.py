@@ -457,8 +457,8 @@ def redq_sac(
             agent.pred_net.train()
             pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
             agent.pred_net.eval()
-            logger.store(RNDPredLoss=pred_loss)
-            logger.log_tabular('RNDPredLoss', average_only=True)
+            # logger.store(RNDPredLoss=pred_loss)
+            # logger.log_tabular('RNDPredLoss', average_only=True)
 
         if d or (ep_len == max_ep_len):
             
@@ -881,9 +881,9 @@ def redq_sac(
                     
                     # Update weights after accumulating all gradients
                     # posterior_model_optimizer.step()              
-                    if args.ft_clip_grad:
-                        print(f'Clipping gradients during finetuning')
-                        torch.nn.utils.clip_grad_norm_(posterior_model.parameters(), max_norm=1.0)
+                    if args.ft_clip_grad > 0.0:
+                        # print(f'Clipping gradients during finetuning')
+                        torch.nn.utils.clip_grad_norm_(posterior_model.parameters(), max_norm=args.ft_clip_grad)
                     posterior_model_optimizer.step()
                     if posterior_model_lr_scheduler is not None:
                         posterior_model_lr_scheduler.step()
@@ -1268,7 +1268,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--prior_lr', type=float, default=3e-4)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
-    parser.add_argument('--ft_clip_grad', action='store_true', default=False)
+    parser.add_argument('--ft_clip_grad', type=float, default=1.0)
     parser.add_argument('--alpha_rtb', type=float, default=1.0)
     parser.add_argument('--cond_top_frac', type=float, default=0.25)
     
