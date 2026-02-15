@@ -474,10 +474,6 @@ def redq_sac(
         # if (t + 1) % steps_per_epoch == 0 and args.rnd:
         # if (t + 1) % steps_per_epoch == 0:
         if d or (ep_len == max_ep_len):
-        # if (ep_len == max_ep_len):
-            # print(t)
-            # print(d)
-            # print(ep_len == max_ep_len)
             agent.pred_net.train()
             pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
             agent.pred_net.eval()
@@ -637,9 +633,9 @@ def redq_sac(
             test_function_y_tensor = torch.FloatTensor(test_function_y)
             
             # compute 95-percentile of test_function_y
-            if args.clip_reward:
-                test_function_y_percentile = torch.quantile(test_function_y_tensor, 0.95)
-                print(f'95-percentile of test function y: {test_function_y_percentile:.7f}')
+            if args.clip_reward > 0.0:
+                test_function_y_percentile = torch.quantile(test_function_y_tensor, args.clip_reward)
+                print(f'{args.clip_reward}-percentile of test function y: {test_function_y_percentile:.7f}')
             else:
                 test_function_y_percentile = None
             
@@ -1066,8 +1062,7 @@ def redq_sac(
                 # Split into batches due to memory constraints
                 # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
                 if args.algorithm == 'Ours':
-                    posterior_model.eval()
-                    X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
+                    pass
                 elif args.algorithm == 'PGRrnd' or args.algorithm == 'PGR':
                     # prior_model.eval()
                     # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
@@ -1790,8 +1785,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--ddim', action='store_true', default=False)
     parser.add_argument('--eta', type=float, default=0.0)
-    parser.add_argument('--clip_reward', action='store_true', default=False)
-    
+    parser.add_argument('--clip_reward', type=float, default=0.95)
 
     args = parser.parse_args()
 

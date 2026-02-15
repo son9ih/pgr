@@ -27,6 +27,149 @@ from synther.online.utils import PBE, RMS, compute_intr_reward
 import pdb
 
 
+# For Dynamic MSE logging
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+def _mujoco_set_state_from_obs(env: gym.Env, obs: np.ndarray) -> bool:
+    """
+    Best-effort helper to set MuJoCo simulator state from a Gym MuJoCo observation.
+
+    Supports common observation layouts:
+      - obs = concat(qpos[1:], qvel)  (e.g., Hopper/Walker2d/HalfCheetah in Gym)
+      - obs = concat(qpos, qvel)
+
+    Returns:
+      True if state was set successfully; False otherwise.
+    """
+    unwrapped = getattr(env, "unwrapped", env)
+    if not hasattr(unwrapped, "set_state"):
+        return False
+    if not hasattr(unwrapped, "model"):
+        return False
+    if not hasattr(unwrapped, "sim") or not hasattr(unwrapped.sim, "data"):
+        return False
+
+    obs = np.asarray(obs, dtype=np.float64).reshape(-1)
+    nq = int(getattr(unwrapped.model, "nq", 0))
+    nv = int(getattr(unwrapped.model, "nv", 0))
+    if nq <= 0 or nv <= 0:
+        return False
+
+    # Current state for padding/fallback
+    qpos_cur = np.array(unwrapped.sim.data.qpos, dtype=np.float64).copy()
+    qvel_cur = np.array(unwrapped.sim.data.qvel, dtype=np.float64).copy()
+
+    if obs.shape[0] == (nq - 1 + nv):
+        qpos = qpos_cur.copy()
+        qpos[1:] = obs[: nq - 1]
+        qvel = obs[nq - 1 :]
+    elif obs.shape[0] == (nq + nv):
+        qpos = obs[:nq]
+        qvel = obs[nq:]
+    else:
+        return False
+
+    try:
+        unwrapped.set_state(qpos, qvel)
+        return True
+    except Exception:
+        return False
+
+
+def compute_dynamic_mse_from_diffusion_buffer(
+    diffusion_buffer,
+    gt_env: gym.Env,
+    n_samples: int = 5000,
+) -> dict:
+    """
+    Computes per-transition Dynamic MSE on synthetic transitions stored in diffusion_buffer,
+    using a "ground-truth" one-step simulator model:
+      s', r = step(env | set_state(s), a)
+
+    Dynamic MSE (per sample):
+      0.5 * ( mean((s'_true - s'_gt)^2) + (r_true - r_gt)^2 )
+
+    Returns a dict with arrays + summary stats.
+    """
+    n_samples = int(n_samples)
+    if diffusion_buffer.size <= 0:
+        return dict(ok=False, reason="empty_diffusion_buffer")
+
+    batch = diffusion_buffer.sample_batch(batch_size=min(n_samples, diffusion_buffer.size))
+    obs1 = batch["obs1"]
+    acts = batch["acts"]
+    obs2 = batch["obs2"]
+    rews = batch["rews"]
+
+    # Ensure gt_env is initialized once (some envs require reset before use)
+    try:
+        gt_env.reset()
+    except Exception:
+        pass
+
+    next_obs_gt = np.zeros_like(obs2, dtype=np.float64)
+    rew_gt = np.zeros_like(rews, dtype=np.float64)
+    ok_mask = np.zeros((obs1.shape[0],), dtype=bool)
+
+    unwrapped = getattr(gt_env, "unwrapped", gt_env)
+
+    for i in range(obs1.shape[0]):
+        state = obs1[i]
+        action = acts[i]
+
+        # 1) Try env.reset(state=state) style API (works for custom MuJoCo envs like in env_test.py)
+        reset_ok = False
+        try:
+            unwrapped.reset(state=state)
+            reset_ok = True
+        except TypeError:
+            reset_ok = False
+        except Exception:
+            reset_ok = False
+
+        # 2) Fallback: try MuJoCo-style set_state from observation
+        if not reset_ok:
+            if not _mujoco_set_state_from_obs(gt_env, state):
+                continue
+
+        try:
+            o2_pred, r_pred, d_pred, _ = gt_env.step(action)
+            # Some gym envs return scalar reward; ensure float
+            next_obs_gt[i] = np.asarray(o2_pred, dtype=np.float64)
+            rew_gt[i] = float(r_pred)
+            ok_mask[i] = True
+        except Exception:
+            continue
+
+    if not np.any(ok_mask):
+        return dict(ok=False, reason="gt_env_set_state_failed_for_all")
+
+    obs2_ok = obs2[ok_mask].astype(np.float64, copy=False)
+    rews_ok = rews[ok_mask].astype(np.float64, copy=False)
+    next_obs_gt_ok = next_obs_gt[ok_mask]
+    rew_gt_ok = rew_gt[ok_mask]
+
+    state_mse = np.mean((obs2_ok - next_obs_gt_ok) ** 2, axis=1)
+    reward_mse = (rews_ok - rew_gt_ok) ** 2
+    dyn_mse = 0.5 * (state_mse + reward_mse)
+
+    return dict(
+        ok=True,
+        n_total=int(obs1.shape[0]),
+        n_ok=int(ok_mask.sum()),
+        dyn_mse=dyn_mse,
+        state_mse=state_mse,
+        reward_mse=reward_mse,
+        dyn_mse_mean=float(np.mean(dyn_mse)),
+        dyn_mse_std=float(np.std(dyn_mse)),
+        dyn_mse_min=float(np.min(dyn_mse)),
+        dyn_mse_max=float(np.max(dyn_mse)),
+        dyn_mse_median=float(np.median(dyn_mse)),
+    )
+
 @gin.configurable
 def redq_sac(
         env_name,
@@ -78,10 +221,14 @@ def redq_sac(
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training using device: {device}")
-    # set number of epoch
+    # # set number of epoch
     # if epochs == 'mbpo' or epochs < 0:
-    #     epochs = mbpo_epoches.get(env_name, 150)
-    epochs = 100
+    #     epochs = mbpo_epoches.get(env_name, 400)
+    if env_name == 'finger-turn_hard-v0':
+        epochs = 400
+    else:
+        epochs = 100
+    # epochs = 100
     total_steps = steps_per_epoch * epochs + 1
     
     # set seed
@@ -92,8 +239,8 @@ def redq_sac(
             run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_SER"
             group_name = 'SER'
         else:
-            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_PGR"
-            group_name = 'PGR'
+            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_PGR+{args.novelty_measure}"
+            group_name = f'PGR+{args.novelty_measure}'
         wandb.init(
             project = env_name,
             group = group_name,
@@ -140,6 +287,8 @@ def redq_sac(
     """set up environment and seeding"""
     env_fn = lambda: wrap_gym(gym.make(env_name))
     env, test_env, bias_eval_env = env_fn(), env_fn(), env_fn()
+    # Separate env instance used for "ground-truth" one-step dynamics/reward evaluation
+    gt_dyn_env = env_fn()
     print(f"Environment: {env_name} | Seed: {seed}")
     # seed torch and numpy
     torch.manual_seed(seed)
@@ -152,6 +301,7 @@ def redq_sac(
         env_seed = (seed + seed_shift) % mod_value
         test_env_seed = (seed + 10000 + seed_shift) % mod_value
         bias_eval_env_seed = (seed + 20000 + seed_shift) % mod_value
+        gt_dyn_env_seed = (seed + 30000 + seed_shift) % mod_value
         torch.manual_seed(env_seed)
         np.random.seed(env_seed)
         env.seed(env_seed)
@@ -160,6 +310,8 @@ def redq_sac(
         test_env.action_space.np_random.seed(test_env_seed)
         bias_eval_env.seed(bias_eval_env_seed)
         bias_eval_env.action_space.np_random.seed(bias_eval_env_seed)
+        gt_dyn_env.seed(gt_dyn_env_seed)
+        gt_dyn_env.action_space.np_random.seed(gt_dyn_env_seed)
 
     # user define seed
     seed_all(seed)
@@ -208,11 +360,14 @@ def redq_sac(
                               utd_ratio, num_Q, num_min, q_target_mode,
                               policy_update_delay)
     
+    if not args.synther and args.novelty_measure == 'rnd':
+        agent.set_normalize_intrinsic_reward(True)
+        print('Enabled intrinsic reward normalization for rnd')
+    
     # pbe for state entropy evaluation
-    if args.state_ent:
-        print('Logging state entropy with PBE')
-        rms = RMS(device=torch.device('cpu'))
-        pbe = PBE(rms, args.knn_clip, args.knn_k, args.knn_avg, args.knn_rms, device=torch.device('cpu'))
+    print('Logging state entropy with PBE')
+    rms = RMS(device=torch.device('cpu'))
+    pbe = PBE(rms, args.knn_clip, args.knn_k, args.knn_avg, args.knn_rms, device=torch.device('cpu'))
 
     # set up diffusion model
     diff_dims = obs_dim + act_dim + 1 + obs_dim
@@ -242,13 +397,35 @@ def redq_sac(
 
         # give new data to replay buffer
         agent.store_data(o, a, r, o2, d)
+        
+        # New novelty measure: RND
+        if not args.synther and args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
+            o2_tensor = torch.FloatTensor(o2).unsqueeze(0).to(device)
+            agent.pred_net.eval()
+            _ = agent.compute_intrinsic_reward(o2_tensor, accumulate=True)
+            agent.pred_net.train()
+            
+        
+        
         # let agent update
         agent.train(logger)
         # set obs to next obs
         o = o2
         ep_ret += r
+        
+        # train RND predictor network, once in a epoch
+        if not args.synther and d or (ep_len == max_ep_len) and args.novelty_measure == 'rnd':
+            agent.pred_net.train()
+            pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
+            agent.pred_net.eval()
+            logger.store(RNDPredLoss=pred_loss)
+            logger.log_tabular('RNDPredLoss', average_only=True)
 
         if d or (ep_len == max_ep_len):
+            
+            if not args.synther and args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
+                agent.update_discounted_return_stats(gamma=gamma)
+            
             # store episode return and length to logger
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             # reset environment
@@ -273,8 +450,16 @@ def redq_sac(
                 args=args,
             )
             diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
-            cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
+            
+            if args.novelty_measure == 'curiosity':
+                cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
                                                                    curr_epoch=(t // steps_per_epoch) + 1)
+            elif args.novelty_measure == 'rnd':
+                cond_distri = diffusion_trainer.train_from_redq_buffer_rnd(agent.replay_buffer, agent, top_frac=cond_top_frac,
+                                                                   curr_epoch=(t // steps_per_epoch) + 1)
+            else: 
+                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
+            
             agent.reset_diffusion_buffer()
 
             # Add samples to agent replay buffer
@@ -306,6 +491,36 @@ def redq_sac(
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
 
+            # ---- Dynamic MSE logging (synthetic transition plausibility, MuJoCo-only) ----
+            print(f'Computing Dynamic MSE...')
+            epoch_cur = t // steps_per_epoch
+            dyn_n = getattr(args, "dynamic_mse_samples", 5000)
+
+            dyn_res = compute_dynamic_mse_from_diffusion_buffer(
+                agent.diffusion_buffer,
+                gt_dyn_env,
+                n_samples=dyn_n,
+            )
+
+            if dyn_res.get("ok", False):
+                print('Starting to plot Dynamic MSE...')
+
+                if args.wandb:
+                    fig = plt.figure(figsize=(6, 4))
+                    plt.boxplot(dyn_res["dyn_mse"], showfliers=False)
+                    plt.title(f"Dynamic MSE (n_ok={dyn_res['n_ok']}/{dyn_res['n_total']})")
+                    plt.ylabel("0.5*(state_mse + reward_mse)")
+                    plt.tight_layout()
+                    wandb.log(
+                        {
+                            "eval/DynMSE_boxplot": wandb.Image(fig),
+                            "eval/DynMSE_n_ok": dyn_res["n_ok"],
+                            "eval/DynMSE_n_total": dyn_res["n_total"],
+                        },
+                        step=epoch_cur,
+                    )
+                    plt.close(fig)
+
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
             epoch = t // steps_per_epoch
@@ -320,18 +535,24 @@ def redq_sac(
                 seed_all(epoch)
                 
             # Evaluation of state entropy
-            # 첫 번째 에포크에서 StateEnt를 0으로 초기화하여 헤더에 포함
-            if args.state_ent:
-                if epoch % 5 == 0 and epoch > 1:
-                    # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
-                    obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
-                    intr_rew = compute_intr_reward(pbe, obs_tensor)
-                    logger.store(StateEnt=intr_rew)
-                    print(f'State Entropy: {intr_rew.mean():.4f}')
-                else:
-                    # 헤더 등록을 위해 빈 값 저장 (실제 계산은 하지 않음)
-                    logger.store(StateEnt=0.0)
-                logger.log_tabular('StateEnt', average_only=True)
+            # # 첫 번째 에포크에서 StateEnt를 0으로 초기화하여 헤더에 포함
+            # if args.state_ent:
+            #     if epoch % 5 == 0 and epoch > 1:
+            #         # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
+            #         obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
+            #         intr_rew = compute_intr_reward(pbe, obs_tensor)
+            #         logger.store(StateEnt=intr_rew)
+            #         print(f'State Entropy: {intr_rew.mean():.4f}')
+            #     else:
+            #         # 헤더 등록을 위해 빈 값 저장 (실제 계산은 하지 않음)
+            #         logger.store(StateEnt=0.0)
+            #     logger.log_tabular('StateEnt', average_only=True)
+            
+            obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=4000)
+            intr_rew = compute_intr_reward(pbe, obs_tensor)
+            logger.store(StateEnt=intr_rew)
+            logger.log_tabular('StateEnt', average_only=True)
+            print(f'State Entropy: {intr_rew.mean():.4f}')
             
 
             """logging"""
@@ -412,12 +633,16 @@ if __name__ == '__main__':
     parser.add_argument('--wandb', action='store_true', default=False)
     parser.add_argument('--synther', action='store_true', default=False)
     
-    parser.add_argument('--state_ent', action='store_true', default=False)
     parser.add_argument('--knn_clip', type=float, default=0.0)
     parser.add_argument('--knn_k', type=int, default=12)
     parser.add_argument('--knn_avg', action='store_true', default=False) # default: True
     parser.add_argument('--knn_rms', action='store_true', default=False)
     parser.add_argument('--ent_eval_num', type=int, default=5000)
+    
+    parser.add_argument('--novelty_measure', type=str, default='curiosity')
+    
+    # Dynamic MSE logging (synthetic transition plausibility)
+    parser.add_argument('--dynamic_mse_samples', type=int, default=5000)
     
     args = parser.parse_args()
     

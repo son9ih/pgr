@@ -1,7 +1,7 @@
 # Utilities for diffusion.
 from typing import List, Optional, Union
 
-import d4rl
+# import d4rl
 import gin
 import gym
 import numpy as np
