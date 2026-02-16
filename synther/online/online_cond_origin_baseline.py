@@ -236,8 +236,8 @@ def redq_sac(
     # set number of epoch
     # if epochs == 'mbpo' or epochs < 0:
     #     epochs = mbpo_epoches.get(env_name, 150)
-    if env_name in ['finger-turn_hard-v0', 'humanoid-run-v0', 'humanoid-walk-v0']:
-        epochs = 400
+    if env_name in ['finger-turn_hard-v0', 'finger-turn_easy-v0', 'humanoid-run-v0', 'humanoid-walk-v0']:
+        epochs = 300
     else:
         epochs = 100
     total_steps = steps_per_epoch * epochs + 1

@@ -237,8 +237,8 @@ def redq_sac(
     # set number of epoch
     # if epochs == 'mbpo' or epochs < 0:
     #     epochs = mbpo_epoches.get(env_name, 150)
-    if env_name in ['finger-turn_hard-v0', 'humanoid-run-v0', 'humanoid-walk-v0']:
-        epochs = 400
+    if env_name in ['finger-turn_hard-v0', 'finger-turn_easy-v0', 'humanoid-run-v0', 'humanoid-walk-v0']:
+        epochs = 300
     else:
         epochs = 100
     total_steps = steps_per_epoch * epochs + 1
@@ -249,6 +249,7 @@ def redq_sac(
     if args.wandb:
         run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Ours+{args.novelty_measure}_ftlr{args.finetune_lr}_clip{args.ft_clip_grad}_A{args.alpha_rtb}_On{args.inter_onpolicy}_anl{args.anneal}"
         wandb.init(
+            entity="gda-for-orl",
             project = env_name,
             group = f'Ours+{args.novelty_measure}',
             name = run_name,
