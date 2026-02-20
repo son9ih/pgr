@@ -1,7 +1,12 @@
+import os
+os.environ["MUJOCO_GL"] = "egl"        # 필수
+os.environ["PYOPENGL_PLATFORM"] = "egl"
+
 import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
+from typing import Tuple
 
 import gym
 from gym import spaces
@@ -121,7 +126,7 @@ class VisualEncoder(nn.Module):
         self.critic_dim = feature_dim
 
     @torch.no_grad()
-    def encode(self, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def encode(self, obs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Args:
             obs: numpy array (C, H, W) or (B, C, H, W) uint8.
@@ -402,6 +407,8 @@ class DMControlVisualGymEnv(gym.Env):
 
         obs_spec = self._dmc_env.observation_spec()
         obs_shape = obs_spec.shape  # (C, H, W)
+        
+        # breakpoint()
 
         # Build visual encoder
         self._encoder = VisualEncoder(obs_shape, env_key=env_key_for_encoder, device=device)

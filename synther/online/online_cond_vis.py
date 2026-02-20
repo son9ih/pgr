@@ -1,4 +1,7 @@
+import os
 
+os.environ["MUJOCO_GL"] = "egl"        # 필수
+os.environ["PYOPENGL_PLATFORM"] = "egl"
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -7,7 +10,7 @@ import sys
 sys.path.append('.')
 import time
 
-import dmcgym
+# import dmcgym
 import gin
 import gym
 import numpy as np
@@ -319,18 +322,20 @@ def redq_sac(
     def env_fn():
         # Pixel-based DMControl envs with pretrained frozen visual encoder
         if env_name in pixel_envs:
-            # env_name is expected to be e.g. 'cheetah_run' or 'walker_walk'
+            # env_name is expected to be e.g. 'cheetah-run' or 'walker-walk'
             return DMControlVisualGymEnv(
                 task_name=env_name,
                 env_key_for_encoder=env_name,
                 device=device,
-                frame_stack=3,
-                action_repeat=2,
+                frame_stack=1,
+                action_repeat=1,
                 seed=seed,
             )
         # Default: classic Gym-based state env
         return wrap_gym(gym.make(env_name))
 
+    # breakpoint()
+    # pdb.set_trace()
     env, test_env, bias_eval_env = env_fn(), env_fn(), env_fn()
     # Separate env instance used for "ground-truth" one-step dynamics/reward evaluation
     gt_dyn_env = env_fn()
