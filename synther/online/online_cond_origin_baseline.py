@@ -250,8 +250,15 @@ def redq_sac(
             run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_SER_DDPM"
             group_name = 'SER_DDPM'
         else:   
-            run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_PGR+{args.novelty_measure}_DDPM"
-            group_name = f'PGR+{args.novelty_measure}_DDPM'
+            if args.sac:
+                run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_SAC"
+                group_name = 'SAC'
+            elif args.redq:
+                run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_REDQ"
+                group_name = 'REDQ'
+            else:
+                run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_PGR+{args.novelty_measure}_DDPM"
+                group_name = f'PGR+{args.novelty_measure}_DDPM'
         wandb.init(
             entity="gda-for-orl",
             project = env_name,
@@ -626,6 +633,8 @@ def redq_sac(
             agent.fix_net.eval()
             # unnecessary except for PGR
             if args.novelty_measure == 'curiosity':
+                # 이걸 args.cond_top_frac 대신 gin에 있는 cond_top_frac를 사용하도록 수정해야 함
+                # 지금은 그냥 스크립트에서 두개 다 수정
                 cond_distri = CondDistri(agent.cond_net, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
             elif args.novelty_measure == 'rnd':
                 cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
@@ -714,227 +723,6 @@ def redq_sac(
             
             
             
-            # # rtb fine-tuning
-            
-            # alpha_rtb = args.alpha_rtb
-            # # beta = args.beta
-            
-            
-            # # define reward proxy 
-            # # update basic onpolicy reward
-            # agent.update_onpolicy_reward()
-            # print(f'max_onpolicy_reward: {agent.max_onpolicy_reward}')
-            
-            # # Choose different reward function to optimize for different algorithms
-            # # For unity, each compute_intrinsic_reward and compute_reward should take the whole transition as input
-            # # TODO
-            # if args.novelty_measure == 'curiosity':
-            #     proxy_model_ens = agent.cond_net.compute_reward_torch
-            # elif args.novelty_measure == 'rnd':
-            #     proxy_model_ens = agent.compute_intrinsic_reward
-            # elif args.novelty_measure == 'eco':
-            #     proxy_model_ens = agent.compute_eco_reward
-            # else:
-            #     raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-            
-            # # define posterior model and optimizer
-            # # proxy_model_ens is not used in our settings, so replace it with agent.compute_intrinsic_reward()
-            # # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
-            # # TODO: requires an argument for onpolicy reward function in QFlow()
-            # # add 1) onpolicy reward function, 2) args.novelty measure (curiosity, rnd, eco)
-            # # TODO: We need to normalize the novelty, so that we can handle different scales of novelty measures with on-policy reward
-            # # EMA: Instead of using original prior, we use EMA model
-            
-            # # TODO: deep copy prior_ema.ema_model to prior_model
-            # # TODO: This is the main cause of not decreasing the loss
-            # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb,
-            #                         obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-            #                         agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim).to(device=device)
-            
-            # # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
-            # #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-            # #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
-            
-            # # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
-            # #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-            # #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
-            
-            # # def n_trainable(m):
-            # #     return sum(p.numel() for p in m.parameters() if p.requires_grad)
-
-            # # print("qflow trainable params:", n_trainable(posterior_model.qflow))
-            # # print("bc_net policy trainable params:", n_trainable(posterior_model.bc_net.policy))
-            # # print("logZ requires_grad:", posterior_model.logZ.requires_grad)
-            
-            # # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
-            # # posterior_model_optimizer = torch.optim.AdamW(posterior_model.parameters(), lr=args.finetune_lr)
-            
-            # # special optimizer
-            # no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
-            # optimizer_grouped_parameters = [
-            #         {
-            #             'params': [p for n, p in posterior_model.named_parameters() if not any(nd in n for nd in no_decay)],
-            #             'weight_decay': 0.,
-            #         },
-            #         {
-            #             'params': [p for n, p in posterior_model.named_parameters() if any(nd in n for nd in no_decay)],
-            #             'weight_decay': 0.0,
-            #         },
-            #     ]
-            # posterior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.finetune_lr, betas=args.rtb_adam_betas)
-            # posterior_model_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            #         posterior_model_optimizer,
-            #         args.num_posterior_epochs
-            #     )
-            
-            # xs = test_function_x_tensor.clone().detach().to(device)
-            # xs = prior_model.normalizer.normalize(xs)
-            # next_obs_start = obs_dim + act_dim + 1
-            # next_obs_end = next_obs_start + obs_dim
-            # ys = test_function_y_tensor.clone().detach().to(device)
-            # y_weights = torch.softmax(ys, dim=0)
-            
-            # posterior_model.train()
-            
-            # # fine-tuning loop
-            # if num_posterior_epochs > 0:
-            #     # Initialize wandb table for posterior training logs
-            #     if args.wandb:
-            #         posterior_log_table = wandb.Table(
-            #             columns=["Epoch", "Training_Epoch", "Loss", "logZ", "OnPolicy_Reward"]
-            #         )
-            #     s1 = 1
-                
-            #     for epoch in tqdm(range(num_posterior_epochs), dynamic_ncols=True):
-            #         if args.training_posterior == "both":
-            #             # toggle between on-policy and off-policy
-            #             s1 = (s1+1) % 2
-            #         elif args.training_posterior == "on":
-            #             s1 = 0
-            #         else: # off
-            #             s1 = 1
-                    
-            #         # Gradient accumulation settings
-            #         accumulation_steps = args.accumulation_steps
-            #         micro_batch_size = args.ft_batch_size // accumulation_steps
-            #         posterior_model_optimizer.zero_grad()
-                    
-            #         # Accumulate gradients over micro-batches
-            #         total_loss = 0.0
-            #         total_logZ = 0.0
-            #         # all_x_list = []
-            #         # all_y_list = []
-                    
-            #         on_policy_rewards = []
-            #         for acc_step in range(accumulation_steps):
-            #             if s1 == 0:
-            #                 # on-policy
-            #                 if acc_step == 0:
-            #                     print(f'On-policy training (gradient accumulation: {accumulation_steps} steps)')
-            #                 # return normalized samples x
-            #                 loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=micro_batch_size)
-            #                 # Extract obs and next_obs from x for reward computation
-            #                 x_unnormalized = prior_model.normalizer.unnormalize(x)
-            #                 x_obs_unnormalized = x_unnormalized[:, :obs_dim]
-            #                 x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-            #                 # x_next_obs should be unnormalized as input of proxy_model_ens
-            #                 if args.novelty_measure == 'rnd':
-            #                     y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
-            #                 elif args.novelty_measure == 'curiosity':
-            #                     x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
-            #                     y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
-            #                 elif args.novelty_measure == 'eco':
-            #                     # ECO reward computation
-            #                     # According to paper: "takes the current observation o as input"
-            #                     # Use current obs (obs at time t, before action was taken)
-            #                     y = proxy_model_ens(x_obs_unnormalized).squeeze()
-            #                 else:
-            #                     raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-            #                 on_policy_rewards.append(y.detach().mean().item())
-            #             else:
-            #                 # off-policy (reward prioritization)
-            #                 if acc_step == 0:
-            #                     print(f'Off-policy training (gradient accumulation: {accumulation_steps} steps)')
-            #                 idx = torch.multinomial(y_weights.squeeze(), micro_batch_size, replacement=True)
-            #                 # this is normalized samples x
-            #                 x = xs[idx]
-            #                 # [Optional] Add noise to x
-            #                 # x += torch.randn_like(x) * 0.01
-            #                 loss, logZ = posterior_model.compute_loss_with_sample(x, device)
-            #                 # Extract obs and next_obs from x for reward computation
-            #                 x_unnormalized = prior_model.normalizer.unnormalize(x)
-            #                 x_obs_unnormalized = x_unnormalized[:, :obs_dim]
-            #                 x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-            #                 if args.novelty_measure == 'rnd':
-            #                     y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
-            #                 elif args.novelty_measure == 'curiosity':
-            #                     x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
-            #                     y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
-            #                 elif args.novelty_measure == 'eco':
-            #                     # ECO reward computation
-            #                     # According to paper: "takes the current observation o as input"
-            #                     # Use current obs (obs at time t, before action was taken)
-            #                     y = proxy_model_ens(x_obs_unnormalized).squeeze()
-            #                 else:
-            #                     raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-                        
-            #             # Scale loss by accumulation_steps to maintain same effective learning rate
-            #             (loss / accumulation_steps).backward()
-            #             total_loss += loss.item()
-            #             if isinstance(logZ, torch.Tensor):
-            #                 total_logZ += logZ.item()
-            #             else:
-            #                 total_logZ += logZ
-            #             # all_x_list.append(x)
-            #             # all_y_list.append(y)
-                    
-            #         # Update weights after accumulating all gradients
-            #         # posterior_model_optimizer.step()              
-            #         if args.ft_clip_grad > 0.0:
-            #             # print(f'Clipping gradients during finetuning')
-            #             torch.nn.utils.clip_grad_norm_(posterior_model.parameters(), max_norm=args.ft_clip_grad)
-            #         posterior_model_optimizer.step()
-            #         if posterior_model_lr_scheduler is not None:
-            #             posterior_model_lr_scheduler.step()
-                    
-            #         # Concatenate all samples
-            #         # x = torch.cat(all_x_list, dim=0)
-            #         # y = torch.cat(all_y_list, dim=0)
-            #         # 데이터 하나 당 평균 loss
-            #         loss = total_loss / accumulation_steps  # Average loss for logging
-            #         logZ = total_logZ / accumulation_steps  # Average logZ for logging
-                    
-            #         # xs = torch.cat([xs, x], dim=0)
-            #         # ys = torch.cat([ys, y], dim=0)
-                    
-            #         # y_weights = torch.softmax(ys, dim=0)
-            #         print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss:.9f}')
-                    
-            #         # Add data to wandb table
-            #         if args.wandb:
-            #             loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
-            #             logZ_value = logZ.item() if isinstance(logZ, torch.Tensor) else logZ
-            #             if on_policy_rewards:
-            #                 on_policy_reward_value = torch.tensor(on_policy_rewards).mean().item()
-            #                 on_policy_reward_value = f"{on_policy_reward_value:.9f}"
-            #             else:
-            #                 on_policy_reward_value = "NA"
-            #             posterior_log_table.add_data(
-            #                 cur_epoch,
-            #                 epoch + 1,
-            #                 f"{loss_value:.9f}",
-            #                 f"{logZ_value:.9f}",
-            #                 on_policy_reward_value
-            #             )
-            #             print(f'On-policy reward (Mean): {on_policy_reward_value}')
-                
-            #     # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
-            #     if args.wandb:
-            #         wandb.log({f"Posterior_Training_Log_Epoch_{cur_epoch}": posterior_log_table}, step=cur_epoch)
-                    
-            # posterior_model.eval()
-        
-        
         
         # +++++++++++ training over +++++++++++
             
@@ -1304,6 +1092,9 @@ if __name__ == '__main__':
     # Dynamic MSE logging (synthetic transition plausibility)
     parser.add_argument('--dynamic_mse_samples', type=int, default=5000)
     parser.add_argument('--dynamic_mse_every', type=int, default=1)
+    
+    parser.add_argument('--sac', action='store_true', default=False)
+    parser.add_argument('--redq', action='store_true', default=False)
     
     args = parser.parse_args()
     
