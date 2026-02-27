@@ -1,0 +1,48 @@
+# TD3 with generative replay (SynthER/PGR) for DMC and OpenAI Gym environments.
+# Supports: cheetah-run-v0, reacher-hard-v0 (dmc), Hopper-v2, Walker2d-v2 (gym)
+
+include 'config/online/td3.gin'
+
+# TD3 diffusion args.
+td3_training.disable_diffusion = False
+td3_training.retrain_diffusion_every = 10000
+td3_training.num_samples = 1000000
+td3_training.diffusion_sample_ratio = 0.5
+td3_training.diffusion_start = 0
+td3_training.skip_reward_norm = True
+
+# Conditional network
+td3_training.cond_hidden_size = 256
+td3_training.cond_top_frac = 0.25
+td3_training.cfg_dropout = 0.25
+td3_training.cfg_scale = 2.0
+
+# Online setup.
+construct_diffusion_model.denoising_network = @ResidualMLPDenoiser
+construct_diffusion_model.normalizer_type = 'minmax'
+construct_diffusion_model.activation = 'mish'
+
+# No terminals in DMC.
+modelled_terminals = False
+td3_training.model_terminals = %modelled_terminals
+split_diffusion_samples.modelled_terminals = %modelled_terminals
+
+# Diffusion denoising network.
+ResidualMLPDenoiser.dim_t = 256
+ResidualMLPDenoiser.mlp_width = 1024
+ResidualMLPDenoiser.num_layers = 6
+ResidualMLPDenoiser.learned_sinusoidal_cond = False
+ResidualMLPDenoiser.random_fourier_features = True
+ResidualMLPDenoiser.learned_sinusoidal_dim = 16
+ResidualMLPDenoiser.layer_norm = False
+
+# Diffusion training.
+REDQCondTrainer.train_batch_size = 256
+REDQCondTrainer.train_lr = 3e-4
+REDQCondTrainer.lr_scheduler = "cosine"
+REDQCondTrainer.weight_decay = 0
+REDQCondTrainer.train_num_steps = 100000
+REDQCondTrainer.save_and_sample_every = 100000000
+
+# Diffusion sampling.
+CondDiffusionGenerator.num_sample_steps = 128

@@ -1,0 +1,11 @@
+# TD3 with generative replay for OpenAI Gym MuJoCo (Hopper-v2, Walker2d-v2, etc.)
+
+include 'config/online/td3_cond_synther_dmc.gin'
+
+# Normalize rewards for OpenAI envs.
+td3_training.skip_reward_norm = False
+
+# Model terminals for OpenAI MuJoCo.
+modelled_terminals = True
+td3_training.model_terminals = %modelled_terminals
+split_diffusion_samples.modelled_terminals = %modelled_terminals
