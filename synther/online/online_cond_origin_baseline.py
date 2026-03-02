@@ -874,7 +874,8 @@ def redq_sac(
             # Compute at most once per epoch to avoid double-counting if diffusion sampling happens multiple times.
             epoch_cur = t // steps_per_epoch
             # dyn_every = getattr(args, "dynamic_mse_every", 1)
-            dyn_n = getattr(args, "dynamic_mse_samples", 5000)
+            # dyn_n = getattr(args, "dynamic_mse_samples", 10000)
+            dyn_n = 10000
             # do_dyn = (dyn_every is not None) and (dyn_every > 0) and (epoch_cur % dyn_every == 0)
 
             # if do_dyn and (epoch_cur != last_dynmse_epoch):
@@ -913,6 +914,11 @@ def redq_sac(
                     plt.ylabel("(r_true - r_gt)^2")
                     plt.tight_layout()
                     
+                    # Create table to store all dynamic MSE values
+                    dyn_mse_table = wandb.Table(columns=["Epoch", "Dynamic_MSE"])
+                    for dyn_mse_val in dyn_res["dyn_mse"]:
+                        dyn_mse_table.add_data(epoch_cur, float(dyn_mse_val))
+                    
                     wandb.log(
                         {
                             "eval/DynMSE_boxplot": wandb.Image(fig_dyn),
@@ -920,6 +926,7 @@ def redq_sac(
                             "eval/DynRewardMSE_boxplot": wandb.Image(fig_reward),
                             "eval/DynMSE_mean": dyn_res["dyn_mse_mean"],
                             "eval/DynMSE_median": dyn_res["dyn_mse_median"],
+                            f"eval/DynMSE_all_Epoch_{epoch_cur}": dyn_mse_table,
                         },
                         step=epoch_cur,
                     )
