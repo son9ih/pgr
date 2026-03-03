@@ -654,6 +654,9 @@ def redq_sac(
             if args.wandb:
                 prior_log_table = wandb.Table(columns=["Epoch", "Training_Epoch", "Loss"])
             
+            # ---- measure diffusion training time ----
+            diffusion_train_start = time.time()
+            print(f"[Diffusion] Training start (cur_epoch={cur_epoch}, num_prior_epochs={num_prior_epochs})")
             for epoch in tqdm(range(num_prior_epochs), dynamic_ncols=True):
                 total_loss = 0.0
                 
@@ -712,9 +715,19 @@ def redq_sac(
                             f"{total_loss:.7f}"
                         )
             
-            # Log table at the end of prior training (with epoch-specific key to avoid overwriting)
+            diffusion_train_elapsed = time.time() - diffusion_train_start
+            print(f"[Diffusion] Training finished in {diffusion_train_elapsed:.2f} s "
+                  f"({diffusion_train_elapsed/60.0:.2f} min)")
+            # Log table and timing at the end of prior training (with epoch-specific key to avoid overwriting)
             if args.wandb:
-                wandb.log({f"Prior_Training_Log_Epoch_{cur_epoch}": prior_log_table}, step=cur_epoch)
+                wandb.log(
+                    {
+                        f"Prior_Training_Log_Epoch_{cur_epoch}": prior_log_table,
+                        "diffusion/train_time_sec": diffusion_train_elapsed,
+                        "diffusion/train_time_min": diffusion_train_elapsed / 60.0,
+                    },
+                    step=cur_epoch,
+                )
                 
             
             # reset diffusion buffer
@@ -727,6 +740,7 @@ def redq_sac(
         # +++++++++++ training over +++++++++++
             
             # +++++++++++ 2. Sampling +++++++++++
+            sampling_start = time.time()
             print(f'Sampling...')
             X_sample_total = []
             # we only need X_sample, not logR_sample
@@ -782,7 +796,16 @@ def redq_sac(
             X_sample = torch.cat(X_sample_total, dim=0)
             # logR_sample = torch.cat(logR_sample_total, dim=0)
             
-            print(f'Sampling complete')
+            sampling_elapsed = time.time() - sampling_start
+            print(f'Sampling complete in {sampling_elapsed:.2f} s ({sampling_elapsed/60.0:.2f} min)')
+            if args.wandb:
+                wandb.log(
+                    {
+                        "diffusion/sampling_time_sec": sampling_elapsed,
+                        "diffusion/sampling_time_min": sampling_elapsed / 60.0,
+                    },
+                    step=cur_epoch,
+                )
             
             # clip
             print(f'X_sample before clipping: {X_sample}')
