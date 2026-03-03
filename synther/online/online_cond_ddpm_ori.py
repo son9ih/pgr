@@ -641,6 +641,9 @@ def redq_sac(
             if args.wandb:
                 prior_log_table = wandb.Table(columns=["Epoch", "Training_Epoch", "Loss"])
             
+            # ---- measure diffusion prior training time ----
+            diffusion_prior_train_start = time.time()
+            print(f"[Diffusion-DDPM] Prior training start (cur_epoch={cur_epoch}, num_prior_epochs={num_prior_epochs})")
             for epoch in tqdm(range(num_prior_epochs), dynamic_ncols=True):
                 total_loss = 0.0
                 
@@ -697,6 +700,18 @@ def redq_sac(
                             epoch + 1,
                             f"{total_loss:.7f}"
                         )
+
+            diffusion_prior_train_elapsed = time.time() - diffusion_prior_train_start
+            print(f"[Diffusion-DDPM] Prior training finished in {diffusion_prior_train_elapsed:.2f} s "
+                  f"({diffusion_prior_train_elapsed/60.0:.2f} min)")
+            if args.wandb:
+                wandb.log(
+                    {
+                        "diffusion_ddpm/prior_train_time_sec": diffusion_prior_train_elapsed,
+                        "diffusion_ddpm/prior_train_time_min": diffusion_prior_train_elapsed / 60.0,
+                    },
+                    step=cur_epoch,
+                )
             
             # Log table at the end of prior training (with epoch-specific key to avoid overwriting)
             if args.wandb:
@@ -800,6 +815,9 @@ def redq_sac(
                     )
                 s1 = 1
                 
+                # ---- measure posterior fine-tuning time ----
+                posterior_ft_start = time.time()
+                print(f"[Diffusion-DDPM] Posterior fine-tuning start (cur_epoch={cur_epoch}, num_posterior_epochs={num_posterior_epochs})")
                 for epoch in tqdm(range(num_posterior_epochs), dynamic_ncols=True):
                     if args.training_posterior == "both":
                         # toggle between on-policy and off-policy
@@ -923,9 +941,19 @@ def redq_sac(
                         )
                         print(f'On-policy reward (Mean): {on_policy_reward_value}')
                 
+                posterior_ft_elapsed = time.time() - posterior_ft_start
+                print(f"[Diffusion-DDPM] Posterior fine-tuning finished in {posterior_ft_elapsed:.2f} s "
+                      f"({posterior_ft_elapsed/60.0:.2f} min)")
                 # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
                 if args.wandb:
-                    wandb.log({f"Posterior_Training_Log_Epoch_{cur_epoch}": posterior_log_table}, step=cur_epoch)
+                    wandb.log(
+                        {
+                            f"Posterior_Training_Log_Epoch_{cur_epoch}": posterior_log_table,
+                            "diffusion_ddpm/posterior_finetune_time_sec": posterior_ft_elapsed,
+                            "diffusion_ddpm/posterior_finetune_time_min": posterior_ft_elapsed / 60.0,
+                        },
+                        step=cur_epoch,
+                    )
                     
             posterior_model.eval()
         
@@ -934,6 +962,7 @@ def redq_sac(
         # +++++++++++ training over +++++++++++
             
             # +++++++++++ 2. Sampling +++++++++++
+            posterior_sampling_start = time.time()
             print(f'Sampling...')
             X_sample_total = []
             # we only need X_sample, not logR_sample
@@ -981,7 +1010,16 @@ def redq_sac(
             X_sample = torch.cat(X_sample_total, dim=0)
             # logR_sample = torch.cat(logR_sample_total, dim=0)
             
-            print(f'Sampling complete')
+            posterior_sampling_elapsed = time.time() - posterior_sampling_start
+            print(f'Sampling complete in {posterior_sampling_elapsed:.2f} s ({posterior_sampling_elapsed/60.0:.2f} min)')
+            if args.wandb:
+                wandb.log(
+                    {
+                        "diffusion_ddpm/posterior_sampling_time_sec": posterior_sampling_elapsed,
+                        "diffusion_ddpm/posterior_sampling_time_min": posterior_sampling_elapsed / 60.0,
+                    },
+                    step=cur_epoch,
+                )
             
             # clip
             print(f'X_sample before clipping: {X_sample}')
