@@ -705,10 +705,11 @@ def redq_sac(
             print(f"[Diffusion-DDPM] Prior training finished in {diffusion_prior_train_elapsed:.2f} s "
                   f"({diffusion_prior_train_elapsed/60.0:.2f} min)")
             if args.wandb:
+                # Keep keys consistent with online_cond_origin_baseline.py for easy comparison/plotting
                 wandb.log(
                     {
-                        "diffusion_ddpm/prior_train_time_sec": diffusion_prior_train_elapsed,
-                        "diffusion_ddpm/prior_train_time_min": diffusion_prior_train_elapsed / 60.0,
+                        "diffusion/train_time_sec": diffusion_prior_train_elapsed,
+                        "diffusion/train_time_min": diffusion_prior_train_elapsed / 60.0,
                     },
                     step=cur_epoch,
                 )
@@ -946,11 +947,12 @@ def redq_sac(
                       f"({posterior_ft_elapsed/60.0:.2f} min)")
                 # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
                 if args.wandb:
+                    # Fine-tuning uses a separate key, but keep the same "diffusion/*" prefix family.
                     wandb.log(
                         {
                             f"Posterior_Training_Log_Epoch_{cur_epoch}": posterior_log_table,
-                            "diffusion_ddpm/posterior_finetune_time_sec": posterior_ft_elapsed,
-                            "diffusion_ddpm/posterior_finetune_time_min": posterior_ft_elapsed / 60.0,
+                            "diffusion/finetune_time_sec": posterior_ft_elapsed,
+                            "diffusion/finetune_time_min": posterior_ft_elapsed / 60.0,
                         },
                         step=cur_epoch,
                     )
@@ -1013,10 +1015,11 @@ def redq_sac(
             posterior_sampling_elapsed = time.time() - posterior_sampling_start
             print(f'Sampling complete in {posterior_sampling_elapsed:.2f} s ({posterior_sampling_elapsed/60.0:.2f} min)')
             if args.wandb:
+                # Keep keys consistent with online_cond_origin_baseline.py for easy comparison/plotting
                 wandb.log(
                     {
-                        "diffusion_ddpm/posterior_sampling_time_sec": posterior_sampling_elapsed,
-                        "diffusion_ddpm/posterior_sampling_time_min": posterior_sampling_elapsed / 60.0,
+                        "diffusion/sampling_time_sec": posterior_sampling_elapsed,
+                        "diffusion/sampling_time_min": posterior_sampling_elapsed / 60.0,
                     },
                     step=cur_epoch,
                 )
