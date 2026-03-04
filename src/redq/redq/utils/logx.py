@@ -487,15 +487,32 @@ class Logger:
 
 def get_statistics_scalar(x, with_min_and_max=False):
     """
-    Get mean/std and optional min/max of x
-
-    Args:
-        x: An array containing samples of the scalar to produce statistics
-            for.
-
-        with_min_and_max (bool): If true, return min and max of x in
-            addition to mean and std.
+    Get mean/std and optional min/max of x.
+    Supports lists of numpy scalars, Python scalars, and torch.Tensors (CPU/GPU).
     """
+    # x는 리스트/튜플/배열/텐서 등 다양한 타입이 들어올 수 있으므로,
+    # torch.Tensor가 섞여 있으면 미리 CPU numpy로 변환한다.
+    try:
+        import torch
+    except ImportError:
+        torch = None
+
+    if torch is not None:
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        elif isinstance(x, (list, tuple)):
+            converted = []
+            for v in x:
+                if isinstance(v, torch.Tensor):
+                    # scalar 텐서는 item(), 그 외는 numpy 배열로 변환
+                    if v.numel() == 1:
+                        converted.append(v.detach().cpu().item())
+                    else:
+                        converted.append(v.detach().cpu().numpy())
+                else:
+                    converted.append(v)
+            x = converted
+
     x = np.array(x, dtype=np.float32)
     mean, std = x.mean(), x.std()
     if with_min_and_max:
