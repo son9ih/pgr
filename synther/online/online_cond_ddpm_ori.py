@@ -306,6 +306,7 @@ def redq_sac(
                 "clip_reward": args.clip_reward,
                 "ft_clip_grad": args.ft_clip_grad,
                 "anneal": args.anneal,
+                "intrinsic_reward_addition_coeff": args.intrinsic_reward_addition_coeff,
             }
         )
         print(f'Initialized wandb with run name {run_name}')
@@ -432,12 +433,26 @@ def redq_sac(
         # give new data to replay buffer
         agent.store_data(o, a, r, o2, d)
         
-        # New novelty measure: RND
+        # New novelty measure: RND / curiosity
+        r_intrinsic = 0.0
         if not args.synther and args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
             o2_tensor = torch.FloatTensor(o2).unsqueeze(0).to(device)
             agent.pred_net.eval()
-            _ = agent.compute_intrinsic_reward(o2_tensor, accumulate=True)
+            r_intrinsic = agent.compute_intrinsic_reward(o2_tensor, accumulate=True)
             agent.pred_net.train()
+        elif not args.synther and args.novelty_measure == "curiosity":
+            agent.cond_net.eval()
+            # ICM curiosity reward: expects (state, next_state, action, reward, done) as numpy arrays
+            state = o.reshape(1, -1) if isinstance(o, np.ndarray) and o.ndim == 1 else o
+            next_state = o2.reshape(1, -1) if isinstance(o2, np.ndarray) and o2.ndim == 1 else o2
+            action = a.reshape(1, -1) if isinstance(a, np.ndarray) and a.ndim == 1 else a
+            reward_arr = np.array([[r]], dtype=np.float32)
+            done_arr = np.array([[float(d)]], dtype=np.float32)
+            r_intrinsic = agent.cond_net.compute_reward(state, next_state, action, reward_arr, done_arr)
+            agent.cond_net.train()
+        
+        if args.intrinsic_reward_addition_coeff > 0.0:
+            r = r + args.intrinsic_reward_addition_coeff * r_intrinsic
             
         # TODO: diffusion sample ratio, linearly annealing from 0.5 (default) to 0.0
         # e.g. epoch 0: 0.5, epoch 100: 0.0
@@ -1336,6 +1351,8 @@ if __name__ == '__main__':
     parser.add_argument('--clip_reward', type=float, default=0.95)
     
     parser.add_argument('--anneal', action='store_true', default=False)
+
+    parser.add_argument('--intrinsic_reward_addition_coeff', type=float, default=0.0)
 
     # Dynamic MSE logging (synthetic transition plausibility)
     parser.add_argument('--dynamic_mse_samples', type=int, default=5000)
