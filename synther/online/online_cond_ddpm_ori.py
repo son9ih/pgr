@@ -391,6 +391,9 @@ def redq_sac(
                               start_steps, delay_update_steps,
                               utd_ratio, num_Q, num_min, q_target_mode,
                               policy_update_delay)
+    # intrinsic 보상을 Q-learning에 반영하기 위한 설정
+    agent.intrinsic_reward_addition_coeff = args.intrinsic_reward_addition_coeff
+    agent.novelty_measure = args.novelty_measure
     
     if not args.synther and args.novelty_measure == 'rnd':
         agent.set_normalize_intrinsic_reward(True)
@@ -450,9 +453,6 @@ def redq_sac(
             done_arr = np.array([[float(d)]], dtype=np.float32)
             r_intrinsic = agent.cond_net.compute_reward(state, next_state, action, reward_arr, done_arr)
             agent.cond_net.train()
-        
-        if args.intrinsic_reward_addition_coeff > 0.0:
-            r = r + args.intrinsic_reward_addition_coeff * r_intrinsic
             
         # TODO: diffusion sample ratio, linearly annealing from 0.5 (default) to 0.0
         # e.g. epoch 0: 0.5, epoch 100: 0.0
