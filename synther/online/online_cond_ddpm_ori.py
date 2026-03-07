@@ -1351,6 +1351,8 @@ if __name__ == '__main__':
     logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
 
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
+    
+    print('hi')
 
     # args를 한번에 넘기는게 좋음
     redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args)
