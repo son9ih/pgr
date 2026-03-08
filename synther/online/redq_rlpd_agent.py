@@ -424,10 +424,8 @@ class REDQRLPDCondAgent(REDQSACAgent):
         
     def train_pred_net(self, batch_size, mask=True, update_proportion=0.25):
         if self.pred_optimizer is not None:
-            
             _, obs_next_tensor, _, _, _ = self.sample_real_data_recent(batch_size=batch_size)
             self.pred_optimizer.zero_grad()
-            # Don't accumulate during training
             pred_loss = self.compute_intrinsic_reward(obs_next_tensor, accumulate=False) # .mean()
             if mask:
                 mask_tensor = torch.rand(len(pred_loss)).to(self.device)
@@ -435,7 +433,6 @@ class REDQRLPDCondAgent(REDQSACAgent):
                 pred_loss = (pred_loss * mask_tensor).mean() / torch.max(mask_tensor.sum(), torch.Tensor([1.0]).to(self.device))
             else:
                 pred_loss = pred_loss.mean()
-            # pdb.set_trace()
             pred_loss.backward()
             self.pred_optimizer.step()
         else:

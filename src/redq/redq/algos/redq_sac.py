@@ -167,7 +167,6 @@ class REDQSACAgent(object):
         return obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor
     
     def sample_data_cpu(self, batch_size):
-        # sample data from replay buffer, return cpu tensors
         batch = self.replay_buffer.sample_batch(batch_size)
         obs_tensor = Tensor(batch['obs1'])
         obs_next_tensor = Tensor(batch['obs2'])

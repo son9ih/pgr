@@ -534,7 +534,6 @@ class QFlow(nn.Module):
         x_dim,
         diffusion_steps,
         schedule="linear",
-        # predict="epsilon",
         q_net=None,
         bc_net=None,
         alpha=1.0,
@@ -546,7 +545,6 @@ class QFlow(nn.Module):
         act_dim=None,
         novelty_measure=None,
         agent=None,
-        inter_onpolicy=0.1,
         reward_percentile=None,
         eta=0.0,
         ddim=False,
@@ -586,7 +584,6 @@ class QFlow(nn.Module):
         
         # on-policyness measure
         self.agent = agent
-        self.inter_onpolicy = inter_onpolicy
         
         self.cond_normalizer = bc_net.cond_normalizer
         self.reward_percentile = reward_percentile
@@ -1127,30 +1124,7 @@ class QFlow(nn.Module):
         
         # Bound nice
         print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
-        # print('Here is diffusion.py')
         
-        # combine novelty reward with on-policyness reward
-        if self.inter_onpolicy > 0:
-            with torch.no_grad():
-                # ranging from 0 to 1
-                on_policy_reward = self.agent.compute_onpolicy_reward(obs, act)
-                # on_policy_reward = on_policy_reward.pow(self.inter_onpolicy)
-                on_policy_reward = np.power(on_policy_reward, self.inter_onpolicy)
-                print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
-            # convert numpy to tensor
-            on_policy_reward = torch.tensor(on_policy_reward, device=q_r.device, dtype=q_r.dtype)
-            # inter_onpolicy_tensor = torch.tensor(self.inter_onpolicy, device=q_r.device, dtype=q_r.dtype)
-            # # 1.
-            # q_r = q_r * (1 - inter_onpolicy_tensor) + inter_onpolicy_tensor * on_policy_reward
-            # 2.
-            q_r = q_r * on_policy_reward
-        else:
-            q_r = q_r
-        # q_r = self.q_net(next_obs).squeeze()
-        
-        # print("q_r min/max:", q_r.min().item(), q_r.max().item())
-        # print("q_r <= 0 count:", (q_r <= 0).sum().item())
-        # print("q_r finite:", torch.isfinite(q_r).all().item())
         return q_r
     
     def combined_posterior_log_reward(self, x, alpha=0.1):

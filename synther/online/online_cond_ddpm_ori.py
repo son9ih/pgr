@@ -1,4 +1,3 @@
-
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -32,6 +31,7 @@ from synther.diffusion.elucidated_diffusion import REDQCondTrainer, CondDistri_R
 from synther.online.utils import PBE, RMS, compute_intr_reward, make_inputs_from_replay_buffer
 from synther.diffusion.utils import construct_diffusion_model, split_diffusion_samples
 from synther.diffusion.norm import MinMaxNormalizer
+from synther.online.utils_dyn import compute_dynamic_mse_from_diffusion_buffer
 from ema_pytorch import EMA
 from tqdm import tqdm
 import random
@@ -40,147 +40,6 @@ import random
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-
-def _mujoco_set_state_from_obs(env: gym.Env, obs: np.ndarray) -> bool:
-    """
-    Best-effort helper to set MuJoCo simulator state from a Gym MuJoCo observation.
-
-    Supports common observation layouts:
-      - obs = concat(qpos[1:], qvel)  (e.g., Hopper/Walker2d/HalfCheetah in Gym)
-      - obs = concat(qpos, qvel)
-
-    Returns:
-      True if state was set successfully; False otherwise.
-    """
-    unwrapped = getattr(env, "unwrapped", env)
-    if not hasattr(unwrapped, "set_state"):
-        return False
-    if not hasattr(unwrapped, "model"):
-        return False
-    if not hasattr(unwrapped, "sim") or not hasattr(unwrapped.sim, "data"):
-        return False
-
-    obs = np.asarray(obs, dtype=np.float64).reshape(-1)
-    nq = int(getattr(unwrapped.model, "nq", 0))
-    nv = int(getattr(unwrapped.model, "nv", 0))
-    if nq <= 0 or nv <= 0:
-        return False
-
-    # Current state for padding/fallback
-    qpos_cur = np.array(unwrapped.sim.data.qpos, dtype=np.float64).copy()
-    qvel_cur = np.array(unwrapped.sim.data.qvel, dtype=np.float64).copy()
-
-    if obs.shape[0] == (nq - 1 + nv):
-        qpos = qpos_cur.copy()
-        qpos[1:] = obs[: nq - 1]
-        qvel = obs[nq - 1 :]
-    elif obs.shape[0] == (nq + nv):
-        qpos = obs[:nq]
-        qvel = obs[nq:]
-    else:
-        return False
-
-    try:
-        unwrapped.set_state(qpos, qvel)
-        return True
-    except Exception:
-        return False
-
-
-def compute_dynamic_mse_from_diffusion_buffer(
-    diffusion_buffer,
-    gt_env: gym.Env,
-    n_samples: int = 5000,
-) -> dict:
-    """
-    Computes per-transition Dynamic MSE on synthetic transitions stored in diffusion_buffer,
-    using a "ground-truth" one-step simulator model:
-      s', r = step(env | set_state(s), a)
-
-    Dynamic MSE (per sample):
-      0.5 * ( mean((s'_true - s'_gt)^2) + (r_true - r_gt)^2 )
-
-    Returns a dict with arrays + summary stats.
-    """
-    n_samples = int(n_samples)
-    if diffusion_buffer.size <= 0:
-        return dict(ok=False, reason="empty_diffusion_buffer")
-
-    batch = diffusion_buffer.sample_batch(batch_size=min(n_samples, diffusion_buffer.size))
-    obs1 = batch["obs1"]
-    acts = batch["acts"]
-    obs2 = batch["obs2"]
-    rews = batch["rews"]
-
-    # Ensure gt_env is initialized once (some envs require reset before use)
-    try:
-        gt_env.reset()
-    except Exception:
-        pass
-
-    next_obs_gt = np.zeros_like(obs2, dtype=np.float64)
-    rew_gt = np.zeros_like(rews, dtype=np.float64)
-    ok_mask = np.zeros((obs1.shape[0],), dtype=bool)
-
-    unwrapped = getattr(gt_env, "unwrapped", gt_env)
-
-    for i in range(obs1.shape[0]):
-        state = obs1[i]
-        action = acts[i]
-
-        # 1) Try env.reset(state=state) style API (works for custom MuJoCo/DMC envs like in env_test.py)
-        reset_ok = False
-        try:
-            unwrapped.reset(state=state)
-            reset_ok = True
-        except TypeError:
-            reset_ok = False
-        except Exception:
-            reset_ok = False
-            
-        # print(f"reset_ok: {reset_ok}")
-
-        # 2) Fallback: try MuJoCo-style set_state from observation
-        if not reset_ok:
-            if not _mujoco_set_state_from_obs(gt_env, state):
-                continue
-
-        try:
-            o2_pred, r_pred, d_pred, _ = gt_env.step(action)
-            # Some gym envs return scalar reward; ensure float
-            next_obs_gt[i] = np.asarray(o2_pred, dtype=np.float64)
-            rew_gt[i] = float(r_pred)
-            ok_mask[i] = True
-        except Exception:
-            continue
-
-    if not np.any(ok_mask):
-        return dict(ok=False, reason="gt_env_set_state_failed_for_all")
-
-    obs2_ok = obs2[ok_mask].astype(np.float64, copy=False)
-    rews_ok = rews[ok_mask].astype(np.float64, copy=False)
-    next_obs_gt_ok = next_obs_gt[ok_mask]
-    rew_gt_ok = rew_gt[ok_mask]
-
-    state_mse = np.mean((obs2_ok - next_obs_gt_ok) ** 2, axis=1)
-    reward_mse = (rews_ok - rew_gt_ok) ** 2
-    dyn_mse = 0.5 * (state_mse + reward_mse)
-
-    return dict(
-        ok=True,
-        n_total=int(obs1.shape[0]),
-        n_ok=int(ok_mask.sum()),
-        dyn_mse=dyn_mse,
-        state_mse=state_mse,
-        reward_mse=reward_mse,
-        dyn_mse_mean=float(np.mean(dyn_mse)),
-        dyn_mse_std=float(np.std(dyn_mse)),
-        dyn_mse_min=float(np.min(dyn_mse)),
-        dyn_mse_max=float(np.max(dyn_mse)),
-        dyn_mse_median=float(np.median(dyn_mse)),
-    )
-
 
 
 @gin.configurable
@@ -211,7 +70,6 @@ def redq_sac(
         policy_update_delay=20,
         diffusion_buffer_size=int(1e6),
         diffusion_sample_ratio=0.5,
-        # diffusion hyperparameters
         retrain_diffusion_every=10_000,
         num_samples=100_000,
         diffusion_start=0,
@@ -219,12 +77,10 @@ def redq_sac(
         print_buffer_stats=True,
         skip_reward_norm=True,
         model_terminals=False,
-        # conditional generation hyperparameters
         cfg_dropout=0.25,
         cond_top_frac=0.05,
         cfg_scale=1.0,
         cond_hidden_size=128,
-        # following are bias evaluation related
         evaluate_bias=True,
         n_mc_eval=1000,
         n_mc_cutoff=350,
@@ -234,10 +90,8 @@ def redq_sac(
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training using device: {device}")
-    # set number of epoch
-    # if epochs == 'mbpo' or epochs < 0:
-    #     epochs = mbpo_epoches.get(env_name, 150)
-    if env_name in ['finger-turn_hard-v0', 'finger-turn_easy-v0', 'humanoid-run-v0', 'humanoid-walk-v0']:
+    
+    if env_name in ['finger-turn_hard-v0', 'finger-turn_easy-v0']:
         epochs = 300
     else:
         epochs = 100
@@ -247,11 +101,10 @@ def redq_sac(
     seed = args.seed
     
     if args.wandb:
-        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Ours+{args.novelty_measure}_ftlr{args.finetune_lr}_clip{args.ft_clip_grad}_A{args.alpha_rtb}_On{args.inter_onpolicy}_anl{args.anneal}"
+        run_name = f"{env_name}_{seed}_REGR+{args.novelty_measure}+A{args.alpha_rtb}"
         wandb.init(
-            entity="gda-for-orl",
             project = env_name,
-            group = f'Ours+{args.novelty_measure}',
+            group = f'REGR+{args.novelty_measure}',
             name = run_name,
             config={
                 "env_name": env_name,
@@ -281,8 +134,6 @@ def redq_sac(
                 "synther": args.synther,
                 "knn_clip": args.knn_clip,
                 "knn_k": args.knn_k,
-                "knn_avg": args.knn_avg,
-                "knn_rms": args.knn_rms,
                 "ent_eval_num": args.ent_eval_num,
                 "novelty_measure": args.novelty_measure,
                 "diffusion_steps": args.diffusion_steps,
@@ -321,11 +172,9 @@ def redq_sac(
     # Separate env instance used for "ground-truth" one-step dynamics/reward evaluation
     gt_dyn_env = env_fn()
     print(f"Environment: {env_name} | Seed: {seed}")
-    # seed torch and numpy
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # seed environment along with env action space so that everything is properly seeded for reproducibility
     def seed_all(epoch):
         seed_shift = epoch * 9999
         mod_value = 999999
@@ -351,39 +200,12 @@ def redq_sac(
     # get obs and action dimensions
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
-    # if environment has a smaller max episode length, then use the environment's max episode length
     env_time_limit = get_time_limit(env)
     max_ep_len = env_time_limit if max_ep_len > env_time_limit else max_ep_len
-    # Action limit for clamping: critically, assumes all dimensions share the same bound!
-    # we need .item() to convert it from numpy float to python float
     act_limit = env.action_space.high[0].item()
-    # keep track of run time
-    start_time = time.time()
     # flush logger (optional)
     sys.stdout.flush()
-    #################################################################################################
-
-    """init agent + buffer and start training"""
-    agent_config = {
-        'env_name': env_name,
-        'cond_hidden_size': cond_hidden_size,
-        'hidden_sizes': hidden_sizes,
-        'replay_size': replay_size,
-        'batch_size': batch_size,
-        'lr': lr,
-        'gamma': gamma,
-        'polyak': polyak,
-        'alpha': alpha,
-        'auto_alpha': auto_alpha,
-        'target_entropy': target_entropy,
-        'start_steps': start_steps,
-        'delay_update_steps': delay_update_steps,
-        'utd_ratio': utd_ratio,
-        'num_Q': num_Q,
-        'num_min': num_min,
-        'q_target_mode': q_target_mode,
-        'policy_update_delay': policy_update_delay,
-    }
+    
     agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio, env_name, obs_dim, act_dim, act_limit, device,
                               hidden_sizes, replay_size, batch_size,lr, gamma, polyak,
                               alpha, auto_alpha, target_entropy,
@@ -391,14 +213,12 @@ def redq_sac(
                               utd_ratio, num_Q, num_min, q_target_mode,
                               policy_update_delay)
     
-    if not args.synther and args.novelty_measure == 'rnd':
+    if args.novelty_measure == 'rnd':
         agent.set_normalize_intrinsic_reward(True)
-        print('Enabled intrinsic reward normalization for rnd')
     
     # pbe for state entropy evaluation
-    print('Logging state entropy with PBE')
     rms = RMS(device=torch.device('cpu'))
-    pbe = PBE(rms, args.knn_clip, args.knn_k, args.knn_avg, args.knn_rms, device=torch.device('cpu'))
+    pbe = PBE(rms, args.knn_clip, args.knn_k, device=torch.device('cpu'))
 
     # set up diffusion model
     diff_dims = obs_dim + act_dim + 1 + obs_dim
@@ -413,61 +233,37 @@ def redq_sac(
         skip_dims = []
 
     o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
-    # Guard to ensure Dynamic MSE is computed at most once per epoch
 
     for t in range(total_steps):
+        
         # get action from agent
         a = agent.get_exploration_action(o, env)
-        # Step the env, get next observation, reward and done signal
         o2, r, d, _ = env.step(a)
-
-        # Very important: before we let agent store this transition,
-        # Ignore the "done" signal if it comes from hitting the time
-        # horizon (that is, when it's an artificial terminal signal
-        # that isn't based on the agent's state)
         ep_len += 1
         d = False if ep_len == max_ep_len else d
-        
-
-        # give new data to replay buffer
         agent.store_data(o, a, r, o2, d)
         
-        # New novelty measure: RND
-        if not args.synther and args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
+        if args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
             o2_tensor = torch.FloatTensor(o2).unsqueeze(0).to(device)
             agent.pred_net.eval()
             _ = agent.compute_intrinsic_reward(o2_tensor, accumulate=True)
             agent.pred_net.train()
-            
-        # TODO: diffusion sample ratio, linearly annealing from 0.5 (default) to 0.0
-        # e.g. epoch 0: 0.5, epoch 100: 0.0
-        if args.anneal:     
-            diffusion_sample_ratio = 0.5 - (t // steps_per_epoch) * 0.5 / (epochs - 1)
-            if diffusion_sample_ratio < 0.0:
-                diffusion_sample_ratio = 0.0
-        else:
-            diffusion_sample_ratio = diffusion_sample_ratio
         
-        agent.diffusion_sample_ratio = diffusion_sample_ratio
-        
-        # let agent update
         agent.train(logger)
-        # set obs to next obs
         o = o2
         ep_ret += r
         
-        # train RND predictor network, once in a epoch
-        if not args.synther and d or (ep_len == max_ep_len) and args.novelty_measure == 'rnd':
-            agent.pred_net.train()
-            pred_loss = agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
-            agent.pred_net.eval()
-            # logger.store(RNDPredLoss=pred_loss)
-            # logger.log_tabular('RNDPredLoss', average_only=True)
 
         if d or (ep_len == max_ep_len):
             
-            if not args.synther and args.novelty_measure == 'rnd' and agent.normalize_intrinsic_reward:
-                agent.update_discounted_return_stats(gamma=gamma)
+            # train RND representation network
+            if args.novelty_measure == 'rnd':
+                agent.pred_net.train()
+                agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
+                agent.pred_net.eval()
+                
+                if agent.normalize_intrinsic_reward:
+                    agent.update_discounted_return_stats(gamma=gamma)
             
             # store episode return and length to logger
             logger.store(EpRet=ep_ret, EpLen=ep_len)
@@ -476,51 +272,8 @@ def redq_sac(
 
         if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
             print(f'Retraining diffusion model at step {t + 1}')
-            
-            # ===========================================================================================================================
-            # Original code
-            # # import ipdb; ipdb.set_trace()
-
-            # # Train new diffusion model
-            # diffusion_trainer = REDQCondTrainer(
-            #     construct_diffusion_model(
-            #         inputs=inputs,
-            #         skip_dims=skip_dims,
-            #         disable_terminal_norm=model_terminals,
-            #         cond_dim=1,
-            #         cfg_dropout=cfg_dropout,
-            #     ),
-            #     results_folder=args.results_folder,
-            #     model_terminals=model_terminals,
-            #     args=args,
-            # )
-            # diffusion_trainer.update_normalizer(agent.replay_buffer, device=device)
-            
-            # if args.novelty_measure == 'curiosity':
-            #     cond_distri = diffusion_trainer.train_from_redq_buffer(agent.replay_buffer, agent.cond_net, top_frac=cond_top_frac,
-            #                                                        curr_epoch=(t // steps_per_epoch) + 1)
-            # elif args.novelty_measure == 'rnd':
-            #     cond_distri = diffusion_trainer.train_from_redq_buffer_rnd(agent.replay_buffer, agent, top_frac=cond_top_frac,
-            #                                                        curr_epoch=(t // steps_per_epoch) + 1)
-            # else: 
-            #     raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-            
-            # agent.reset_diffusion_buffer()
-
-            # # Add samples to agent replay buffer
-            # generator = CondDiffusionGenerator(args=args, env=env, ema_model=diffusion_trainer.ema.ema_model, cond_distri=cond_distri)
-            # observations, actions, rewards, next_observations, terminals = generator.sample(num_samples=num_samples,
-            #                                                                                 cfg_scale=cfg_scale)
-
-            # print(f'Adding {num_samples} samples to replay buffer.')
-            # for o, a, r, o2, term in zip(observations, actions, rewards, next_observations, terminals):
-            #     agent.diffusion_buffer.store(o, a, r, o2, term)
-            
-            # ===========================================================================================================================
-            
-            
+        
             dtype = torch.float32
-            
             prior_model = DiffusionModel(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, inputs=inputs, skip_dims=skip_dims, disable_terminal_norm=model_terminals, eta=args.eta).to(dtype=dtype, device=device)
             prior_model.train()
             
@@ -539,19 +292,14 @@ def redq_sac(
                     'weight_decay': 0.0,
                 },
             ]
-            
             prior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.prior_lr, betas=args.prior_adam_betas)
             prior_model_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     prior_model_optimizer,
                     args.num_prior_epochs
                 )
             
-            test_function_x = None
-            test_function_y = None
             all_novelty_list = []
-            
-            # sample every data in replay buffer
-            print(f'Loading every data in replay buffer...')
+            # sample every data in replay buffer, for computing test function y
             ptr_location = agent.replay_buffer.ptr
             
             test_function_x_np = make_inputs_from_replay_buffer(agent.replay_buffer, model_terminals=model_terminals)
@@ -561,10 +309,10 @@ def redq_sac(
             act_dim = env.action_space.shape[0]
             next_obs_start = obs_dim + act_dim + 1
             next_obs_end = next_obs_start + obs_dim
+            
             all_next_obs = test_function_x[:, next_obs_start:next_obs_end]
             all_actions = test_function_x[:, obs_dim:obs_dim+act_dim]
             all_rewards = test_function_x[:, obs_dim+act_dim:obs_dim+act_dim+1]
-            
             all_done = test_function_x[:, obs_dim+act_dim+1:obs_dim+act_dim+2]
             all_obs = test_function_x[:, :obs_dim]
             
@@ -573,22 +321,19 @@ def redq_sac(
             with torch.no_grad():
                 for i in range(0, ptr_location, batch_size_novelty):
                     batch_next_obs = all_next_obs[i:i+batch_size_novelty].to(device)
-                    batch_obs = all_obs[i:i+batch_size_novelty].to(device)
-                    # set curiosity as a measure of novelty
                     if args.novelty_measure == 'curiosity':
+                        batch_obs = all_obs[i:i+batch_size_novelty].to(device)
                         agent.cond_net.eval()
+                        # numpy conversion
                         batch_next_obs_np = batch_next_obs.cpu().numpy()
+                        batch_obs_np = batch_obs.cpu().numpy()
                         batch_actions = all_actions[i:i+batch_size_novelty].cpu().numpy()
                         batch_rewards = all_rewards[i:i+batch_size_novelty].cpu().numpy()
                         batch_done = all_done[i:i+batch_size_novelty].cpu().numpy()
-                        batch_obs_np = batch_obs.cpu().numpy()
                         batch_novelty_tensor = agent.cond_net.compute_reward(batch_obs_np, batch_next_obs_np, batch_actions, batch_rewards, batch_done).squeeze().to(device)
                         agent.cond_net.train()
                     elif args.novelty_measure == 'rnd':
                         batch_novelty_tensor = agent.compute_intrinsic_reward(batch_next_obs, accumulate=False)
-                    elif args.novelty_measure == 'eco':
-                        batch_done_tensor = all_done[i:i+batch_size_novelty].to(device) if len(all_done.shape) > 0 else None
-                        batch_novelty_tensor = agent.compute_eco_reward(batch_obs)
                     else:
                         raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                     batch_novelty = batch_novelty_tensor.cpu().numpy().squeeze()
@@ -598,81 +343,47 @@ def redq_sac(
             # test_function_x is already a tensor, just convert y
             test_function_x_tensor = test_function_x
             test_function_y_tensor = torch.FloatTensor(test_function_y)
-            
-            # compute 95-percentile of test_function_y
+            # clip novelty outliers
             if args.clip_reward > 0.0:
                 test_function_y_percentile = torch.quantile(test_function_y_tensor, args.clip_reward)
                 print(f'{args.clip_reward}-percentile of test function y: {test_function_y_percentile:.7f}')
             else:
                 test_function_y_percentile = None
             
-            # define data normalizer (x의 통계량 계산을 대체)
-            # Now test_function_x uses the same format as update_normalizer, so they are consistent
-            prior_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
-            prior_ema.ema_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
-            
-            # define hyperparameters for training
-            num_prior_epochs = args.num_prior_epochs
-            num_posterior_epochs = args.num_posterior_epochs
-            
-            
-            # training loop
-            print(f'Training conditional diffusion prior...')
-            agent.pred_net.eval()
-            agent.fix_net.eval()
-            # unnecessary except for PGR
             if args.novelty_measure == 'curiosity':
                 cond_distri = CondDistri(agent.cond_net, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
             elif args.novelty_measure == 'rnd':
+                agent.fix_net.eval()
                 cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
-            elif args.novelty_measure == 'eco':
-                cond_distri = CondDistri_ECO(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
             else:
                 raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
+            prior_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
+            prior_ema.ema_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
             prior_model.update_cond_normalizer(cond_distri, device=device)
             prior_ema.ema_model.update_cond_normalizer(cond_distri, device=device)
-            # round_num is not used in our settings
-            # round_num = (t // retrain_diffusion_every) + 1
             
             # Calculate current epoch for logging
             cur_epoch = t // steps_per_epoch
             
-            # Initialize wandb table for prior training logs
-            if args.wandb:
-                prior_log_table = wandb.Table(columns=["Epoch", "Training_Epoch", "Loss"])
-            
-            # ---- measure diffusion prior training time ----
-            diffusion_prior_train_start = time.time()
-            print(f"[Diffusion-DDPM] Prior training start (cur_epoch={cur_epoch}, num_prior_epochs={num_prior_epochs})")
-            for epoch in tqdm(range(num_prior_epochs), dynamic_ncols=True):
+            print(f"[Diffusion-DDPM] Prior training start (cur_epoch={cur_epoch}, num_prior_epochs={args.num_prior_epochs})")
+            for epoch in tqdm(range(args.num_prior_epochs), dynamic_ncols=True):
                 total_loss = 0.0
                 
-                # iteration based training
                 b = cond_distri.sample_batch(args.train_batch_size)
                 obs = b['obs1']
                 next_obs = b['obs2']
                 actions = b['acts']
                 rewards = b['rews'][:, None]
                 done = b['done'][:, None]
-                cond_signal = b['irews'][:, None]
+                # cond_signal = b['irews'][:, None]
 
                 data = [obs, actions, rewards, next_obs]
                 if model_terminals:
                     data.append(done)
                 data = np.concatenate(data, axis=1)
-                
-                # move to cuda (옮기고 normalize하는 순서가 맞음)
                 data = torch.from_numpy(data).float().to(device)
-                cond_signal = torch.from_numpy(cond_signal).float().to(device)
-                
-                # normalize data
                 data = prior_model.normalizer.normalize(data)
-                cond_signal = prior_model.cond_normalizer.normalize(cond_signal)
-                
-                if args.synther:
-                    loss = prior_model.compute_loss(data, cond=None)
-                else:
-                    loss = prior_model.compute_loss(data, cond=cond_signal)
+                loss = prior_model.compute_loss(data, cond=None)
                     
                 prior_model_optimizer.zero_grad()
                 loss.backward()
@@ -682,42 +393,13 @@ def redq_sac(
                 # update learning rate scheduler
                 if prior_model_lr_scheduler is not None:
                     prior_model_lr_scheduler.step()
-                    
                 # update EMA model
                 prior_ema.to(device)
                 prior_ema.update()
                 
                 total_loss += loss.item()
-                
-                
                 if epoch % 1000 == 0:
-                    print(f'[{epoch}/{num_prior_epochs}] loss: {total_loss:.4f}')
-                
-                    # Add data to wandb table
-                    if args.wandb:
-                        prior_log_table.add_data(
-                            cur_epoch,
-                            epoch + 1,
-                            f"{total_loss:.7f}"
-                        )
-
-            diffusion_prior_train_elapsed = time.time() - diffusion_prior_train_start
-            print(f"[Diffusion-DDPM] Prior training finished in {diffusion_prior_train_elapsed:.2f} s "
-                  f"({diffusion_prior_train_elapsed/60.0:.2f} min)")
-            if args.wandb:
-                # Keep keys consistent with online_cond_origin_baseline.py for easy comparison/plotting
-                wandb.log(
-                    {
-                        "diffusion/train_time_sec": diffusion_prior_train_elapsed,
-                        "diffusion/train_time_min": diffusion_prior_train_elapsed / 60.0,
-                    },
-                    step=cur_epoch,
-                )
-            
-            # Log table at the end of prior training (with epoch-specific key to avoid overwriting)
-            if args.wandb:
-                wandb.log({f"Prior_Training_Log_Epoch_{cur_epoch}": prior_log_table}, step=cur_epoch)
-                
+                    print(f'[{epoch}/{args.num_prior_epochs}] loss: {total_loss:.4f}')
             
             # reset diffusion buffer
             agent.reset_diffusion_buffer()
@@ -725,62 +407,21 @@ def redq_sac(
             
             
             
+            
             # rtb fine-tuning
-            
             alpha_rtb = args.alpha_rtb
-            # beta = args.beta
             
-            
-            # define reward proxy 
-            # update basic onpolicy reward
-            agent.update_onpolicy_reward()
-            print(f'max_onpolicy_reward: {agent.max_onpolicy_reward}')
-            
-            # Choose different reward function to optimize for different algorithms
-            # For unity, each compute_intrinsic_reward and compute_reward should take the whole transition as input
-            # TODO
+            # Choose different reward function to optimize
             if args.novelty_measure == 'curiosity':
                 proxy_model_ens = agent.cond_net.compute_reward_torch
             elif args.novelty_measure == 'rnd':
                 proxy_model_ens = agent.compute_intrinsic_reward
-            elif args.novelty_measure == 'eco':
-                proxy_model_ens = agent.compute_eco_reward
             else:
                 raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-            
-            # define posterior model and optimizer
-            # proxy_model_ens is not used in our settings, so replace it with agent.compute_intrinsic_reward()
-            # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
-            # TODO: requires an argument for onpolicy reward function in QFlow()
-            # add 1) onpolicy reward function, 2) args.novelty measure (curiosity, rnd, eco)
-            # TODO: We need to normalize the novelty, so that we can handle different scales of novelty measures with on-policy reward
-            # EMA: Instead of using original prior, we use EMA model
-            
-            # TODO: deep copy prior_ema.ema_model to prior_model
-            # TODO: This is the main cause of not decreasing the loss
             posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb,
                                     obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-                                    agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim).to(device=device)
+                                    agent=agent, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim).to(device=device)
             
-            # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
-            #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-            #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
-            
-            # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
-            #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-            #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
-            
-            # def n_trainable(m):
-            #     return sum(p.numel() for p in m.parameters() if p.requires_grad)
-
-            # print("qflow trainable params:", n_trainable(posterior_model.qflow))
-            # print("bc_net policy trainable params:", n_trainable(posterior_model.bc_net.policy))
-            # print("logZ requires_grad:", posterior_model.logZ.requires_grad)
-            
-            # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
-            # posterior_model_optimizer = torch.optim.AdamW(posterior_model.parameters(), lr=args.finetune_lr)
-            
-            # special optimizer
             no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
             optimizer_grouped_parameters = [
                     {
@@ -808,7 +449,7 @@ def redq_sac(
             posterior_model.train()
             
             # fine-tuning loop
-            if num_posterior_epochs > 0:
+            if args.num_posterior_epochs > 0:
                 # Initialize wandb table for posterior training logs
                 if args.wandb:
                     posterior_log_table = wandb.Table(
@@ -816,16 +457,14 @@ def redq_sac(
                     )
                 s1 = 1
                 
-                # ---- measure posterior fine-tuning time ----
-                posterior_ft_start = time.time()
-                print(f"[Diffusion-DDPM] Posterior fine-tuning start (cur_epoch={cur_epoch}, num_posterior_epochs={num_posterior_epochs})")
-                for epoch in tqdm(range(num_posterior_epochs), dynamic_ncols=True):
+                print(f"[Diffusion-DDPM] Posterior fine-tuning start (cur_epoch={cur_epoch}, num_posterior_epochs={args.num_posterior_epochs})")
+                for epoch in tqdm(range(args.num_posterior_epochs), dynamic_ncols=True):
+                    # toggle between on-policy and off-policy
                     if args.training_posterior == "both":
-                        # toggle between on-policy and off-policy
                         s1 = (s1+1) % 2
                     elif args.training_posterior == "on":
                         s1 = 0
-                    else: # off
+                    else: # fine-tuning only on samples from R.B
                         s1 = 1
                     
                     # Gradient accumulation settings
@@ -836,13 +475,11 @@ def redq_sac(
                     # Accumulate gradients over micro-batches
                     total_loss = 0.0
                     total_logZ = 0.0
-                    # all_x_list = []
-                    # all_y_list = []
                     
                     on_policy_rewards = []
                     for acc_step in range(accumulation_steps):
+                        # on-policy
                         if s1 == 0:
-                            # on-policy
                             if acc_step == 0:
                                 print(f'On-policy training (gradient accumulation: {accumulation_steps} steps)')
                             # return normalized samples x
@@ -851,78 +488,49 @@ def redq_sac(
                             x_unnormalized = prior_model.normalizer.unnormalize(x)
                             x_obs_unnormalized = x_unnormalized[:, :obs_dim]
                             x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-                            # x_next_obs should be unnormalized as input of proxy_model_ens
-                            if args.novelty_measure == 'rnd':
-                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
-                            elif args.novelty_measure == 'curiosity':
+                            if args.novelty_measure == 'curiosity':
                                 x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
                                 y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
-                            elif args.novelty_measure == 'eco':
-                                # ECO reward computation
-                                # According to paper: "takes the current observation o as input"
-                                # Use current obs (obs at time t, before action was taken)
-                                y = proxy_model_ens(x_obs_unnormalized).squeeze()
+                            elif args.novelty_measure == 'rnd':
+                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
                             else:
                                 raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                             on_policy_rewards.append(y.detach().mean().item())
+                        # off-policy (R.B.)
                         else:
-                            # off-policy (reward prioritization)
                             if acc_step == 0:
                                 print(f'Off-policy training (gradient accumulation: {accumulation_steps} steps)')
                             idx = torch.multinomial(y_weights.squeeze(), micro_batch_size, replacement=True)
-                            # this is normalized samples x
                             x = xs[idx]
-                            # [Optional] Add noise to x
-                            # x += torch.randn_like(x) * 0.01
                             loss, logZ = posterior_model.compute_loss_with_sample(x, device)
                             # Extract obs and next_obs from x for reward computation
                             x_unnormalized = prior_model.normalizer.unnormalize(x)
                             x_obs_unnormalized = x_unnormalized[:, :obs_dim]
                             x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-                            if args.novelty_measure == 'rnd':
-                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
-                            elif args.novelty_measure == 'curiosity':
+                            if args.novelty_measure == 'curiosity':
                                 x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
                                 y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
-                            elif args.novelty_measure == 'eco':
-                                # ECO reward computation
-                                # According to paper: "takes the current observation o as input"
-                                # Use current obs (obs at time t, before action was taken)
-                                y = proxy_model_ens(x_obs_unnormalized).squeeze()
+                            elif args.novelty_measure == 'rnd':
+                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
                             else:
                                 raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
                         
-                        # Scale loss by accumulation_steps to maintain same effective learning rate
+                        # Scale loss by accumulation_steps to maintain same the learning rate
                         (loss / accumulation_steps).backward()
                         total_loss += loss.item()
                         if isinstance(logZ, torch.Tensor):
                             total_logZ += logZ.item()
                         else:
                             total_logZ += logZ
-                        # all_x_list.append(x)
-                        # all_y_list.append(y)
                     
-                    # Update weights after accumulating all gradients
-                    # posterior_model_optimizer.step()              
                     if args.ft_clip_grad > 0.0:
-                        # print(f'Clipping gradients during finetuning')
                         torch.nn.utils.clip_grad_norm_(posterior_model.parameters(), max_norm=args.ft_clip_grad)
                     posterior_model_optimizer.step()
-                    if posterior_model_lr_scheduler is not None:
-                        posterior_model_lr_scheduler.step()
+                    posterior_model_lr_scheduler.step()
                     
-                    # Concatenate all samples
-                    # x = torch.cat(all_x_list, dim=0)
-                    # y = torch.cat(all_y_list, dim=0)
-                    # 데이터 하나 당 평균 loss
-                    loss = total_loss / accumulation_steps  # Average loss for logging
-                    logZ = total_logZ / accumulation_steps  # Average logZ for logging
-                    
-                    # xs = torch.cat([xs, x], dim=0)
-                    # ys = torch.cat([ys, y], dim=0)
-                    
-                    # y_weights = torch.softmax(ys, dim=0)
-                    print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss:.9f}')
+                    loss = total_loss / accumulation_steps
+                    logZ = total_logZ / accumulation_steps  
+                    print(f'Epoch: {epoch+1}/{args.num_posterior_epochs} \tLoss: {loss:.9f}')
                     
                     # Add data to wandb table
                     if args.wandb:
@@ -942,17 +550,10 @@ def redq_sac(
                         )
                         print(f'On-policy reward (Mean): {on_policy_reward_value}')
                 
-                posterior_ft_elapsed = time.time() - posterior_ft_start
-                print(f"[Diffusion-DDPM] Posterior fine-tuning finished in {posterior_ft_elapsed:.2f} s "
-                      f"({posterior_ft_elapsed/60.0:.2f} min)")
-                # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
                 if args.wandb:
-                    # Fine-tuning uses a separate key, but keep the same "diffusion/*" prefix family.
                     wandb.log(
                         {
-                            f"Posterior_Training_Log_Epoch_{cur_epoch}": posterior_log_table,
-                            "diffusion/finetune_time_sec": posterior_ft_elapsed,
-                            "diffusion/finetune_time_min": posterior_ft_elapsed / 60.0,
+                            f"Posterior_Training_Log_Epoch_{cur_epoch}": posterior_log_table
                         },
                         step=cur_epoch,
                     )
@@ -960,118 +561,65 @@ def redq_sac(
             posterior_model.eval()
         
         
-        
-        # +++++++++++ training over +++++++++++
-            
-            # +++++++++++ 2. Sampling +++++++++++
-            posterior_sampling_start = time.time()
+            # Sampling from posterior model
             print(f'Sampling...')
             X_sample_total = []
-            # we only need X_sample, not logR_sample
-            # logR_sample_total = []
             eval_epochs = int(args.num_samples // args.sample_batch_size)
             assert args.num_samples % args.sample_batch_size == 0
-            # In our settings, filtering is not used
-            # if args.filtering:
-            #     M = args.num_proposals
-            # else: # 
-            #     M = 1
-            posterior_model.eval()
-                
-            for _ in tqdm(range(eval_epochs)): #NOTE B * M**2 samples proposal.
-                # Split into batches due to memory constraints
-                # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
-                # if args.algorithm == 'Ours':
-                # posterior_model.eval()
+            
+            for _ in tqdm(range(eval_epochs)):
                 X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
-                # elif args.algorithm == 'PGRrnd' or args.algorithm == 'PGR':
-                #     # prior_model.eval()
-                #     # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
-                #     # # pdb.set_trace()
-                #     # cond = prior_model.cond_normalizer.normalize(cond)
-                #     # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale)
-                #     prior_ema.ema_model.eval()
-                #     cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
-                #     cond = prior_ema.ema_model.cond_normalizer.normalize(cond)
-                #     X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale, ddim=args.ddim)
-                # elif args.algorithm == 'SER':
-                #     # prior_model.eval()
-                #     # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
-                #     prior_ema.ema_model.eval()
-                #     X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None, ddim=args.ddim)
-                # else:
-                #     raise ValueError(f'Invalid algorithm: {args.algorithm}')
-                
-                # local search is not used in our settings
-                # if args.local_search and args.local_search_epochs > 0:
-                #     break
-                # else:
                 X_sample_total.append(X_sample)
-                    # logR_sample_total.append(logR)
-                    
             X_sample = torch.cat(X_sample_total, dim=0)
-            # logR_sample = torch.cat(logR_sample_total, dim=0)
-            
-            posterior_sampling_elapsed = time.time() - posterior_sampling_start
-            print(f'Sampling complete in {posterior_sampling_elapsed:.2f} s ({posterior_sampling_elapsed/60.0:.2f} min)')
-            if args.wandb:
-                # Keep keys consistent with online_cond_origin_baseline.py for easy comparison/plotting
-                wandb.log(
-                    {
-                        "diffusion/sampling_time_sec": posterior_sampling_elapsed,
-                        "diffusion/sampling_time_min": posterior_sampling_elapsed / 60.0,
-                    },
-                    step=cur_epoch,
-                )
-            
-            # clip
             print(f'X_sample before clipping: {X_sample}')
-            # originally in PGR source code
-            if isinstance(prior_model.normalizer, MinMaxNormalizer):
-                print('Clipping X_sample to [-1, 1]')
-                print('it works anyway')
-                X_sample = torch.clamp(X_sample, -1., 1.)
-            else:
-                print('Not clipping X_sample')
-            # unnormalize samples after clipping
-            X_sample_unnorm = prior_model.normalizer.unnormalize(X_sample)
-            # if actions are not clipped, then clamp them to [-1, 1]
-            # X_sample_unnorm = torch.clamp(X_sample_unnorm, -1, 1)
-                
             
-            # put it in diffusion replay buffer
-            # Convert to numpy if it's a tensor
+            X_sample = torch.clamp(X_sample, -1., 1.)
+                
+            X_sample_unnorm = prior_model.normalizer.unnormalize(X_sample)
             if isinstance(X_sample_unnorm, torch.Tensor):
+                print(f'X_sample_unnorm is a tensor')
                 X_sample_unnorm_np = X_sample_unnorm.cpu().numpy()
             else:
+                print(f'X_sample_unnorm is not a tensor')
                 X_sample_unnorm_np = X_sample_unnorm
             
             transitions = split_diffusion_samples(X_sample_unnorm_np, env, modelled_terminals=model_terminals)
             if len(transitions) == 4:
+                print(f'transitions is 4')
                 obs, act, rew, next_obs = transitions
                 # Convert to numpy if tensors
                 if isinstance(next_obs, torch.Tensor):
+                    print(f'next_obs is a tensor')
                     next_obs = next_obs.cpu().numpy()
+                else:
+                    print(f'next_obs is not a tensor')
                 terminal = np.zeros_like(next_obs[:, 0])
             else:
-                # won't be chosen
+                print(f'transitions is not 4')
                 obs, act, rew, next_obs, terminal = transitions
                 # Convert to numpy if tensors
                 if isinstance(next_obs, torch.Tensor):
+                    print(f'next_obs is a tensor')
                     next_obs = next_obs.cpu().numpy()
                 if isinstance(terminal, torch.Tensor):
+                    print(f'terminal is a tensor')
                     terminal = terminal.cpu().numpy()
             
             # Convert all to numpy arrays if they're tensors
             if isinstance(obs, torch.Tensor):
+                print(f'obs is a tensor')
                 obs = obs.cpu().numpy()
             if isinstance(act, torch.Tensor):
+                print(f'act is a tensor')
                 act = act.cpu().numpy()
             if isinstance(rew, torch.Tensor):
+                print(f'rew is a tensor')
                 rew = rew.cpu().numpy()
             if isinstance(next_obs, torch.Tensor):
+                print(f'next_obs is a tensor')
                 next_obs = next_obs.cpu().numpy()
             if isinstance(terminal, torch.Tensor):
+                print(f'terminal is a tensor')
                 terminal = terminal.cpu().numpy()
                 
             observations = np.array(obs).squeeze()
@@ -1087,8 +635,7 @@ def redq_sac(
                 
             
             
-                
-
+            # print buffers' statistics
             if print_buffer_stats:
                 ptr_location = agent.replay_buffer.ptr
                 real_observations = agent.replay_buffer.obs1_buf[:ptr_location]
@@ -1109,78 +656,25 @@ def redq_sac(
                 print(f'Replay buffer size: {ptr_location}')
                 print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
 
-            # ---- Dynamic MSE logging (placed right after print_buffer_stats, as requested) ----
-            print(f'Computing Dynamic MSE...')
-            # Compute at most once per epoch to avoid double-counting if diffusion sampling happens multiple times.
-            epoch_cur = t // steps_per_epoch
-            # dyn_every = getattr(args, "dynamic_mse_every", 1)
-            # dyn_n = getattr(args, "dynamic_mse_samples", 5000)
-            
-            dyn_n = 10000
-            # do_dyn = (dyn_every is not None) and (dyn_every > 0) and (epoch_cur % dyn_every == 0)
 
-            # if do_dyn and (epoch_cur != last_dynmse_epoch):
+            # ---- Dynamic MSE logging (Mujoco) ----
+            dyn_n = 10000
             dyn_res = compute_dynamic_mse_from_diffusion_buffer(
                 agent.diffusion_buffer,
                 gt_dyn_env,
                 n_samples=dyn_n,
             )
-            
             if dyn_res.get("ok", False):
-                # logger.store(DynMSE=dyn_res["dyn_mse"])
-                # logger.store(DynStateMSE=dyn_res["state_mse"])
-                # logger.store(DynRewardMSE=dyn_res["reward_mse"])
-                
-                print('Starting to plot Dynamic MSE...')
-
+                print(f'Dynamic MSE, computed')
                 if args.wandb:
-                    # Dynamic MSE boxplot
-                    fig_dyn = plt.figure(figsize=(6, 4))
-                    plt.boxplot(dyn_res["dyn_mse"], showfliers=False)
-                    plt.title(f"Dynamic MSE (n_ok={dyn_res['n_ok']}/{dyn_res['n_total']})")
-                    plt.ylabel("0.5*(state_mse + reward_mse)")
-                    plt.tight_layout()
-                    
-                    # State MSE boxplot
-                    fig_state = plt.figure(figsize=(6, 4))
-                    plt.boxplot(dyn_res["state_mse"], showfliers=False)
-                    plt.title(f"State MSE (n_ok={dyn_res['n_ok']}/{dyn_res['n_total']})")
-                    plt.ylabel("mean((s'_true - s'_gt)^2)")
-                    plt.tight_layout()
-                    
-                    # Reward MSE boxplot
-                    fig_reward = plt.figure(figsize=(6, 4))
-                    plt.boxplot(dyn_res["reward_mse"], showfliers=False)
-                    plt.title(f"Reward MSE (n_ok={dyn_res['n_ok']}/{dyn_res['n_total']})")
-                    plt.ylabel("(r_true - r_gt)^2")
-                    plt.tight_layout()
-                    
-                    # Create table to store all dynamic MSE values
-                    dyn_mse_table = wandb.Table(columns=["Epoch", "Dynamic_MSE"])
-                    for dyn_mse_val in dyn_res["dyn_mse"]:
-                        dyn_mse_table.add_data(epoch_cur, float(dyn_mse_val))
-                    
                     wandb.log(
                         {
-                            "eval/DynMSE_boxplot": wandb.Image(fig_dyn),
-                            "eval/DynStateMSE_boxplot": wandb.Image(fig_state),
-                            "eval/DynRewardMSE_boxplot": wandb.Image(fig_reward),
                             "eval/DynMSE_mean": dyn_res["dyn_mse_mean"],
-                            "eval/DynMSE_median": dyn_res["dyn_mse_median"],
-                            f"eval/DynMSE_all_Epoch_{epoch_cur}": dyn_mse_table,
+                            "eval/DynMSE_median": dyn_res["dyn_mse_median"]
                         },
-                        step=epoch_cur,
+                        step=cur_epoch,
                     )
-                    plt.close(fig_dyn)
-                    plt.close(fig_state)
-                    plt.close(fig_reward)
-            # else:
-            #     logger.store(DynMSE=np.array([np.nan], dtype=np.float32))
-            #     logger.store(DynStateMSE=np.array([np.nan], dtype=np.float32))
-            #     logger.store(DynRewardMSE=np.array([np.nan], dtype=np.float32))
-
-            # last_dynmse_epoch = epoch_cur
-
+                
         # End of epoch wrap-up
         if (t + 1) % steps_per_epoch == 0:
             epoch = t // steps_per_epoch
@@ -1190,23 +684,8 @@ def redq_sac(
             if evaluate_bias:
                 log_bias_evaluation(bias_eval_env, agent, logger, max_ep_len, alpha, gamma, n_mc_eval, n_mc_cutoff)
 
-            # reseed should improve reproducibility (should make results the same whether bias evaluation is on or not)
             if reseed_each_epoch:
                 seed_all(epoch)
-                
-            # Evaluation of state entropy
-            # # 첫 번째 에포크에서 StateEnt를 0으로 초기화하여 헤더에 포함
-            # if args.state_ent:
-            #     if epoch % 5 == 0 and epoch > 1:
-            #         # obs_tensor, _, _, _, _ = agent.sample_real_data(batch_size=args.ent_eval_num)
-            #         obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=args.ent_eval_num)
-            #         intr_rew = compute_intr_reward(pbe, obs_tensor)
-            #         logger.store(StateEnt=intr_rew)
-            #         print(f'State Entropy: {intr_rew.mean():.4f}')
-            #     else:
-            #         # 헤더 등록을 위해 빈 값 저장 (실제 계산은 하지 않음)
-            #         logger.store(StateEnt=0.0)
-            #     logger.log_tabular('StateEnt', average_only=True)
             
             obs_tensor, _, _, _, _ = agent.sample_real_data_cpu(batch_size=4000)
             intr_rew = compute_intr_reward(pbe, obs_tensor)
@@ -1214,16 +693,10 @@ def redq_sac(
             logger.log_tabular('StateEnt', average_only=True)
             print(f'State Entropy: {intr_rew.mean():.4f}')
             
-            # logger.log_tabular('DynMSE', with_min_and_max=True)
-            # logger.log_tabular('DynStateMSE', with_min_and_max=True)
-            # logger.log_tabular('DynRewardMSE', with_min_and_max=True)
-            
-
             """logging"""
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
             logger.log_tabular('TotalEnvInteracts', t)
-            logger.log_tabular('Time', time.time() - start_time)
             logger.log_tabular('EpRet', with_min_and_max=True)
             logger.log_tabular('EpLen', average_only=True)
             logger.log_tabular('TestEpRet', with_min_and_max=True)
@@ -1253,6 +726,7 @@ def redq_sac(
             
     if args.wandb:
         wandb.finish()
+
 
 def wrap_gym(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
     if rescale_actions:
@@ -1349,10 +823,6 @@ if __name__ == '__main__':
         os.makedirs(args.results_folder)
 
     logger_kwargs = setup_logger_kwargs(args.env, args.log_dir)
-
     gin.parse_config_files_and_bindings(args.gin_config_files, args.gin_params)
-    
-    print('hi')
 
-    # args를 한번에 넘기는게 좋음
     redq_sac(args.env, target_entropy='auto', logger_kwargs=logger_kwargs, args=args)
