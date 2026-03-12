@@ -1,131 +1,204 @@
-# Prioritized Generative Replay
-
-[Renhao Wang](https://renwang435.github.io/), [Kevin Frans](https://kvfrans.com/), [Pieter Abbeel](https://people.eecs.berkeley.edu/~pabbeel/), [Sergey Levine](https://people.eecs.berkeley.edu/~svlevine/), [Alexei A. Efros](http://people.eecs.berkeley.edu/~efros/)
-
-[[`arXiv`](https://arxiv.org/abs/2410.18082)] [[`BibTeX`](#Citing)]
+# Robust Exploration through Generative Replay
 
 ## Installation
 
-This repository is based heavily off the release code of [SynthER](https://github.com/conglu1997/SynthER?tab=readme-ov-file#setup). The instructions for setting up their environment are reproduced below: 
+Run the following:
 
-To install, clone the repository and run the following:
-
-```bash 
-git submodule update --init --recursive
+```bash
+conda create -n regr python=3.8
+conda activate regr
 pip install -r requirements.txt
 ```
 
-Our code is tested on Python 3.8.
-If you don't have MuJoCo installed, follow the instructions here: https://github.com/openai/mujoco-py#install-mujoco.
+Our code is tested on **Python 3.8**.
 
-## Running Instructions
+If you do not have MuJoCo installed, follow the instructions here:  
+https://github.com/openai/mujoco-py#install-mujoco
 
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed '(...)' --algorithm '(...)'
-```
 
-```bash
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed '(...)' --algorithm '(...)'
-```
+---
 
-```bash
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed '(...)' --algorithm '(...)'
-```
+# Running
 
-## Running Instructions(1)
+This repository supports several algorithms used in our experiments, including **SAC**, **REDQ**, **SER**, **PGR**, and our method **REGR**.
 
-scripts for baselines (SAC, REDQ, SER, PGR, PGR-rnd) and our methods in DMCsuite
+All experiments are executed through the following scripts:
 
-Baseline.0: SAC
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm SAC
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
 ```
-Baseline.1: REDQ
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm REDQ
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-```
-Baseline.2: SER
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm SER
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-```
-Baseline.3: PGR
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm PGR
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-```
-Baseline.4: PGR-rnd
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm PGRrnd
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGRrnd
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGRrnd
-```
-Ours: ??
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm Ours
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
+synther/online/online_cond.py
+synther/online/online_cond_regr.py
 ```
 
-## Running Instructions(2)
+Configuration files are specified via **gin-config**.
 
-scripts for baselines (SAC, REDQ, SER, PGR, PGR-rnd) and our methods in Mujoco
+The environments used in our experiments are:
 
-Baseline.0: SAC
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
 ```
-Baseline.1: REDQ
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-```
-Baseline.2: SER
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-```
-Baseline.3: PGR
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-```
-Baseline.4: PGR-rnd
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
-```
-Ours: ??
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
+quadruped-walk-v0
+cheetah-run-v0
+reacher-hard-v0
+HalfCheetah-v2
+Walker2d-v2
+Hopper-v2
+finger-turn_hard-v0
 ```
 
-## <a name="Citing"></a>Citing PGR
+Experiments can optionally log results using **Weights & Biases** by enabling the `--wandb` flag.
 
-```BibTeX
-@inproceedings{wang2025prioritized,
-  title={Prioritized Generative Replay},
-  author={Renhao Wang and Kevin Frans and Pieter Abbeel and Sergey Levine and Alexei A Efros},
-  booktitle={The Thirteenth International Conference on Learning Representations},
-  year={2025},
-  url={https://openreview.net/forum?id=5IkDAfabuo}
-}
+
+---
+
+# Running Baselines
+
+## SAC Baseline
+
+```bash
+for env in quadruped-walk-v0 cheetah-run-v0 reacher-hard-v0 HalfCheetah-v2 Walker2d-v2 Hopper-v2 finger-turn_hard-v0; do
+
+    GIN_FILE="config/online/sac.gin"
+
+    CUDA_VISIBLE_DEVICES=0 python synther/online/online_cond.py \
+        --wandb \
+        --env $env \
+        --gin_config_files $GIN_FILE \
+        --seed 0 \
+        --sac &
+
+done
 ```
+
+
+---
+
+## REDQ Baseline
+
+```bash
+for env in quadruped-walk-v0 cheetah-run-v0 reacher-hard-v0 HalfCheetah-v2 Walker2d-v2 Hopper-v2 finger-turn_hard-v0; do
+
+    GIN_FILE="config/online/redq.gin"
+
+    CUDA_VISIBLE_DEVICES=0 python synther/online/online_cond.py \
+        --wandb \
+        --env $env \
+        --gin_config_files $GIN_FILE \
+        --seed 0 \
+        --redq &
+
+done
+```
+
+
+---
+
+## SER (SynthER)
+
+```bash
+for env in quadruped-walk-v0 cheetah-run-v0 reacher-hard-v0 HalfCheetah-v2 Walker2d-v2 Hopper-v2 finger-turn_hard-v0; do
+
+    case "$env" in
+        "quadruped-walk-v0" | "cheetah-run-v0" | "reacher-hard-v0" | "finger-turn_hard-v0")
+            GIN_FILE="config/online/sac_cond_synther_dmc.gin"
+            ;;
+        *)
+            GIN_FILE="config/online/sac_cond_synther_openai.gin"
+            ;;
+    esac
+
+    CUDA_VISIBLE_DEVICES=0 python synther/online/online_cond.py \
+        --wandb \
+        --env $env \
+        --gin_config_files $GIN_FILE \
+        --seed 0 \
+        --synther \
+        --ddim &
+
+done
+```
+
+
+---
+
+## PGR (Prioritized Generative Replay)
+
+```bash
+for env in quadruped-walk-v0 cheetah-run-v0 reacher-hard-v0 HalfCheetah-v2 Walker2d-v2 Hopper-v2 finger-turn_hard-v0; do
+    for novelty_measure in curiosity rnd; do
+        for cond_top_frac in 0.25; do
+            for cfg_scale in 2.0; do
+
+                case "$env" in
+                    "quadruped-walk-v0" | "cheetah-run-v0" | "reacher-hard-v0" | "finger-turn_hard-v0")
+                        GIN_FILE="config/online/sac_cond_synther_dmc.gin"
+                        ;;
+                    *)
+                        GIN_FILE="config/online/sac_cond_synther_openai.gin"
+                        ;;
+                esac
+
+                CUDA_VISIBLE_DEVICES=0 python synther/online/online_cond.py \
+                    --wandb \
+                    --env $env \
+                    --gin_config_files $GIN_FILE \
+                    --gin_params "redq_sac.cond_top_frac = $cond_top_frac" "redq_sac.cfg_scale = $cfg_scale" \
+                    --seed 0 \
+                    --novelty_measure $novelty_measure \
+                    --ddim &
+
+            done
+        done
+    done
+done
+```
+
+
+---
+
+# Running REGR (Ours)
+
+```bash
+for env in quadruped-walk-v0 cheetah-run-v0 reacher-hard-v0 HalfCheetah-v2 Walker2d-v2 Hopper-v2 finger-turn_hard-v0; do
+    for novelty_measure in curiosity rnd; do
+        for alpha_rtb in 1.0; do
+
+            case "$env" in
+                "quadruped-walk-v0")
+                    POST_EPOCH=150
+                    GIN_FILE="config/online/sac_cond_synther_dmc.gin"
+                    ;;
+                "HalfCheetah-v2" | "Hopper-v2" | "Walker2d-v2")
+                    POST_EPOCH=100
+                    GIN_FILE="config/online/sac_cond_synther_openai.gin"
+                    ;;
+                "reacher-hard-v0" | "cheetah-run-v0")
+                    POST_EPOCH=100
+                    GIN_FILE="config/online/sac_cond_synther_dmc.gin"
+                    ;;
+                *)
+                    POST_EPOCH=100
+                    GIN_FILE="config/online/sac_cond_synther_dmc.gin"
+                    ;;
+            esac
+
+            CUDA_VISIBLE_DEVICES=1 python synther/online/online_cond_regr.py \
+                --wandb \
+                --env $env \
+                --gin_config_files $GIN_FILE \
+                --seed 0 \
+                --alpha_rtb $alpha_rtb \
+                --training_posterior both \
+                --novelty_measure $novelty_measure \
+                --num_posterior_epochs $POST_EPOCH \
+                --accumulation_steps 1 \
+                --ddim &
+
+        done
+    done
+done
+```
+
+
+---
 
 ## License and Acknowledgements
 
-This codebase inherits all licenses from the public release of [SynthER](https://github.com/conglu1997/SynthER).
+This codebase inherits all licenses from the public release of [SynthER](https://github.com/conglu1997/SynthER), [PGR](https://github.com/renwang435/pgr), [RTB](https://github.com/GFNOrg/diffusion-finetuning).
