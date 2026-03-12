@@ -6,12 +6,6 @@ import gin
 import gym
 import numpy as np
 import torch
-from ipdb import set_trace as st
-# GIN-required Imports.
-from synther.diffusion.denoiser_network_cond import ResidualMLPDenoiser
-from synther.diffusion.elucidated_diffusion import ElucidatedDiffusion
-from synther.diffusion.norm import normalizer_factory
-from torch import nn
 
 # Convert diffusion samples back to (s, a, r, s') format.
 @gin.configurable
@@ -39,53 +33,4 @@ def split_diffusion_samples(
         return obs, actions, rewards, next_obs, terminals
     else:
         return obs, actions, rewards, next_obs
-
-
-@gin.configurable
-def construct_diffusion_model(
-        inputs: torch.Tensor,
-        normalizer_type: str,
-        denoising_network: nn.Module,
-        activation: str = "relu",
-        disable_terminal_norm: bool = False,
-        skip_dims: List[int] = [],
-        cond_dim: Optional[int] = None,
-        cfg_dropout: float = 0.0,
-        num_sample_steps: int = 1000,
-) -> ElucidatedDiffusion:
-    event_dim = inputs.shape[1]
-    model = denoising_network(d_in=event_dim, activation=activation, 
-                              cond_dim=cond_dim, cfg_dropout=cfg_dropout)
-
-    if disable_terminal_norm:
-        terminal_dim = event_dim - 1
-        if terminal_dim not in skip_dims:
-            skip_dims.append(terminal_dim)
-
-    if skip_dims:
-        print(f"Skipping normalization for dimensions {skip_dims}.")
-    
-    # import ipdb; ipdb.set_trace()
-
-    normalizer = normalizer_factory(normalizer_type, inputs, skip_dims=skip_dims)
-    if cond_dim is not None:
-        cond_inputs = torch.zeros((128, cond_dim)).float()
-        cond_normalizer = normalizer_factory(normalizer_type, cond_inputs, skip_dims=[])
-    else:
-        cond_normalizer = None
-
-    # num_sample_steps는 128
-    diffusion_model = ElucidatedDiffusion(
-        net=model,
-        normalizer=normalizer,
-        cond_normalizer=cond_normalizer,
-        event_shape=[event_dim],
-        num_sample_steps=num_sample_steps,
-    )
-
-    # Counter number of parameters in diffusion model
-    num_params = sum(p.numel() for p in diffusion_model.net.parameters() if p.requires_grad)
-    print(f"Number of parameters in diffusion model: {num_params}")
-
-    return diffusion_model
 

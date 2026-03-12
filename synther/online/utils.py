@@ -23,7 +23,6 @@ def make_inputs_from_replay_buffer(
     return np.concatenate(inputs, axis=1)
 
 def compute_intr_reward(pbe, obs):
-    # with torch.no_grad():
     reward = pbe(obs)
     reward = reward.reshape(-1,1)
     reward = reward.cpu().numpy()
@@ -31,7 +30,7 @@ def compute_intr_reward(pbe, obs):
 
 class PBE(object):
     """particle-based entropy based on knn normalized by running mean """
-    def __init__(self, rms, knn_clip, knn_k, device):
+    def __init__(self, rms, knn_k, device):
         self.rms = rms
         self.knn_rms = True
         self.knn_avg = True

@@ -3,8 +3,7 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.optim as optim
-from redq.algos.core import TanhGaussianPolicy, Mlp, soft_update_model1_with_model2, ReplayBuffer,\
-    mbpo_target_entropy_dict
+from redq.algos.core import TanhGaussianPolicy, Mlp, soft_update_model1_with_model2, ReplayBuffer
 
 def get_probabilistic_num_min(num_mins):
     # allows the number of min to be a float
@@ -146,8 +145,6 @@ class REDQSACAgent(object):
         rews_tensor = Tensor(batch['rews']).unsqueeze(1).to(self.device)
         done_tensor = Tensor(batch['done']).unsqueeze(1).to(self.device)
         return obs_tensor, obs_next_tensor, acts_tensor, rews_tensor, done_tensor
-    
-    
     
     def sample_data_recent(self, batch_size):
         # sample most recent data from replay buffer

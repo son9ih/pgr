@@ -74,7 +74,6 @@ def compute_dynamic_mse_from_diffusion_buffer(
     obs2 = batch["obs2"]
     rews = batch["rews"]
 
-    # Ensure gt_env is initialized once (some envs require reset before use)
     gt_env.reset()
 
     next_obs_gt = np.zeros_like(obs2, dtype=np.float64)
@@ -83,16 +82,13 @@ def compute_dynamic_mse_from_diffusion_buffer(
 
     unwrapped = getattr(gt_env, "unwrapped", gt_env)
 
-    # refactoring later
     for i in range(obs1.shape[0]):
         state = obs1[i]
         action = acts[i]
 
-        # 1) Try env.reset(state=state) style API (works for custom MuJoCo/DMC envs like in env_test.py)
         reset_ok = False
         try:
             unwrapped.reset(state=state)
-            print(f'reset_ok: {reset_ok}')
             reset_ok = True
         except TypeError:
             reset_ok = False
@@ -100,9 +96,7 @@ def compute_dynamic_mse_from_diffusion_buffer(
             reset_ok = False
             
         if not reset_ok:
-            print(f'reset_ok is False')
             if not _mujoco_set_state_from_obs(gt_env, state):
-                print(f'_mujoco_set_state_from_obs is False')
                 continue
 
         try:

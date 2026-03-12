@@ -11,35 +11,27 @@ import gin
 import gym
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
+
 from gym.wrappers.flatten_observation import FlattenObservation
-from redq.algos.core import mbpo_epoches, test_agent
+from redq.algos.core import test_agent
 from redq.utils.bias_utils import log_bias_evaluation
 from redq.utils.logx import EpochLogger
 from redq.utils.run_utils import setup_logger_kwargs
-from synther.diffusion.elucidated_diffusion import REDQCondTrainer
-from synther.diffusion.diffusion_generator import CondDiffusionGenerator
-from synther.diffusion.utils import construct_diffusion_model
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
 
 import wandb
 from synther.online.utils import PBE, RMS, compute_intr_reward
-import pdb
-
 
 from synther.diffusion.diffusion import DiffusionModel, QFlow
-from synther.diffusion.elucidated_diffusion import REDQCondTrainer, CondDistri_RND, CondDistri, CondDistri_ECO
+from synther.diffusion.elucidated_diffusion import  CondDistri_RND, CondDistri
 from synther.online.utils import PBE, RMS, compute_intr_reward, make_inputs_from_replay_buffer
-from synther.diffusion.utils import construct_diffusion_model, split_diffusion_samples
-from synther.diffusion.norm import MinMaxNormalizer
+from synther.diffusion.utils import split_diffusion_samples
 from synther.online.utils_dyn import compute_dynamic_mse_from_diffusion_buffer
 from ema_pytorch import EMA
 from tqdm import tqdm
-import random
 
-# For Dynamic MSE logging
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 @gin.configurable
@@ -91,7 +83,7 @@ def redq_sac(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training using device: {device}")
     
-    if env_name in ['finger-turn_hard-v0', 'finger-turn_easy-v0']:
+    if env_name in ['finger-turn_hard-v0']:
         epochs = 300
     else:
         epochs = 100
@@ -105,59 +97,7 @@ def redq_sac(
         wandb.init(
             project = env_name,
             group = f'REGR+{args.novelty_measure}',
-            name = run_name,
-            config={
-                "env_name": env_name,
-                "polyak": polyak,
-                "alpha": alpha,
-                "auto_alpha": auto_alpha,
-                "target_entropy": target_entropy,
-                "start_steps": start_steps,
-                "delay_update_steps": delay_update_steps,
-                "utd_ratio": utd_ratio,
-                "num_Q": num_Q,
-                "num_min": num_min,
-                "q_target_mode": q_target_mode,
-                "policy_update_delay": policy_update_delay,
-                "diffusion_buffer_size": diffusion_buffer_size,
-                "diffusion_sample_ratio": diffusion_sample_ratio,
-                "retrain_diffusion_every": retrain_diffusion_every,
-                "num_samples": num_samples,
-                "disable_diffusion": disable_diffusion,
-                "cfg_dropout": cfg_dropout,
-                "cond_top_frac": cond_top_frac,
-                "cfg_scale": cfg_scale,
-                "cond_hidden_size": cond_hidden_size,
-                # Arguments from parser
-                "seed": args.seed,
-                "wandb": args.wandb,
-                "synther": args.synther,
-                "knn_clip": args.knn_clip,
-                "knn_k": args.knn_k,
-                "ent_eval_num": args.ent_eval_num,
-                "novelty_measure": args.novelty_measure,
-                "diffusion_steps": args.diffusion_steps,
-                "num_prior_epochs": args.num_prior_epochs,
-                "num_posterior_epochs": args.num_posterior_epochs,
-                "training_posterior": args.training_posterior,
-                "train_batch_size": args.train_batch_size,
-                "sample_batch_size": args.sample_batch_size,
-                "prior_lr_scheduler": args.prior_lr_scheduler,
-                "rtb_lr_scheduler": args.rtb_lr_scheduler,
-                "prior_adam_betas": list(args.prior_adam_betas),
-                "rtb_adam_betas": list(args.rtb_adam_betas),
-                "prior_lr": args.prior_lr,
-                "finetune_lr": args.finetune_lr,
-                "alpha_rtb": args.alpha_rtb,
-                "accumulation_steps": args.accumulation_steps,
-                "ft_batch_size": args.ft_batch_size,
-                "inter_onpolicy": args.inter_onpolicy,
-                "ddim": args.ddim,
-                "eta": args.eta,
-                "clip_reward": args.clip_reward,
-                "ft_clip_grad": args.ft_clip_grad,
-                "anneal": args.anneal,
-            }
+            name = run_name
         )
         print(f'Initialized wandb with run name {run_name}')
 
@@ -169,7 +109,6 @@ def redq_sac(
     """set up environment and seeding"""
     env_fn = lambda: wrap_gym(gym.make(env_name))
     env, test_env, bias_eval_env = env_fn(), env_fn(), env_fn()
-    # Separate env instance used for "ground-truth" one-step dynamics/reward evaluation
     gt_dyn_env = env_fn()
     print(f"Environment: {env_name} | Seed: {seed}")
     torch.manual_seed(seed)
@@ -203,7 +142,6 @@ def redq_sac(
     env_time_limit = get_time_limit(env)
     max_ep_len = env_time_limit if max_ep_len > env_time_limit else max_ep_len
     act_limit = env.action_space.high[0].item()
-    # flush logger (optional)
     sys.stdout.flush()
     
     agent = REDQRLPDCondAgent(cond_hidden_size, diffusion_buffer_size, diffusion_sample_ratio, env_name, obs_dim, act_dim, act_limit, device,
@@ -218,7 +156,7 @@ def redq_sac(
     
     # pbe for state entropy evaluation
     rms = RMS(device=torch.device('cpu'))
-    pbe = PBE(rms, args.knn_clip, args.knn_k, device=torch.device('cpu'))
+    pbe = PBE(rms, args.knn_k, device=torch.device('cpu'))
 
     # set up diffusion model
     diff_dims = obs_dim + act_dim + 1 + obs_dim
@@ -256,7 +194,7 @@ def redq_sac(
 
         if d or (ep_len == max_ep_len):
             
-            # train RND representation network
+            # train RND encoder
             if args.novelty_measure == 'rnd':
                 agent.pred_net.train()
                 agent.train_pred_net(batch_size=steps_per_epoch, mask=True)
@@ -299,7 +237,6 @@ def redq_sac(
                 )
             
             all_novelty_list = []
-            # sample every data in replay buffer, for computing test function y
             ptr_location = agent.replay_buffer.ptr
             
             test_function_x_np = make_inputs_from_replay_buffer(agent.replay_buffer, model_terminals=model_terminals)
@@ -316,7 +253,6 @@ def redq_sac(
             all_done = test_function_x[:, obs_dim+act_dim+1:obs_dim+act_dim+2]
             all_obs = test_function_x[:, :obs_dim]
             
-            # compute test function y for all data in replay buffer
             batch_size_novelty = 4096
             with torch.no_grad():
                 for i in range(0, ptr_location, batch_size_novelty):
@@ -340,7 +276,6 @@ def redq_sac(
                     all_novelty_list.append(batch_novelty)
                 test_function_y = np.concatenate(all_novelty_list)    
             
-            # test_function_x is already a tensor, just convert y
             test_function_x_tensor = test_function_x
             test_function_y_tensor = torch.FloatTensor(test_function_y)
             # clip novelty outliers
@@ -351,10 +286,10 @@ def redq_sac(
                 test_function_y_percentile = None
             
             if args.novelty_measure == 'curiosity':
-                cond_distri = CondDistri(agent.cond_net, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
+                cond_distri = CondDistri(agent.cond_net, args.train_batch_size, agent.replay_buffer, cond_top_frac)
             elif args.novelty_measure == 'rnd':
                 agent.fix_net.eval()
-                cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, args.cond_top_frac)
+                cond_distri = CondDistri_RND(agent, args.train_batch_size, agent.replay_buffer, cond_top_frac)
             else:
                 raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
             prior_model.update_normalizer(agent.replay_buffer, device=device, model_terminals=model_terminals)
@@ -362,7 +297,7 @@ def redq_sac(
             prior_model.update_cond_normalizer(cond_distri, device=device)
             prior_ema.ema_model.update_cond_normalizer(cond_distri, device=device)
             
-            # Calculate current epoch for logging
+            # Current epoch
             cur_epoch = t // steps_per_epoch
             
             print(f"[Diffusion-DDPM] Prior training start (cur_epoch={cur_epoch}, num_prior_epochs={args.num_prior_epochs})")
@@ -375,7 +310,6 @@ def redq_sac(
                 actions = b['acts']
                 rewards = b['rews'][:, None]
                 done = b['done'][:, None]
-                # cond_signal = b['irews'][:, None]
 
                 data = [obs, actions, rewards, next_obs]
                 if model_terminals:
@@ -390,7 +324,6 @@ def redq_sac(
                 torch.nn.utils.clip_grad_norm_(prior_model.parameters(), 1.0)
                 prior_model_optimizer.step()
                 
-                # update learning rate scheduler
                 if prior_model_lr_scheduler is not None:
                     prior_model_lr_scheduler.step()
                 # update EMA model
@@ -408,7 +341,6 @@ def redq_sac(
             
             
             
-            # rtb fine-tuning
             alpha_rtb = args.alpha_rtb
             
             # Choose different reward function to optimize
@@ -464,7 +396,7 @@ def redq_sac(
                         s1 = (s1+1) % 2
                     elif args.training_posterior == "on":
                         s1 = 0
-                    else: # fine-tuning only on samples from R.B
+                    else: # fine-tuning only on samples from buffer
                         s1 = 1
                     
                     # Gradient accumulation settings
@@ -576,52 +508,16 @@ def redq_sac(
             X_sample = torch.clamp(X_sample, -1., 1.)
                 
             X_sample_unnorm = prior_model.normalizer.unnormalize(X_sample)
-            if isinstance(X_sample_unnorm, torch.Tensor):
-                print(f'X_sample_unnorm is a tensor')
-                X_sample_unnorm_np = X_sample_unnorm.cpu().numpy()
-            else:
-                print(f'X_sample_unnorm is not a tensor')
-                X_sample_unnorm_np = X_sample_unnorm
+            X_sample_unnorm_np = X_sample_unnorm.cpu().numpy()
             
             transitions = split_diffusion_samples(X_sample_unnorm_np, env, modelled_terminals=model_terminals)
             if len(transitions) == 4:
-                print(f'transitions is 4')
                 obs, act, rew, next_obs = transitions
-                # Convert to numpy if tensors
-                if isinstance(next_obs, torch.Tensor):
-                    print(f'next_obs is a tensor')
-                    next_obs = next_obs.cpu().numpy()
-                else:
-                    print(f'next_obs is not a tensor')
                 terminal = np.zeros_like(next_obs[:, 0])
             else:
-                print(f'transitions is not 4')
                 obs, act, rew, next_obs, terminal = transitions
-                # Convert to numpy if tensors
-                if isinstance(next_obs, torch.Tensor):
-                    print(f'next_obs is a tensor')
-                    next_obs = next_obs.cpu().numpy()
-                if isinstance(terminal, torch.Tensor):
-                    print(f'terminal is a tensor')
-                    terminal = terminal.cpu().numpy()
             
-            # Convert all to numpy arrays if they're tensors
-            if isinstance(obs, torch.Tensor):
-                print(f'obs is a tensor')
-                obs = obs.cpu().numpy()
-            if isinstance(act, torch.Tensor):
-                print(f'act is a tensor')
-                act = act.cpu().numpy()
-            if isinstance(rew, torch.Tensor):
-                print(f'rew is a tensor')
-                rew = rew.cpu().numpy()
-            if isinstance(next_obs, torch.Tensor):
-                print(f'next_obs is a tensor')
-                next_obs = next_obs.cpu().numpy()
-            if isinstance(terminal, torch.Tensor):
-                print(f'terminal is a tensor')
-                terminal = terminal.cpu().numpy()
-                
+            
             observations = np.array(obs).squeeze()
             actions = np.array(act).squeeze()
             rewards = np.array(rew).squeeze()
@@ -765,55 +661,34 @@ if __name__ == '__main__':
     parser.add_argument('--gin_config_files', nargs='*', type=str,
                         default=['config/online/sac_synther_dmc.gin'])
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
-    
-    # Additional arguments
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--wandb', action='store_true', default=False)
-    parser.add_argument('--synther', action='store_true', default=False)
-    
-    parser.add_argument('--knn_clip', type=float, default=0.0)
     parser.add_argument('--knn_k', type=int, default=12)
-    parser.add_argument('--knn_avg', action='store_true', default=False) # default: True
-    parser.add_argument('--knn_rms', action='store_true', default=False)
-    parser.add_argument('--ent_eval_num', type=int, default=5000)
-    
     parser.add_argument('--novelty_measure', type=str, default='curiosity')
+    parser.add_argument('--clip_reward', type=float, default=0.95)
     
-    # new arguments
+    # training
     parser.add_argument('--diffusion_steps', type=int, default=1000)
     parser.add_argument('--num_prior_epochs', type=int, default=100000)
     parser.add_argument('--num_posterior_epochs', type=int, default=50)
     parser.add_argument('--training_posterior', type=str, default='both') # 'both', 'on', 'off'
-    
     parser.add_argument('--train_batch_size', type=int, default=256)
-    parser.add_argument('--num_samples', type=int, default=1000000)
-    parser.add_argument('--sample_batch_size', type=int, default=100000)
+    parser.add_argument('--ft_batch_size', type=int, default=1024)
     parser.add_argument('--prior_lr_scheduler', type=str, default='cosine')
     parser.add_argument('--rtb_lr_scheduler', type=str, default='cosine')
     parser.add_argument('--prior_adam_betas', type=tuple, default=(0.9, 0.99))
     parser.add_argument('--rtb_adam_betas', type=tuple, default=(0.9, 0.99))
-    
     parser.add_argument('--prior_lr', type=float, default=3e-4)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
     parser.add_argument('--ft_clip_grad', type=float, default=1.0)
     parser.add_argument('--alpha_rtb', type=float, default=1.0)
-    parser.add_argument('--cond_top_frac', type=float, default=0.25)
+    parser.add_argument('--accumulation_steps', type=int, default=1)
     
-    
-    parser.add_argument('--accumulation_steps', type=int, default=2)
-    parser.add_argument('--ft_batch_size', type=int, default=256)
-    
-    parser.add_argument('--inter_onpolicy', type=float, default=0.1)
-    
+    # sampling
+    parser.add_argument('--num_samples', type=int, default=1000000)
+    parser.add_argument('--sample_batch_size', type=int, default=100000)
     parser.add_argument('--ddim', action='store_true', default=False)
     parser.add_argument('--eta', type=float, default=1.0)
-    parser.add_argument('--clip_reward', type=float, default=0.95)
-    
-    parser.add_argument('--anneal', action='store_true', default=False)
-
-    # Dynamic MSE logging (synthetic transition plausibility)
-    parser.add_argument('--dynamic_mse_samples', type=int, default=5000)
-    parser.add_argument('--dynamic_mse_every', type=int, default=1)
     
     args = parser.parse_args()
     

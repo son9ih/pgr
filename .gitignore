@@ -180,3 +180,7 @@ cython_debug/
 *.yaml
 *.ckpt
 *.sh
+*.csv
+*.pdf
+*.parquet
+*.pyc

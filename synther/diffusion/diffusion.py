@@ -11,13 +11,10 @@ from synther.diffusion.norm import normalizer_factory
 from redq.algos.core import ReplayBuffer
 from synther.online.utils import make_inputs_from_replay_buffer
 
-# new
 import math
 from einops import rearrange
 import gin
 from torch.distributions import Bernoulli
-
-import pdb
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -61,40 +58,14 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.linear = nn.Linear(dim_in, dim_out, bias=True)
         if layer_norm:
-            # when we use layer norm,
             self.ln = nn.LayerNorm(dim_in)
         else:
-            # current style
             self.ln = torch.nn.Identity()
         self.activation = getattr(F, activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.linear(self.activation(self.ln(x)))
     
-    
-# class ResidualMLP(nn.Module):
-#     def __init__(
-#             self,
-#             input_dim: int,
-#             width: int,
-#             depth: int,
-#             output_dim: int,
-#             activation: str = "gelu",
-#             layer_norm: bool = False,
-#     ):
-#         super().__init__()
-
-#         self.network = nn.Sequential(
-#             nn.Linear(input_dim, width),
-#             *[ResidualBlock(width, width, activation, layer_norm) for _ in range(depth)],
-#             nn.LayerNorm(width) if layer_norm else torch.nn.Identity(),
-#         )
-
-#         self.activation = getattr(F, activation)
-#         self.final_linear = nn.Linear(width, output_dim)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         return self.final_linear(self.activation(self.network(x)))    
 
 class ResidualMLP(nn.Module):
     def __init__(
@@ -128,65 +99,6 @@ class ResidualMLP(nn.Module):
             x = layer(x)
         return self.final_linear(self.activation(x))
 
-# @gin.configurable
-# class QFlowMLP(nn.Module):
-#     def __init__(self, x_dim, hidden_dim=512, is_qflow=False, q_net=None, beta=None, dtype = torch.float32):
-#         super(QFlowMLP, self).__init__()
-#         self.is_qflow = is_qflow
-#         self.q = q_net
-#         self.beta = beta
-
-#         # self.x_model = nn.Sequential(
-#         #     nn.Linear(x_dim + 128, hidden_dim, dtype=dtype), nn.GELU(), nn.Linear(hidden_dim, hidden_dim, dtype=dtype), nn.GELU()
-#         # )
-
-#         # self.out_model = nn.Sequential(
-#         #     nn.Linear(hidden_dim, hidden_dim, dtype=dtype),
-#         #     nn.LayerNorm(hidden_dim, dtype=dtype),
-#         #     nn.GELU(),
-#         #     nn.Linear(hidden_dim, x_dim, dtype=dtype),
-#         # )
-
-#         self.proj = nn.Linear(x_dim, hidden_dim)
-#         self.residual_mlp = ResidualMLP(
-#             input_dim=hidden_dim + 128,
-#             width=hidden_dim,
-#             depth=3,
-#             output_dim=x_dim,
-#             activation="gelu",
-#             layer_norm=True,
-#         )
-
-#         self.means_scaling_model = nn.Sequential(
-#             nn.Linear(128, hidden_dim // 2, dtype=dtype),
-#             nn.LayerNorm(hidden_dim // 2, dtype=dtype),
-#             nn.GELU(),
-#             nn.Linear(hidden_dim // 2, hidden_dim // 2, dtype=dtype),
-#             nn.LayerNorm(hidden_dim // 2, dtype=dtype),
-#             nn.GELU(),
-#             nn.Linear(hidden_dim // 2, x_dim, dtype=dtype),
-#         )
-
-#         self.harmonics = nn.Parameter(torch.arange(1, 64 + 1, dtype=dtype) * 2 * np.pi).requires_grad_(False)
-
-#     def forward(self, x, t):
-#         t_fourier1 = (t.unsqueeze(1) * self.harmonics).sin()
-#         t_fourier2 = (t.unsqueeze(1) * self.harmonics).cos()
-#         t_emb = torch.cat([t_fourier1, t_fourier2], 1)
-#         # if not self.is_qflow:
-#         #     x_emb = self.x_model(torch.cat([x, t_emb], 1))
-#         # if self.is_qflow:
-#         #     # with torch.no_grad():
-#         #     x_emb = self.x_model(torch.cat([x, t_emb], 1))
-#         #     with torch.enable_grad():
-#         #         x.requires_grad_(True)
-#         #         means_scaling = self.means_scaling_model(t_emb) * self.q.score(x, beta=self.beta)
-#         #     return self.out_model(x_emb) + means_scaling
-#         # return self.out_model(x_emb)
-#         # x = self.proj(x) + t_emb
-#         # problem: needs debugging
-#         x = torch.cat([self.proj(x), t_emb], 1)
-#         return self.residual_mlp(x)
 
 @gin.configurable
 class QFlowMLP(nn.Module):
@@ -199,9 +111,7 @@ class QFlowMLP(nn.Module):
             learned_sinusoidal_cond: bool = False,
             random_fourier_features: bool = True,
             learned_sinusoidal_dim: int = 16,
-            # gin referenced activation: mish
             activation: str = "mish",
-            # activation: str = "gelu",
             layer_norm: bool = True,
             cond_dim: int = None,
             cfg_dropout: float = 0.25,
@@ -209,15 +119,11 @@ class QFlowMLP(nn.Module):
         super().__init__()
         self.residual_mlp = ResidualMLP(
             input_dim=d_in,
-            # including both time and cond embeddings
             cond_dim=dim_t * 2,
             width=mlp_width,
             depth=num_layers,
             output_dim=d_in,
-            # activation="gelu",
             activation=activation,
-            # in pgr, originally false
-            # layer_norm=True,
             layer_norm=layer_norm,
         )
         assert cond_dim is not None, "Conditional denoiser constructor requires cond_dim"
@@ -259,11 +165,8 @@ class QFlowMLP(nn.Module):
         t = self.time_mlp(timesteps)
         
         if cond is not None:
-            
-            # pdb.set_trace()
             c = self.cond_mlp(cond)
             
-            # Do conditional dropout during training
             if self.training:
                 mask = self.cond_dropout.sample(sample_shape=(c.shape[0], 1)).to(c.device)
                 c = c * mask
@@ -280,8 +183,6 @@ class DiffusionModel(nn.Module):
     def __init__(self, x_dim, diffusion_steps, inputs, skip_dims, disable_terminal_norm=False, schedule="linear", predict="epsilon", policy_net="mlp", 
                  hidden_dim=1024, dtype=torch.float32, cond_dim=1, cfg_dropout=0.25, eta=0.0):
         super(DiffusionModel, self).__init__()
-        # ================================
-        # new things
         self.inputs = inputs
         self.skip_dims = skip_dims
         self.disable_terminal_norm = disable_terminal_norm
@@ -292,20 +193,15 @@ class DiffusionModel(nn.Module):
                 self.skip_dims.append(terminal_dim)
         if skip_dims:
             print(f"Skipping normalization for dimensions {self.skip_dims}.")
-        # normalizer of pgr 
         self.normalizer = normalizer_factory('minmax', inputs, skip_dims=self.skip_dims)
-        # cond normalizer for conditional generation
         cond_inputs = torch.zeros((128, cond_dim)).float()
         self.cond_normalizer = normalizer_factory('minmax', cond_inputs, skip_dims=[])
-        # ================================
         self.x_dim = x_dim
         self.diffusion_steps = diffusion_steps
         self.schedule = schedule
         self.dtype = dtype
-        # QFlowMLP requires cond_dim, default to 1 if not provided
         if cond_dim is None:
             cond_dim = 1
-        # this initialization is carefully designed w.r.t. PGR
         self.policy = QFlowMLP(d_in=x_dim, dim_t=256, mlp_width=hidden_dim, num_layers=6, cond_dim=cond_dim, cfg_dropout=cfg_dropout)
         self.predict = predict
         if self.schedule == "linear":
@@ -359,31 +255,23 @@ class DiffusionModel(nn.Module):
             eval: if True, disable dropout during sampling
         """
         with torch.no_grad():
-            # if ddim:
-            #     # TODO: Implement DDIM sampling
-            #     pass
             if ddim:
-                # --- DDIM hyperparams ---
-                ddim_steps = self.ddim_steps        # 원하는 step 수 (1000 -> 128)
-                eta = self.eta              # 0.0: deterministic DDIM, >0.0: stochastic DDIM
-                # ------------------------
+                ddim_steps = self.ddim_steps      
+                eta = self.eta             
 
                 x = torch.randn(bs, self.x_dim, dtype=self.dtype, device=device)
 
                 T = self.diffusion_steps
                 assert ddim_steps <= T
 
-                # 1000-step index 중 128개를 고름 (i=0 noisy -> i=T-1 clean 방향 유지)
                 idxs = torch.linspace(0, T - 1, steps=ddim_steps, device=device).long()
 
                 for k in range(ddim_steps):
                     i = idxs[k].item()
                     j = idxs[k + 1].item() if k < ddim_steps - 1 else None
 
-                    # training에서 썼던 time encoding과 동일하게: t = i / T
                     t = torch.full((bs,), float(i) / float(T), dtype=self.dtype, device=device)
 
-                    # ----- epsilon prediction (CFG 지원) -----
                     if cond is not None and cfg_scale is not None:
                         eps_uncond = self(x, t, cond=None)
                         cond_input = cond.unsqueeze(-1) if cond.dim() == 1 else cond
@@ -391,25 +279,20 @@ class DiffusionModel(nn.Module):
                         eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
                     else:
                         eps = self(x, t, cond=cond)
-                    # ----------------------------------------
-
-                    # ----- DDIM uses alphabar directly -----
+                        
                     abar_i = self.alphabar_t[i]  # scalar tensor
                     sqrt_abar_i = torch.sqrt(abar_i)
                     sqrt_one_m_abar_i = torch.sqrt(1.0 - abar_i)
 
-                    # x0 prediction: x0 = (x - sqrt(1-abar)*eps) / sqrt(abar)
                     x0 = (x - sqrt_one_m_abar_i * eps) / (sqrt_abar_i + 1e-12)
 
                     if j is None:
-                        # 마지막은 x0를 반환하는 게 보통 가장 안정적
                         x = x0
                         break
 
                     abar_j = self.alphabar_t[j]
                     sqrt_abar_j = torch.sqrt(abar_j)
 
-                    # eta로 sigma 조절 (eta=0이면 0)
                     if eta > 0.0:
                         sigma = eta * torch.sqrt(
                             torch.clamp(
@@ -420,45 +303,25 @@ class DiffusionModel(nn.Module):
                     else:
                         sigma = torch.zeros((), dtype=self.dtype, device=device)
 
-                    # direction coefficient
                     c = torch.sqrt(torch.clamp(1.0 - abar_j - sigma * sigma, min=0.0))
-
                     noise = torch.randn_like(x, dtype=self.dtype, device=device) if eta > 0.0 else 0.0
-
-                    # DDIM update: x_j
                     x = sqrt_abar_j * x0 + c * eps + sigma * noise
 
-                # # DDIM 끝나면 x가 sample
-                # return x
 
             else:
                 x = torch.randn(bs, self.x_dim, dtype=self.dtype, device=device)
                 t = torch.zeros((bs,), dtype=self.dtype, device=device)
                 dt = 1 / self.diffusion_steps
-                
-                # assumes that time t, when denoising, start from 0 to 1
-                # It means, when training, variance or betas are larger in t=1
                 for i in range(self.diffusion_steps):
-                    # Classifier-free guidance: combine unconditional and conditional scores
                     if cond is not None and cfg_scale is not None:
-                        # print("Now conditioned generation")
-                        # Compute unconditional score (cond=None)
                         epsilon_uncond = self(x, t, cond=None)
                             
                         cond_input = cond.unsqueeze(-1) if cond.dim() == 1 else cond
                         epsilon_cond = self(x, t, cond=cond_input)
-                        # pdb.set_trace()
-                        
-                        # Combine scores using classifier-free guidance formula:
-                        # epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
-                        # This can be rewritten as:
-                        # epsilon = (1 + cfg_scale) * epsilon_cond - cfg_scale * epsilon_uncond
                         epsilon = epsilon_uncond + cfg_scale * (epsilon_cond - epsilon_uncond)
                     else:
-                        # No guidance: use conditional or unconditional score directly
                         epsilon = self(x, t, cond=cond)
                     
-                    # if it is the last step, no noise is added
                     if i < self.diffusion_steps - 1:
                         if self.predict == "epsilon":
                             x = self.oneover_sqrta[i] * (x - self.mab_over_sqrtmab_inv[i] * epsilon) + torch.sqrt(
@@ -480,29 +343,21 @@ class DiffusionModel(nn.Module):
             
         return x
 
-    # code for training prior or on-policy posterior training
     def compute_loss(self, x, cond=None):
         t_idx = torch.randint(0, self.diffusion_steps, (x.shape[0], 1)).to(x.device)
-        # continuous time index 0 to 1
         t = t_idx.float().squeeze(1) / self.diffusion_steps
         epsilon = torch.randn_like(x, dtype=self.dtype).to(x.device)
-        # t_idx가 0일때, sqrtmab[t_idx]가 제일 커야함. 이게 중요함.
         x_t = self.sqrtab[t_idx] * x + self.sqrtmab[t_idx] * epsilon
-        # for debugging
-        # t: training is aligned with sampling
-        # t_idx_first = t_idx[0]
-        # print(f'self.sqrtab[{t_idx_first}]: {self.sqrtmab[t_idx_first]}')
-        # pdb.set_trace()
-        # if cond is 1D tensor, we need to expand it to 2D tensor
         if cond is not None and cond.dim() == 1:
             cond = cond.unsqueeze(-1)
+            
         epsilon_pred = self(x_t, t, cond=cond)
+        
         if self.predict == "epsilon":
             w = torch.minimum(
                 torch.tensor(5, dtype=self.dtype) / ((self.sqrtab[t_idx] / self.sqrtmab[t_idx]) ** 2), torch.tensor(1, dtype=self.dtype)
-            )  # Min-SNR-gamma weights
+            ) 
             loss = (w * (epsilon - epsilon_pred) ** 2).mean()
-        # we are not using x0
         elif self.predict == "x0":
             w = torch.minimum((self.sqrtab[t_idx] / self.sqrtmab[t_idx]) ** 2, torch.tensor(5, dtype=self.dtype))
             loss = (w * (x - epsilon_pred) ** 2).mean()
@@ -511,22 +366,16 @@ class DiffusionModel(nn.Module):
     def update_normalizer(self, buffer: ReplayBuffer, device=None, model_terminals=False):
         data = make_inputs_from_replay_buffer(buffer, model_terminals=model_terminals)
         data = torch.from_numpy(data).float()
-        # self.model.normalizer.reset(data)
         self.normalizer.reset(data)
-        # self.ema.ema_model.normalizer.reset(data)
         if device:
-            # self.model.normalizer.to(device)
             self.normalizer.to(device)
-            # self.ema.ema_model.normalizer.to(device)
             
     def update_cond_normalizer(self, cond_distri, device=None):
         data = cond_distri.irews_buf[:, None]
         data = torch.from_numpy(data).float()
         self.cond_normalizer.reset(data)
-        # self.ema.ema_model.cond_normalizer.reset(data)
         if device:
             self.cond_normalizer.to(device)
-            # self.ema.ema_model.cond_normalizer.to(device)
 
 class QFlow(nn.Module):
     def __init__(
@@ -553,17 +402,13 @@ class QFlow(nn.Module):
         self.x_dim = x_dim
         self.diffusion_steps = diffusion_steps
         self.schedule = schedule
-        # self.predict = predict
         self.logZ = torch.nn.Parameter(torch.tensor(0.0, dtype=dtype))
         self.q_net = q_net
         self.bc_net = bc_net
         self.qflow = copy.deepcopy(bc_net.policy)
-        # Convert qflow to the correct dtype to match QFlow's dtype
         self.qflow = self.qflow.to(dtype=dtype)
         for p in self.qflow.parameters():
             p.requires_grad_(True)
-        # self.qflow.is_qflow = True  # This makes things more than 1.5x slower
-        # This appears to be not used
         self.qflow.q = q_net
         self.qflow.beta = beta
 
@@ -571,18 +416,10 @@ class QFlow(nn.Module):
         self.beta = beta
         self.dtype = dtype
         
-        # hyperparameters for reward function
-        self.square = square
-        self.pow_reward = pow_reward
-        
-        # Store dimensions for extracting next_obs from tensor
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         
-        # Store novelty measure
         self.novelty_measure = novelty_measure
-        
-        # on-policyness measure
         self.agent = agent
         
         self.cond_normalizer = bc_net.cond_normalizer
@@ -598,7 +435,6 @@ class QFlow(nn.Module):
         self.ddim_steps = 100
 
     def forward(self, x, t, cond=None):
-        # problem: needs debugging
         q_epsilon = self.qflow(x, t, cond=cond)
         with torch.no_grad():
             bc_epsilon = self.bc_net(x, t, cond=cond).detach()
@@ -607,11 +443,6 @@ class QFlow(nn.Module):
     def sample(self, bs, device, extra=False, eval=False, cond=None):
         if eval:
             with torch.no_grad():
-                # if ddim:
-                #     # TODO: Implement DDIM sampling
-                #     pass
-                
-                #     # return x
                 if self.ddim:
 
                     normal_dist = torch.distributions.Normal(
@@ -623,7 +454,6 @@ class QFlow(nn.Module):
                     T = self.diffusion_steps
                     assert self.ddim_steps <= T
 
-                    # 1000-step index 중 128개 선택 (0 noisy -> T-1 clean)
                     idxs = torch.linspace(0, T - 1, steps=self.ddim_steps, device=device).long()
 
                     extra_steps = 1
@@ -633,13 +463,8 @@ class QFlow(nn.Module):
                     for k in range(self.ddim_steps):
                         i = idxs[k].item()
                         j = idxs[k + 1].item() if k < self.ddim_steps - 1 else None
-
-                        # 학습과 동일한 t 정의
                         t = torch.full((bs,), float(i) / float(T), dtype=self.dtype, device=device)
 
-                        # 원래 코드처럼 extra refinement를 유지하고 싶으면,
-                        # 같은 t에서 여러 번 epsilon을 재평가할 수 있음.
-                        # (DDIM은 원래 1회 업데이트가 일반적이지만, 너 코드는 extra 옵션이 있으니 보존)
                         for _ in range(extra_steps):
                             q_eps, bc_eps = self(x, t, cond=cond)
                             eps = (q_eps + bc_eps).detach()
@@ -673,10 +498,7 @@ class QFlow(nn.Module):
 
                             # DDIM update
                             x = sqrt_abar_j * x0 + c * eps + sigma * noise
-
-                            # DDIM에서는 보통 extra loop를 돌 필요가 없어서,
-                            # extra_steps>1을 쓸 거면 "같은 i->j 이동을 여러 번 반복"하게 되는데,
-                            # 너 의도(약간 더 refine)라면 괜찮고, 아니라면 아래 break로 1회만 하자.
+                            
                             if not extra:
                                 break
 
@@ -693,21 +515,15 @@ class QFlow(nn.Module):
                     x = normal_dist.sample()
                     t = torch.zeros((bs,), device=device, dtype=self.dtype)
                     dt = 1 / self.diffusion_steps
-
-                    # logpf_pi = normal_dist.log_prob(x).sum(1)
-                    # logpf_p = normal_dist.log_prob(x).sum(1)
-                    # print(logpf_pi[:4])
                     extra_steps = 1
                     if extra:
                         extra_steps = 20
                     for i in range(self.diffusion_steps):
                         for j in range(extra_steps):
-                            # problem: needs debugging
                             q_epsilon, bc_epsilon = self(x, t, cond=cond)
 
                             epsilon = q_epsilon + bc_epsilon
                             
-                            # if it is the last step, no noise is added
                             if i < self.diffusion_steps - 1:
                                 new_x = self.bc_net.oneover_sqrta[i] * (
                                     x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
@@ -717,25 +533,6 @@ class QFlow(nn.Module):
                                 x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
                                 )
                                 
-                            # new_x = self.bc_net.oneover_sqrta[i] * (
-                            #     x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
-                            # ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
-                            
-                            
-                            
-
-                            # pf_pi_dist = torch.distributions.Normal(
-                            #     self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
-                            #     torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
-                            # )
-                            # logpf_pi += pf_pi_dist.log_prob(new_x).sum(1)
-
-                            # pf_p_dist = torch.distributions.Normal(
-                            #     self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
-                            #     torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
-                            # )
-                            # logpf_p += pf_p_dist.log_prob(new_x).sum(1)
-
                             x = new_x
                             if i < self.diffusion_steps - 1:
                                 break
@@ -743,7 +540,6 @@ class QFlow(nn.Module):
                 
                     return x
         
-        # This is for training   
         else:
             if self.ddim:
                 normal_dist = torch.distributions.Normal(
@@ -753,29 +549,18 @@ class QFlow(nn.Module):
                 x = normal_dist.sample()
                 T = self.diffusion_steps
                 assert self.ddim_steps <= T
-                # 1000-step index 중 128개 선택 (0 noisy -> T-1 clean)
                 
-                # original:
                 logpf_pi = normal_dist.log_prob(x).sum(1)
                 logpf_p = normal_dist.log_prob(x).sum(1)
-                # logpf_pi = normal_dist.log_prob(x).sum(1).clamp(min=-12.0, max=7.0)
-                # logpf_p = normal_dist.log_prob(x).sum(1).clamp(min=-12.0, max=7.0)
                 
-                # idx = 0, 8 ,16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,...
                 idxs = torch.linspace(0, T - 1, steps=self.ddim_steps, device=device).long()
                 extra_steps = 1
                 if extra:
                     extra_steps = 20
                 for k in range(self.ddim_steps):
-                    # i=0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,...
                     i = idxs[k].item()
-                    # j=8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, None,...
                     j = idxs[k + 1].item() if k < self.ddim_steps - 1 else None
-                    # 학습과 동일한 t 정의
                     t = torch.full((bs,), float(i) / float(T), dtype=self.dtype, device=device)
-                    # 원래 코드처럼 extra refinement를 유지하고 싶으면,
-                    # 같은 t에서 여러 번 epsilon을 재평가할 수 있음.
-                    # (DDIM은 원래 1회 업데이트가 일반적이지만, 너 코드는 extra 옵션이 있으니 보존)
                     for _ in range(extra_steps):
                         q_eps, bc_eps = self(x, t, cond=cond)
                         eps = (q_eps + bc_eps).detach()
@@ -791,25 +576,6 @@ class QFlow(nn.Module):
                         if j is None:
                             x = x0
                             break
-                        
-                        # abar_j = self.bc_net.alphabar_t[j]
-                        #     sqrt_abar_j = torch.sqrt(abar_j)
-
-                        #     if eta > 0.0:
-                        #         sigma = eta * torch.sqrt(
-                        #             torch.clamp(
-                        #                 (1.0 - abar_j) / (1.0 - abar_i + 1e-12) * (1.0 - abar_i / (abar_j + 1e-12)),
-                        #                 min=0.0,
-                        #             )
-                        #         )
-                        #     else:
-                        #         sigma = torch.zeros((), dtype=self.dtype, device=device)
-
-                        #     c = torch.sqrt(torch.clamp(1.0 - abar_j - sigma * sigma, min=0.0))
-                        #     noise = torch.randn_like(x, dtype=self.dtype, device=device) if eta > 0.0 else 0.0
-
-                        #     # DDIM update
-                        #     x = sqrt_abar_j * x0 + c * eps + sigma * noise
                         
                         abar_j = self.bc_net.alphabar_t[j]
                         sqrt_abar_j = torch.sqrt(abar_j)
@@ -830,7 +596,6 @@ class QFlow(nn.Module):
                         # DDIM update
                         x = sqrt_abar_j * x0 + c * eps + sigma * noise
                         
-                        # original:
                         pf_pi_dist = torch.distributions.Normal(
                             sqrt_abar_j * x0_bc + c * bc_eps,
                             sigma * torch.ones_like(x, dtype=self.dtype),
@@ -842,30 +607,7 @@ class QFlow(nn.Module):
                             sigma * torch.ones_like(x, dtype=self.dtype),
                         )
                         logpf_p += pf_p_dist.log_prob(x).sum(1)
-
-                        # pf_pi_dist = torch.distributions.Normal(
-                        #     sqrt_abar_j * x0_bc + c * bc_eps,
-                        #     sigma * torch.ones_like(x, dtype=self.dtype),
-                        #     # self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
-                        #     # torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(x, dtype=self.dtype),
-                        # )
-                        # logpf_pi_step = pf_pi_dist.log_prob(x).sum(1)
-                        # logpf_pi += logpf_pi_step.clamp(min=-12.0, max=7.0)
                         
-                        # pf_p_dist = torch.distributions.Normal(
-                        #     sqrt_abar_j * x0 + c * eps,
-                        #     sigma * torch.ones_like(x, dtype=self.dtype),
-                        #     # self.bc_net.oneover_sqrta[i] * (x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon),
-                        #     # torch.sqrt(self.bc_net.beta_t[i]) * torch.ones_like(new_x, dtype=self.dtype),
-                        # )
-                        # logpf_p_step = pf_p_dist.log_prob(x).sum(1)
-                        # logpf_p += logpf_p_step.clamp(min=-12.0, max=7.0)
-
-                        
-                        
-                        # DDIM에서는 보통 extra loop를 돌 필요가 없어서,
-                        # extra_steps>1을 쓸 거면 "같은 i->j 이동을 여러 번 반복"하게 되는데,
-                        # 너 의도(약간 더 refine)라면 괜찮고, 아니라면 아래 break로 1회만 하자.
                         if not extra:
                             break
                     if j is None:
@@ -884,13 +626,11 @@ class QFlow(nn.Module):
 
                 logpf_pi = normal_dist.log_prob(x).sum(1)
                 logpf_p = normal_dist.log_prob(x).sum(1)
-                # print(logpf_pi[:4])
                 extra_steps = 1
                 if extra:
                     extra_steps = 20
                 for i in range(self.diffusion_steps):
                     for j in range(extra_steps):
-                        # problem: needs debugging
                         q_epsilon, bc_epsilon = self(x, t)
 
                         epsilon = q_epsilon + bc_epsilon
@@ -914,10 +654,8 @@ class QFlow(nn.Module):
                         if i < self.diffusion_steps - 1:
                             break
                     t = t + dt
-                
-                # we don't need logpf_pi and logpf_p
                 return x, logpf_pi, logpf_p
-            # return x
+            
     
     def back_and_forth(self, x, ratio, device):
         # Back
@@ -1080,17 +818,10 @@ class QFlow(nn.Module):
         return ll_prior + delta_ll
         
     def posterior_log_reward(self, x):
-        # Handle both dict and tensor inputs
         if isinstance(x, dict):
-            # This will not be probably called
-            # Dict input: extract next_obs_tensor
             next_obs = x['next_obs_tensor']
             next_act = x['next_act_tensor']
         elif isinstance(x, torch.Tensor):
-            # This will probably be called
-            # Tensor input: extract next_obs from concatenated tensor
-            # x shape: [batch_size, obs_dim + act_dim + 1 + obs_dim]
-            # next_obs starts at obs_dim + act_dim + 1
             if self.obs_dim is not None and self.act_dim is not None:
                 next_obs_start = self.obs_dim + self.act_dim + 1
                 next_obs_end = next_obs_start + self.obs_dim
@@ -1102,15 +833,10 @@ class QFlow(nn.Module):
         else:
             raise TypeError(f"x must be dict or torch.Tensor, got {type(x)}")
         
-        # According to the measure of novelty, we use different code to compute q_r
-        # TODO
         if self.novelty_measure == 'curiosity':
             q_r = self.q_net(obs, next_obs, act).squeeze()
         elif self.novelty_measure == 'rnd':
             q_r = self.agent.compute_intrinsic_reward(next_obs).squeeze()
-        elif self.novelty_measure == 'eco':
-            # ECO uses current obs (according to paper: "takes the current observation o as input")
-            q_r = self.agent.compute_eco_reward(obs).squeeze()
         else:
             raise ValueError(f'Invalid novelty measure: {self.novelty_measure}')
         
@@ -1121,56 +847,35 @@ class QFlow(nn.Module):
         else:
             q_r = (self.cond_normalizer.normalize(q_r) + 1) / 2
         
-        
-        # Bound nice
-        print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
-        
         return q_r
     
     def combined_posterior_log_reward(self, x, alpha=0.1):
-        # alpha is the weight of the on-policyness reward
-        # TODO
         return 0.0
 
     def compute_loss_with_sample(self, x, device):
         if self.ddim:
             bs = x.shape[0]
-            # --- DDIM hyperparams ---
             ddim_steps = 100
             eta = self.eta
-            # ------------------------
             
             logpf_pi = torch.zeros((bs,), device=device, dtype=self.dtype)
             logpf_p = torch.zeros((bs,), device=device, dtype=self.dtype)
-            # I think we need to log here
-            # Also, we need to unnormalize x here
             x_unnormalized = self.bc_net.normalizer.unnormalize(x)
             logr = self.posterior_log_reward(x_unnormalized).log()
             
             T = self.diffusion_steps
             assert ddim_steps <= T
             
-            # 역방향으로 DDIM 인덱스 선택 (T-1 clean -> 0 noisy)
             idxs = torch.linspace(T - 1, 0, steps=ddim_steps, device=device).long()
             
-            # going to noisy x (reverse direction)
             for k in range(ddim_steps):
-                # i는 더 clean한 상태, j는 더 noisy한 상태
                 i = idxs[k].item()
                 j = idxs[k + 1].item() if k < ddim_steps - 1 else None
                 
-                # 학습과 동일한 t 정의
                 t = torch.full((bs,), float(i) / float(T), dtype=self.dtype, device=device)
                 
-                # pb_dist: x에서 new_x로 가는 forward diffusion (더 noisy하게)
-                # 원래 non-DDIM 버전과 동일한 방식으로 구현
-                # DDIM에서는 여러 스텝을 건너뛰지만, forward kernel은 원래 방식과 동일하게 유지
                 if j is not None:
-                    # i에서 j로 가는 forward diffusion을 순차적으로 수행
-                    # 원래 non-DDIM 버전: x_{i-1} ~ N(sqrt(alpha_t[i]) * x_i, sqrt(beta_t[i]))
-                    # DDIM 버전: i에서 j로 가는 모든 스텝을 순차적으로 수행
                     current_x = x
-                    # i > j이므로, i-1부터 j까지 순차적으로 forward diffusion
                     for step_idx in range(i - 1, j - 1, -1):
                         pb_dist = torch.distributions.Normal(
                             torch.sqrt(self.bc_net.alpha_t[step_idx]) * current_x,
@@ -1179,7 +884,6 @@ class QFlow(nn.Module):
                         current_x = pb_dist.sample()
                     new_x = current_x
                 else:
-                    # 마지막 단계: i에서 0까지 모든 스텝을 순차적으로 수행
                     current_x = x
                     for step_idx in range(i - 1, -1, -1):
                         pb_dist = torch.distributions.Normal(
@@ -1188,22 +892,18 @@ class QFlow(nn.Module):
                         )
                         current_x = pb_dist.sample()
                     new_x = current_x
-                
-                # new_x에서 epsilon 예측 (new_x는 j 상태이므로 j의 시간을 사용해야 함)
+                    
                 if j is not None:
                     t_j = torch.full((bs,), float(j) / float(T), dtype=self.dtype, device=device)
                     q_epsilon, bc_epsilon = self(new_x, t_j)
                     epsilon = q_epsilon + bc_epsilon
                     
-                    # DDIM 업데이트를 역으로 사용하여 proposal 분포 계산
-                    # new_x (x_j)에서 x (x_i)로 가는 proposal
                     abar_i = self.bc_net.alphabar_t[i]
                     abar_j = self.bc_net.alphabar_t[j]
                     sqrt_abar_i = torch.sqrt(abar_i)
                     sqrt_abar_j = torch.sqrt(abar_j)
                     sqrt_one_m_abar_j = torch.sqrt(1.0 - abar_j)
                     
-                    # x0 prediction from new_x (x_j 상태에서)
                     x0 = (new_x - sqrt_one_m_abar_j * epsilon) / (sqrt_abar_j + 1e-12)
                     x0_bc = (new_x - sqrt_one_m_abar_j * bc_epsilon) / (sqrt_abar_j + 1e-12)
                     
@@ -1219,9 +919,6 @@ class QFlow(nn.Module):
                     
                     c = torch.sqrt(torch.clamp(1.0 - abar_i - sigma * sigma, min=0.0))
                     
-                    # DDIM proposal: new_x (x_j)에서 x (x_i)로 가는 proposal
-                    # pf_pi_dist와 pf_p_dist는 x (현재 상태 x_i)에 대한 분포
-                    # original:
                     pf_pi_dist = torch.distributions.Normal(
                         sqrt_abar_i * x0_bc + c * bc_epsilon,
                         sigma * torch.ones_like(x, dtype=self.dtype),
@@ -1233,56 +930,33 @@ class QFlow(nn.Module):
                         sigma * torch.ones_like(x, dtype=self.dtype),
                     )
                     logpf_p += pf_p_dist.log_prob(x).sum(1)
-
-                    # pf_pi_dist = torch.distributions.Normal(
-                    #     sqrt_abar_i * x0_bc + c * bc_epsilon,
-                    #     sigma * torch.ones_like(x, dtype=self.dtype),
-                    # )
-                    # logpf_pi_step = pf_pi_dist.log_prob(x).sum(1)
-                    # logpf_pi += logpf_pi_step.clamp(min=-12.0, max=7.0)
                     
-                    # pf_p_dist = torch.distributions.Normal(
-                    #     sqrt_abar_i * x0 + c * epsilon,
-                    #     sigma * torch.ones_like(x, dtype=self.dtype),
-                    # )
-                    # logpf_p_step = pf_p_dist.log_prob(x).sum(1)
-                    # logpf_p += logpf_p_step.clamp(min=-12.0, max=7.0)
                 else:
-                    # 마지막 단계: prior 분포
                     prior_dist = torch.distributions.Normal(
                         torch.zeros_like(x, dtype=self.dtype),
                         torch.ones_like(x, dtype=self.dtype)
                     )
-                    # original:
                     logpf_pi += prior_dist.log_prob(x).sum(1)
                     logpf_p += prior_dist.log_prob(x).sum(1)
-                    # prior_logpf_pi = prior_dist.log_prob(x).sum(1)
-                    # prior_logpf_p = prior_dist.log_prob(x).sum(1)
-                    # logpf_pi += prior_logpf_pi.clamp(min=-12.0, max=7.0)
-                    # logpf_p += prior_logpf_p.clamp(min=-12.0, max=7.0)
                 
                 x = new_x
                 if j is None:
                     break
             
             loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
-            # loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha)) ** 2).mean()
+            
             return loss, self.logZ
         
         else:
             bs = x.shape[0]
-            # minlogvar, maxlogvar = -4, 4
             t = torch.zeros((bs,), device=device, dtype=self.dtype)
             dt = 1 / self.diffusion_steps
 
             logpf_pi = torch.zeros((bs,), device=device, dtype=self.dtype)
             logpf_p = torch.zeros((bs,), device=device, dtype=self.dtype)
-            # I think we need to log here
-            # Also, we need to unnormalize x here
             x_unnormalized = self.bc_net.normalizer.unnormalize(x)
             logr = self.posterior_log_reward(x_unnormalized).log()
             
-            # going to noisy x
             for i in range(self.diffusion_steps - 1, -1, -1):
                 pb_dist = torch.distributions.Normal(
                     torch.sqrt(self.bc_net.alpha_t[i]) * x,
@@ -1292,9 +966,6 @@ class QFlow(nn.Module):
 
                 q_epsilon, bc_epsilon = self(new_x, t + i * dt)
                 epsilon = q_epsilon + bc_epsilon
-                
-                # noised 샘플로 만든 proposal이 필요함
-                # 이걸 만드려면 j가 필요함
 
                 pf_pi_dist = torch.distributions.Normal(
                     self.bc_net.oneover_sqrta[i] * (new_x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
@@ -1313,25 +984,15 @@ class QFlow(nn.Module):
             logpf_pi += prior_dist.log_prob(x).sum(1)
             logpf_p += prior_dist.log_prob(x).sum(1)
             loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
-            # loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha)) ** 2).mean()
+            
             return loss, self.logZ
 
     def compute_loss(self, device, gfn_batch_size=512):
-        # return normalized samples x
         x, logpf_pi, logpf_p = self.sample(bs=gfn_batch_size, device=device)
-        # need to unnormalize x
-        # self.bc_net.normalizer is the prior normalizer
         x_unnormalized = self.bc_net.normalizer.unnormalize(x)
-        # I think we need to log here
         logr = self.posterior_log_reward(x_unnormalized)
-        # logr = self.bc_net.cond_normalizer.unnormalize(logr*2-1)
-        # print(f'logr: {logr}')
         logr = logr.log()
         
-        # print("logr finite:", torch.isfinite(logr).all().item())
-        # breakpoint()
-        # pdb.set_trace()
-        # logpf_p는 지금 1D tensor, 따라서 loss는 데이터 하나 당 평균 loss임, 이러면 data dimension이 큰 환경에서 loss가 커질 수 밖에 없는데
         loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha) / float(self.x_dim)) ** 2).mean()
-        # loss = 0.5 * (((self.logZ + logpf_p * self.alpha - logr.detach() - logpf_pi * self.alpha)) ** 2).mean()
+        
         return loss, self.logZ, x, logr

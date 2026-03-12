@@ -73,16 +73,11 @@ class Curiosity(nn.Module):
     def forward(self, state, next_state, action):
         encode_state = self.feature(state)
         encode_next_state = self.feature(next_state)
-        # get pred action
         pred_action = torch.cat((encode_state, encode_next_state), 1)
         pred_action = self.inverse_net(pred_action)
-        # ---------------------
-
-        # get pred next state
         pred_next_state_feature_orig = torch.cat((encode_state, action), 1)
         pred_next_state_feature_orig = self.forward_net_1(pred_next_state_feature_orig)
 
-        # residual
         for i in range(self.resnet_time):
             pred_next_state_feature = self.residual[i * 2](torch.cat((pred_next_state_feature_orig, action), 1))
             pred_next_state_feature_orig = self.residual[i * 2 + 1](
