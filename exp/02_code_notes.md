@@ -1,6 +1,6 @@
 # 02. 코드 맵 & 수정 방향
 
-기준 commit: `404186a` (fix: time logging consistency), branch `explore`.
+기준 commit: `242d57e`, branch `AAAI2027`.
 
 ---
 
@@ -20,8 +20,8 @@
 | [scripts/run.sh](../scripts/run.sh) | 런처. `bash scripts/run.sh <algo> <env|all> [seed ...]` → [04_script.md](04_script.md) |
 | `run_ori.sh` / `run_ori_ours.sh` / `run_abl.sh` | 구 런처 (untracked, `.gitignore`의 `*.sh`). `*_final` 실행값과 어긋남 — 참고용으로만 |
 
-`synther/online/`에는 위 3개 entry-point와 공용 모듈(`redq_rlpd_agent.py`,
-`conditional_nets.py`, `eco.py`, `utils.py`)만 남겼다. 삭제 목록은 §7.
+`synther/online/`에는 위 3개 entry-point와 `env_defaults.py`, 그리고 공용 모듈
+(`redq_rlpd_agent.py`, `conditional_nets.py`, `eco.py`, `utils.py`)만 남겼다. 삭제 목록은 §7.
 
 ## 2. 알고리즘 요약 (Ours)
 
@@ -67,7 +67,7 @@
 
 ---
 
-## 4. 현재 진행 중인 갈래 (untracked)
+## 4. 현재 진행 중인 갈래 (ablation)
 
 `online_cond_ddpm_ori_abl.py`는 `online_cond_ddpm_ori.py`와 **딱 3곳** 다르다:
 
