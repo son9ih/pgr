@@ -484,7 +484,21 @@ def redq_sac(
             # reset environment
             o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
-        if not disable_diffusion and (t + 1) % retrain_diffusion_every == 0 and (t + 1) >= diffusion_start:
+        # A retrain is only worth its cost if the resulting diffusion buffer still gets at
+        # least one epoch of agent updates before an evaluation. `retrain_diffusion_every`
+        # divides `steps_per_epoch * epochs` exactly, so without this guard the last
+        # retrain lands on the final logging step: prior training + `num_samples`
+        # generation run and then the run ends, with the epoch's metrics still reflecting
+        # the *previous* buffer. Pure waste. Kept identical to online_cond_ddpm_ori.py so
+        # the wall-clock comparison stays fair.
+        diffusion_retrain_useful = (total_steps - (t + 1)) >= steps_per_epoch
+        if (not disable_diffusion and (t + 1) % retrain_diffusion_every == 0
+                and (t + 1) >= diffusion_start and not diffusion_retrain_useful):
+            print(f'Skipping diffusion retrain at step {t + 1}: only '
+                  f'{total_steps - (t + 1)} step(s) left (< steps_per_epoch='
+                  f'{steps_per_epoch}), so the samples could not affect any logged metric.')
+        if (not disable_diffusion and (t + 1) % retrain_diffusion_every == 0
+                and (t + 1) >= diffusion_start and diffusion_retrain_useful):
             print(f'Retraining diffusion model at step {t + 1}')
             
             # ===========================================================================================================================

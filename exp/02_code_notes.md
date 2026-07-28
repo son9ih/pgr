@@ -183,6 +183,40 @@ DMC는 `env.unwrapped.physics.set_state()` / `get_state()`로 같은 걸 할 수
 `_mujoco_set_state_from_obs`에 dm_control 분기를 추가하면 8개 태스크 전부에서
 같은 그림을 그릴 수 있다. **여기가 지금 가장 가성비 높은 코드 작업이다.**
 
+### I-16 (P1) 마지막 diffusion retrain이 통째로 버려짐 → **fixed in `e32355d`**
+
+`total_steps = steps_per_epoch * epochs + 1` (100 epoch → 100001)이고, 루프 한 iteration에서
+**retrain([L480](../synther/online/online_cond_ddpm_ori.py#L480)) → epoch 평가·로깅([L1202](../synther/online/online_cond_ddpm_ori.py#L1202))** 순으로 실행된다.
+`retrain_diffusion_every=10000`이 `steps_per_epoch*epochs=100000`을 **정확히 나누므로**
+마지막 retrain이 항상 마지막 로깅 스텝(`t+1=100000`)에 걸렸다:
+
+1. prior 100k step + RTB fine-tuning 100 epoch + 1M 샘플링 (~30분)
+2. 곧바로 같은 iteration에서 epoch 99 평가 — 이때 policy는 **직전** buffer로 학습된 상태
+3. 남은 스텝은 `t=100000` 하나뿐이고 `(t+1)=100001`은 retrain/로깅 조건 어디에도 안 맞아
+   그대로 `wandb.finish()`
+
+→ **마지막 사이클의 결과물이 어떤 로깅 값에도 반영되지 못하고 버려졌다.**
+
+수정: "남은 스텝이 한 epoch 미만이면 retrain하지 않는다"를 조건에 추가.
+새 buffer가 최소 한 epoch은 agent 학습에 쓰이고 평가를 받아야 의미가 있다는 기준이다.
+
+```python
+diffusion_retrain_useful = (total_steps - (t + 1)) >= steps_per_epoch
+```
+
+| 설정 | retrain 시점 | 유지 | skip |
+|---|---|---|---|
+| 100 epoch | 10000…100000 (10회) | 9회 (마지막 90000) | **100000** |
+| finger 300 epoch | 10000…300000 (30회) | 29회 (마지막 290000) | **300000** |
+
+**로깅되는 값은 하나도 바뀌지 않는다** (버려지던 계산만 제거). 절감량은 run당 ~25–35분,
+Ours 80 run 재실행 기준 **30–45 GPU-시간**.
+baseline([online_cond_origin_baseline.py:487](../synther/online/online_cond_origin_baseline.py#L487))도 같은 구조였으므로 동일하게 고쳤다 —
+wall-clock 비교를 공정하게 유지하려면 양쪽이 같아야 한다.
+
+⚠️ 부작용: `--epochs 1`로는 retrain이 **전부** skip된다 (남은 스텝이 항상 한 epoch 미만).
+timing 측정용 짧은 run은 `--epochs 2` 이상을 써야 한다 → [04_script.md](04_script.md).
+
 ### I-15 (P0) sampling이 불필요하게 2 NFE → **fixed in `b21c00b`**
 
 `*_final` 시점의 posterior는 **residual**로 정의돼 있었다:
@@ -262,6 +296,7 @@ dead 런처 `run.sh` / `run_muj.sh` / `run_rtb.sh`를 삭제했다.
 | 날짜 | 이슈 | commit | 비고 |
 |---|---|---|---|
 | 2026-07-28 | §7 정리 | `607853c` | `synther/online/` 미사용 entry-point 9개 삭제 |
+| 2026-07-28 | I-16 | `e32355d` | 마지막 diffusion retrain skip (버려지던 ~30분/run 제거). baseline도 동일 |
 | 2026-07-28 | I-13, I-15 | `b21c00b` | posterior를 absolute로 → sampling 1 NFE (PGR의 절반). `diffusion_cond.py` 사본 제거. **Ours 재실행 필요** |
 | 2026-07-28 | I-5, I-8, I-10, I-14 | `5173525` | `env_defaults.py` 도입 — 커맨드 25플래그 → 3~4플래그. HalfCheetah gin을 openai로 교정. 자세한 건 [04_script.md](04_script.md) |
 

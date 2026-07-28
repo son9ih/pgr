@@ -174,7 +174,25 @@ bash scripts/run.sh ours hopper 0 -- --posterior_param residual
 wandb run 이름/group에 `_abs` / `_res`가 붙어 섞이지 않는다.
 샘플링 비용은 `diffusion/sample_nfe`로 로깅된다.
 
-## 8. Ablation
+## 8. 짧은 run / timing 측정
+
+diffusion retrain은 **남은 스텝이 한 epoch 미만이면 skip된다** (I-16). 따라서
+`--epochs 1`로는 retrain이 한 번도 안 돌아 prior/fine-tuning/sampling 시간을 측정할 수 없다.
+`--epochs 2` 이상 + `retrain_diffusion_every`를 낮춰 쓴다:
+
+```bash
+# reacher-hard, absolute, retrain 사이클 2회를 production 설정으로 측정
+CUDA_VISIBLE_DEVICES=1 python synther/online/online_cond_ddpm_ori.py \
+  --env reacher --seed 0 --posterior_param absolute --epochs 2 \
+  --gin_params "redq_sac.retrain_diffusion_every = 500"
+```
+
+→ retrain은 step 500, 1000에서 돌고 1500, 2000은 skip된다.
+구간별 시간은 로그의 `Prior training finished` / `Posterior fine-tuning finished` /
+`Sampling complete`와 wandb의 `diffusion/train_time_sec`, `diffusion/finetune_time_sec`,
+`diffusion/sampling_time_sec`, `diffusion/sample_nfe`에서 읽는다.
+
+## 9. Ablation
 
 [online_cond_ddpm_ori_abl.py](../synther/online/online_cond_ddpm_ori_abl.py)는 아직
 `env_defaults.py`를 쓰지 않는다 (진행 중인 ablation을 건드리지 않기 위해 그대로 뒀다).
@@ -185,7 +203,7 @@ wandb run 이름/group에 `_abs` / `_res`가 붙어 섞이지 않는다.
 (argparse에 플래그가 없어서 `residual`로 되돌릴 수단도 없다). 이전에 뽑은
 `ablation_data/`의 reward 히스토그램은 `residual` 기준이라 새로 뽑은 것과 섞으면 안 된다.
 
-## 9. 확인한 것
+## 10. 확인한 것
 
 - `python -m py_compile synther/online/*.py` 통과
 - `env_defaults`가 8개 태스크 × {curiosity, rnd} 전부를 `*_final` 값으로 해석 (HalfCheetah gin만 의도적으로 변경)
@@ -196,3 +214,5 @@ wandb run 이름/group에 `_abs` / `_res`가 붙어 섞이지 않는다.
 - `--posterior_param` 양쪽 스모크런 exit 0. NFE 100(absolute) / 200(residual),
   wall-clock 0.86s / 1.68s로 NFE 비율과 일치. init에서
   `max|eps_post − eps_prior|`가 absolute 0.000e+00 / residual 1.155e+00(ratio 2.000).
+- retrain skip 조건(I-16) 시뮬레이션: 100 epoch → 10회 중 9회 유지, step 100000만 skip.
+  finger 300 epoch → 30회 중 29회 유지, step 300000만 skip. 마지막 로깅 스텝과 정확히 겹친다.
