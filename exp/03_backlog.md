@@ -16,15 +16,24 @@
 - [ ] **I-11** reward 함수 안 `print` 디버그 플래그로 게이트
 - [ ] **I-2** off-policy `y_weights` 갱신 여부 결정 (의도된 고정인지 확인 후)
 - [ ] **I-9** `--wandb_project` / `--wandb_group` 인자화
-- [ ] **I-10** `--epochs` 인자화 → `*_abl.py` 사본 제거
-- [ ] **I-8** `exp/tools/summarize.py --cmds` 출력으로 `run_ori*.sh` 재생성
+- [x] **I-10** `--epochs` 인자화 (`5173525`) — 남은 일: `*_abl.py`를
+      `--epochs 62` + reward-dump 플래그로 접어서 사본 제거
+- [x] **I-8/I-14** 런처·README 정리 → `scripts/run.sh` + [04_script.md](04_script.md) (`5173525`)
 
 ## 재실행 (결과 신뢰성)
 
+- [ ] **I-5** HalfCheetah 전체 재실행 — gin이 `openai.gin`으로 바뀌었으므로(`5173525`)
+      기존 `half_final` 값은 새 설정과 비교 불가. 5 method × 5 seed:
+      ```bash
+      for a in ours ours-rnd pgr pgr-rnd ser; do GPUS="0 1" bash scripts/run.sh $a half; done
+      ```
 - [ ] **I-7** 빠진 seed 채우기 — walker SER seed 1 / hopper SER seed 4 /
-      half SER seed 3 / fingerhard PGR+curiosity seed 2
-      (런처에서 SER을 novelty loop 밖으로 뺄 것)
-- [ ] **I-5** HalfCheetah를 `sac_cond_synther_openai.gin`으로 재실행 (또는 표에 각주)
+      fingerhard PGR+curiosity seed 2 (half SER seed 3은 위 재실행에 포함됨)
+      ```bash
+      bash scripts/run.sh ser walker 1;  bash scripts/run.sh ser hopper 4
+      bash scripts/run.sh pgr fingerhard 2
+      ```
+      → `scripts/run.sh`는 SER을 novelty loop와 분리해 두었으므로 중복 제출이 재발하지 않는다
 - [ ] **I-6** quad를 다른 태스크와 같은 `accumulation_steps=4`, `num_posterior_epochs=100`으로
       한 번 더 돌려 연산량 confound 제거
 

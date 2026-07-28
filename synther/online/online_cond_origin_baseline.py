@@ -21,6 +21,7 @@ from synther.diffusion.elucidated_diffusion import REDQCondTrainer
 from synther.diffusion.diffusion_generator import CondDiffusionGenerator
 from synther.diffusion.utils import construct_diffusion_model
 from synther.online.redq_rlpd_agent import REDQRLPDCondAgent
+from synther.online.env_defaults import apply_env_defaults
 
 import wandb
 from synther.online.utils import PBE, RMS, compute_intr_reward
@@ -233,18 +234,16 @@ def redq_sac(
     # use gpu if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training using device: {device}")
-    # set number of epoch
-    # if epochs == 'mbpo' or epochs < 0:
-    #     epochs = mbpo_epoches.get(env_name, 150)
-    if env_name in ['finger-turn_hard-v0', 'finger-turn_easy-v0', 'humanoid-run-v0', 'humanoid-walk-v0']:
-        epochs = 300
-    else:
-        epochs = 100
+    # Number of epochs and the conditioning fraction come from args (resolved per env
+    # in env_defaults.py), not from gin -- `cond_top_frac` below is only what gets
+    # logged, while behaviour has always read args.cond_top_frac (see CondDistri call).
+    epochs = args.epochs
+    cond_top_frac = args.cond_top_frac
     total_steps = steps_per_epoch * epochs + 1
-    
+
     # set seed
     seed = args.seed
-    
+
     if args.wandb:
         if args.synther:
             run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_SER_DDPM"
@@ -1066,19 +1065,26 @@ if __name__ == '__main__':
     import os
     
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description='Baselines: SER (--synther), PGR (--novelty_measure), SAC (--sac), '
+                    'REDQ (--redq). Per-task values are resolved from '
+                    'synther/online/env_defaults.py, so a run normally only needs '
+                    '--env / the algorithm flag / --seed / --wandb.')
+    # `--env` accepts the short aliases in env_defaults.ENV_ALIASES (hopper, half, ...).
     parser.add_argument('--env', type=str, default='Hopper-v2')
     parser.add_argument('--log_dir', type=str, default='online_logs')
     parser.add_argument('--results_folder', type=str, default='./results')
-    parser.add_argument('--gin_config_files', nargs='*', type=str,
-                        default=['config/online/sac_synther_dmc.gin'])
+    # None -> picked per env (dmc.gin for DMC, openai.gin for the MuJoCo tasks).
+    parser.add_argument('--gin_config_files', nargs='*', type=str, default=None)
     parser.add_argument('--gin_params', nargs='*', type=str, default=[])
-    
+    # None -> 300 for finger-turn_*, else 100.
+    parser.add_argument('--epochs', type=int, default=None)
+
     # Additional arguments
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--wandb', action='store_true', default=False)
     parser.add_argument('--synther', action='store_true', default=False)
-    
+
     parser.add_argument('--knn_clip', type=float, default=0.0)
     parser.add_argument('--knn_k', type=int, default=12)
     parser.add_argument('--knn_avg', action='store_true', default=False) # default: True
@@ -1103,20 +1109,23 @@ if __name__ == '__main__':
     
     parser.add_argument('--prior_lr', type=float, default=3e-4)
     parser.add_argument('--finetune_lr', type=float, default=1e-4)
+    # RTB-only knobs; unused by the baselines but kept so both entry points share a CLI.
     parser.add_argument('--ft_clip_grad', type=float, default=1.0)
     parser.add_argument('--alpha_rtb', type=float, default=1.0)
-    parser.add_argument('--cond_top_frac', type=float, default=0.25)
-    
-    
-    parser.add_argument('--accumulation_steps', type=int, default=2)
-    parser.add_argument('--ft_batch_size', type=int, default=256)
-    
-    parser.add_argument('--inter_onpolicy', type=float, default=0.1)
-    
-    parser.add_argument('--ddim', action='store_true', default=False)
+    # None -> 0.1 for quadruped-walk-v0, else 0.25.
+    parser.add_argument('--cond_top_frac', type=float, default=None)
+
+    parser.add_argument('--accumulation_steps', type=int, default=4)
+    parser.add_argument('--ft_batch_size', type=int, default=1024)
+
+    parser.add_argument('--inter_onpolicy', type=float, default=0.0)
+
+    # DDIM sampling is on by default (every final run used it); --no_ddim opts out.
+    parser.add_argument('--ddim', action='store_true', default=True)
+    parser.add_argument('--no_ddim', dest='ddim', action='store_false')
     parser.add_argument('--eta', type=float, default=1.0)
     parser.add_argument('--clip_reward', type=float, default=0.95)
-    
+
     parser.add_argument('--anneal', action='store_true', default=False)
 
     # Dynamic MSE logging (synthetic transition plausibility)
@@ -1127,7 +1136,8 @@ if __name__ == '__main__':
     parser.add_argument('--redq', action='store_true', default=False)
     
     args = parser.parse_args()
-    
+    apply_env_defaults(args)
+
     args.results_folder = f'./{args.results_folder}/{args.results_folder}_{args.env}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
     print(args.results_folder)
     if not os.path.exists(args.results_folder):

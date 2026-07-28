@@ -11,13 +11,14 @@
 | [synther/online/online_cond_ddpm_ori.py](../synther/online/online_cond_ddpm_ori.py) | **Ours.** SAC/REDQ 루프 + DDPM prior 학습 + RTB posterior fine-tuning (1356 lines) |
 | [synther/online/online_cond_origin_baseline.py](../synther/online/online_cond_origin_baseline.py) | **SER / PGR / PGR-rnd** baseline (DDPM 버전, 1141 lines) |
 | [synther/online/online_cond_ddpm_ori_abl.py](../synther/online/online_cond_ddpm_ori_abl.py) | ablation 변형. ↓ §4 |
+| [synther/online/env_defaults.py](../synther/online/env_defaults.py) | env별 기본값 표 (gin, `cond_top_frac`, `alpha_rtb`, ...). `--env`만으로 해석 |
 | [synther/diffusion/diffusion.py](../synther/diffusion/diffusion.py) | `DiffusionModel`, `QFlow`(RTB), `posterior_log_reward`, `compute_loss*` — **Ours가 쓰는 쪽** |
 | [synther/diffusion/diffusion_cond.py](../synther/diffusion/diffusion_cond.py) | 위 파일과 **byte 단위로 동일한 사본** — baseline이 쓰는 쪽 (⚠️ I-13) |
 | [synther/diffusion/denoiser_network_cond.py](../synther/diffusion/denoiser_network_cond.py) | `ResidualMLPDenoiser` |
 | [config/online/sac_cond_synther_dmc.gin](../config/online/sac_cond_synther_dmc.gin) | DMC 기본 설정 (UTD 20, cfg_scale 2.0, `skip_reward_norm=True`, terminal 없음) |
 | [config/online/sac_cond_synther_openai.gin](../config/online/sac_cond_synther_openai.gin) | dmc.gin include + `skip_reward_norm=False` + `modelled_terminals=True` |
-| `run_ori.sh` / `run_ori_ours.sh` / `run_abl.sh` | 런처 (untracked, `.gitignore`의 `*.sh`에 걸림). ⚠️ 내용이 `*_final` 실행값과 어긋남 — I-8 |
-| `run.sh` / `run_muj.sh` / `run_rtb.sh` | 구 런처 (tracked). ⚠️ 삭제된 스크립트를 호출하는 라인 잔존 — I-14 |
+| [scripts/run.sh](../scripts/run.sh) | 런처. `bash scripts/run.sh <algo> <env|all> [seed ...]` → [04_script.md](04_script.md) |
+| `run_ori.sh` / `run_ori_ours.sh` / `run_abl.sh` | 구 런처 (untracked, `.gitignore`의 `*.sh`). `*_final` 실행값과 어긋남 — 참고용으로만 |
 
 `synther/online/`에는 위 3개 entry-point와 공용 모듈(`redq_rlpd_agent.py`,
 `conditional_nets.py`, `eco.py`, `utils.py`)만 남겼다. 삭제 목록은 §7.
@@ -123,11 +124,13 @@ baseline엔 대응 하이퍼파라미터가 없어서 "Ours만 튜닝됨" 지적
 quad에서만 둘 다 돌았고 **clip=0이 +174 (910 vs 737)**. I-1 수정 후 전 태스크
 clip=0으로 재실행할 값어치가 있다. 최소한 논문 표는 한쪽으로 통일해야 한다.
 
-### I-5 (P1) `half_final`의 gin 불일치
+### I-5 (P1) `half_final`의 gin 불일치 → **fixed in `5173525`**
 
 HalfCheetah만 `sac_cond_synther_dmc.gin`(`skip_reward_norm=True`)로 돌았다.
-Hopper/Walker2d는 `openai.gin`(`skip_reward_norm=False`). MuJoCo 표 3종을 같은 설정으로
-맞추려면 HalfCheetah를 `openai.gin`으로 재실행하거나, 표에 각주를 달아야 한다.
+Hopper/Walker2d는 `openai.gin`(`skip_reward_norm=False`).
+`env_defaults.py`에서 HalfCheetah-v2를 `openai.gin`으로 바꿨다.
+**남은 일: HalfCheetah 5 seed × 5 method 재실행** — 지금 표의 HalfCheetah 값은
+reward normalization이 꺼진 설정이라 새 설정과 직접 비교할 수 없다.
 
 ### I-6 (P1) quad만 연산량이 다름
 
@@ -140,22 +143,28 @@ Ours 쪽에만 추가 연산을 준 셈이라 quad의 +18.6%는 할인해서 봐
 (원인·목록은 [01_experiments.md §4](01_experiments.md)).
 런처가 SER을 novelty loop 안에서 제출한 게 원인 → **SER은 novelty loop 밖으로 빼야 한다.**
 
-### I-8 (P2) 런처 스크립트가 실제 실행값과 어긋남
+### I-8 (P2) 런처 스크립트가 실제 실행값과 어긋남 → **fixed in `5173525`**
 
-`run_ori.sh`는 지금 `ACC_STEPS=6`, `for env in HalfCheetah-v2`, `for seed in 6 7`로
-남아 있어 `*_final` 실행(ACC 4/8, seed 0-4)을 재현하지 못한다.
-`python exp/tools/summarize.py --cmds` 출력으로 **런처를 다시 생성**해 드리프트를 없앨 것.
+`run_ori.sh`가 `ACC_STEPS=6`, `for seed in 6 7`로 남아 `*_final`을 재현하지 못했다.
+`run.sh` / `run_muj.sh` / `run_rtb.sh`는 삭제된 스크립트만 호출하는 dead 파일이었다.
+→ 세 개 삭제하고 [scripts/run.sh](../scripts/run.sh) 하나로 대체.
+사용법은 [04_script.md](04_script.md).
+(untracked `run_ori.sh` / `run_ori_ours.sh` / `run_abl.sh`는 손대지 않았다 — 필요 없으면 지울 것)
 
 ### I-9 (P2) wandb project가 코드에 하드코딩
 
 `wandb.init(project=env_name)` ([L253](../synther/online/online_cond_ddpm_ori.py#L253)).
 `*_final`은 UI에서 수동으로 모은 것 → `--wandb_project` / `--wandb_group` 인자 추가.
 
-### I-10 (P2) 총 epoch이 함수 본문에 하드코딩
+### I-10 (P2) 총 epoch이 함수 본문에 하드코딩 → **fixed in `5173525`**
 
-[L240-243](../synther/online/online_cond_ddpm_ori.py#L240-L243)에서 env 이름으로 300/100을
-정하고 gin의 `epochs`를 덮어쓴다. ablation 스크립트가 이 줄만 62로 바꾼 사본인 이유.
-→ `--epochs`(기본 None이면 현재 규칙) 인자로 빼면 사본 유지가 필요 없다.
+env 이름으로 300/100을 정하고 gin의 `epochs`를 덮어쓰던 블록을 `epochs = args.epochs`로
+바꿨다. 값은 `env_defaults.ENV_CONFIG`의 `epochs`(finger 2종·humanoid 300, 그 외 100)에서
+오고 `--epochs`로 덮어쓸 수 있다.
+`cond_top_frac`도 같이 정리했다 — gin의 `redq_sac.cond_top_frac` 바인딩은 wandb 로깅에만
+쓰였고 동작은 늘 `args.cond_top_frac`을 읽었으므로, 이제 로깅도 args 값을 쓴다.
+→ **`--gin_params "redq_sac.cond_top_frac = ..."`는 더 이상 붙일 필요 없다.**
+(ablation 사본 `online_cond_ddpm_ori_abl.py`는 아직 `epochs=62` 하드코딩 유지)
 
 ### I-11 (P2) reward 함수 안의 `print`
 
@@ -190,18 +199,11 @@ afab5241...  synther/diffusion/diffusion_cond.py
 baseline의 import를 `diffusion`으로 통일해 사본을 없애는 게 맞다.
 (baseline은 QFlow를 실제로 쓰지 않을 수도 있으니 사용처 확인 후 정리)
 
-### I-14 (P2) 삭제된 스크립트를 호출하는 런처/README 잔존
+### I-14 (P2) 삭제된 스크립트를 호출하는 런처/README 잔존 → **fixed in `5173525`**
 
-§7 정리 후 아래가 dangling 상태다:
-
-| 위치 | 호출 |
-|---|---|
-| `README.md` "Running Instructions" 전체 (L24-115) | `online_cond.py --algorithm ...` — 파일도, `--algorithm` 인자도 없음 |
-| `run.sh:160` | `online_cond_ddpm.py` |
-| `run_muj.sh:109` | `online_cond.py` |
-| `run_ori.sh:217,227` (untracked) | `online_cond.py` |
-
-README는 [01_experiments.md §2](01_experiments.md)의 실제 커맨드로 교체해야 한다.
+`README.md`의 Running Instructions를 `scripts/run.sh` 기준으로 다시 썼고,
+dead 런처 `run.sh` / `run_muj.sh` / `run_rtb.sh`를 삭제했다.
+남은 것: untracked `run_ori.sh:217,227`이 여전히 `online_cond.py`를 부른다 (미추적이라 방치).
 
 ---
 
@@ -209,7 +211,8 @@ README는 [01_experiments.md §2](01_experiments.md)의 실제 커맨드로 교�
 
 | 날짜 | 이슈 | commit | 비고 |
 |---|---|---|---|
-| 2026-07-28 | §7 정리 | (아래 커밋) | `synther/online/` 미사용 entry-point 9개 삭제 |
+| 2026-07-28 | §7 정리 | `607853c` | `synther/online/` 미사용 entry-point 9개 삭제 |
+| 2026-07-28 | I-5, I-8, I-10, I-14 | `5173525` | `env_defaults.py` 도입 — 커맨드 25플래그 → 3~4플래그. HalfCheetah gin을 openai로 교정. 자세한 건 [04_script.md](04_script.md) |
 
 ---
 

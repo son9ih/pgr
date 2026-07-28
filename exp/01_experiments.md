@@ -68,6 +68,12 @@ diffusion_sample_ratio=0.5, retrain_diffusion_every=10000, start_steps=5000`.
 
 ## 2. 실행 커맨드 (seed는 0–4)
 
+> ⚠️ **아래는 당시 실제로 쓴 원본 커맨드 기록이다.** 지금은 이 값들이
+> [env_defaults.py](../synther/online/env_defaults.py)에 들어가 있어서
+> `bash scripts/run.sh ours hopper` 한 줄로 같은 설정이 나온다 → [04_script.md](04_script.md).
+> 단 **HalfCheetah는 gin이 `dmc.gin` → `openai.gin`으로 교정**되었으므로(I-5),
+> 새로 돌린 HalfCheetah 결과는 §3의 `half_final` 값과 직접 비교할 수 없다.
+
 `$SEED` 자리에 0,1,2,3,4를 넣어 5개씩 돌렸다. 앞에 `CUDA_VISIBLE_DEVICES=<gpu>`를 붙인다.
 
 ### 2.1 Baselines (공통 형태)

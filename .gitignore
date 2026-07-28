@@ -181,5 +181,9 @@ cython_debug/
 *.ckpt
 *.sh
 
-# Experiment records under exp/ are tracked on purpose.
+# Experiment records under exp/ and the launcher are tracked on purpose.
 !exp/data/*.json
+!scripts/*.sh
+
+# Launcher output
+exp_logs/

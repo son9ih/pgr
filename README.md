@@ -18,101 +18,69 @@ pip install -r requirements.txt
 Our code is tested on Python 3.8.
 If you don't have MuJoCo installed, follow the instructions here: https://github.com/openai/mujoco-py#install-mujoco.
 
+```bash
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia
+```
+
 ## Running Instructions
 
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed '(...)' --algorithm '(...)'
-```
+Every per-task hyperparameter (gin config, `cond_top_frac`, `alpha_rtb`,
+`accumulation_steps`, `num_posterior_epochs`, `ft_clip_grad`, epoch count) is resolved
+from `--env` by [synther/online/env_defaults.py](synther/online/env_defaults.py), so a
+run only names the task, the algorithm and the seed.
+
+### With the launcher
 
 ```bash
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed '(...)' --algorithm '(...)'
+bash scripts/run.sh <algo> <env|all> [seed ...] [-- <extra flags>]
 ```
 
+| argument | values |
+|---|---|
+| `algo` | `ours` `ours-rnd` `pgr` `pgr-rnd` `ser` `sac` `redq` |
+| `env` | `quad` `cheetah` `reacher` `fingereasy` `fingerhard` `hopper` `walker` `half`, or `all` |
+| `seed` | defaults to `0 1 2 3 4` |
+
 ```bash
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed '(...)' --algorithm '(...)'
+bash scripts/run.sh ours hopper                  # Ours+curiosity, seeds 0-4, GPU 0
+bash scripts/run.sh pgr-rnd half 0 1 2           # PGR+rnd, seeds 0,1,2
+GPUS="0 1 2 3" bash scripts/run.sh ser all 0     # SER on all 8 tasks, 4 GPUs
+DRY=1 bash scripts/run.sh ours-rnd quad          # print the commands only
+bash scripts/run.sh ours walker 0 -- --alpha_rtb 4.0   # override one default
 ```
 
-## Running Instructions(1)
+One job per GPU at a time; logs go to `exp_logs/<algo>_<env>_s<seed>.log`.
 
-scripts for baselines (SAC, REDQ, SER, PGR, PGR-rnd) and our methods in DMCsuite
+### Directly
 
-Baseline.0: SAC
 ```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm SAC
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
-```
-Baseline.1: REDQ
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm REDQ
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-```
-Baseline.2: SER
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm SER
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-```
-Baseline.3: PGR
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm PGR
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-```
-Baseline.4: PGR-rnd
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm PGRrnd
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGRrnd
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGRrnd
-```
-Ours: ??
-```bash
-python synther/online/online_cond.py --env quadruped-walk-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.1' --wandb --seed 0 --algorithm Ours
-python synther/online/online_cond.py --env cheetah-run-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
-python synther/online/online_cond.py --env reacher-hard-v0 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
+# Ours -- PGR with RTB posterior fine-tuning of the DDPM prior
+python synther/online/online_cond_ddpm_ori.py --env hopper \
+       --novelty_measure curiosity --seed 0 --wandb
+
+# PGR
+python synther/online/online_cond_origin_baseline.py --env hopper \
+       --novelty_measure curiosity --seed 0 --wandb
+
+# SER / SAC / REDQ
+python synther/online/online_cond_origin_baseline.py --env hopper --synther --seed 0 --wandb
+python synther/online/online_cond_origin_baseline.py --env hopper --sac     --seed 0 --wandb
+python synther/online/online_cond_origin_baseline.py --env hopper --redq    --seed 0 --wandb
 ```
 
-## Running Instructions(2)
+`--env` takes either the short alias (`half`) or the gym id (`HalfCheetah-v2`).
+Anything given on the command line overrides the per-task default, and the resolved
+values are printed at startup:
 
-scripts for baselines (SAC, REDQ, SER, PGR, PGR-rnd) and our methods in Mujoco
+```
+[env_defaults] env=Hopper-v2  gin_config_files=['config/online/sac_cond_synther_openai.gin']
+  epochs=100  cond_top_frac=0.25  accumulation_steps=4  num_posterior_epochs=100
+  ft_clip_grad=1.0  alpha_rtb=2.0
+```
 
-Baseline.0: SAC
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc_sac.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SAC
-```
-Baseline.1: REDQ
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm REDQ
-```
-Baseline.2: SER
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm SER
-```
-Baseline.3: PGR
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR
-```
-Baseline.4: PGR-rnd
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm PGR-rnd
-```
-Ours: ??
-```bash
-python synther/online/online_cond.py --env Hopper-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
-python synther/online/online_cond.py --env Walker2d-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
-python synther/online/online_cond.py --env HalfCheetah-v2 --gin_config_files config/online/sac_cond_synther_dmc.gin --gin_params 'redq_sac.cond_top_frac = 0.25' --wandb --seed 0 --algorithm Ours
-```
+See [exp/04_script.md](exp/04_script.md) for the full per-task table, the list of
+argparse defaults, and how to change them. Recorded runs and results live in
+[exp/01_experiments.md](exp/01_experiments.md).
 
 ## <a name="Citing"></a>Citing PGR
 
