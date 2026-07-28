@@ -1164,8 +1164,10 @@ class QFlow(nn.Module):
             q_r = (self.cond_normalizer.normalize(q_r) + 1) / 2
         
         
-        # Bound nice
-        print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
+        # Bound nice -- fires once per micro-batch, so it floods the log
+        # (accumulation_steps x posterior epochs x diffusion retrains). Re-enable by hand
+        # when debugging the reward scale.
+        # print(f'Check if q_r is bounded between 0 and 1: {q_r.min()}, {q_r.max()}')
         # print('Here is diffusion.py')
         
         # combine novelty reward with on-policyness reward
@@ -1175,7 +1177,8 @@ class QFlow(nn.Module):
                 on_policy_reward = self.agent.compute_onpolicy_reward(obs, act)
                 # on_policy_reward = on_policy_reward.pow(self.inter_onpolicy)
                 on_policy_reward = np.power(on_policy_reward, self.inter_onpolicy)
-                print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
+                # Same per-micro-batch flooding as above.
+                # print(f'Check if on-policyness reward is bounded between 0 and 1: {on_policy_reward.min()}, {on_policy_reward.max()}')
             # convert numpy to tensor
             on_policy_reward = torch.tensor(on_policy_reward, device=q_r.device, dtype=q_r.dtype)
             # inter_onpolicy_tensor = torch.tensor(self.inter_onpolicy, device=q_r.device, dtype=q_r.dtype)
