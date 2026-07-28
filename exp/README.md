@@ -13,6 +13,8 @@ PGR(Prioritized Generative Replay) 기반 **RTB posterior fine-tuning** 연구�
 | [04_script.md](04_script.md) | **지금 실험을 돌리는 방법** — `scripts/run.sh`와 env별 기본값 |
 | [tools/fetch_wandb.py](tools/fetch_wandb.py) | wandb에서 run 메타데이터를 `data/wandb_final_runs.json`으로 덤프 |
 | [tools/summarize.py](tools/summarize.py) | 덤프를 집계해 표(`--md`) / 커맨드(`--cmds`) 출력 |
+| [tools/fetch_curves.py](tools/fetch_curves.py) | buffer capacity ablation의 `eval/AverageTestEpRet` 학습곡선 → CSV |
+| [tools/plot_buffer_ablation.py](tools/plot_buffer_ablation.py) | 위 CSV → 3곡선 figure (`figures/`) |
 | [data/wandb_final_runs.json](data/wandb_final_runs.json) | 2026-07-28 기준 205개 run 스냅샷 (config·args·summary) |
 
 ## 갱신 방법

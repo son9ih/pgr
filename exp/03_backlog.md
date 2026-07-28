@@ -45,6 +45,22 @@
 - [ ] **I-6** quad를 다른 태스크와 같은 `accumulation_steps=4`, `num_posterior_epochs=100`으로
       한 번 더 돌려 연산량 confound 제거
 
+## 진행 중
+
+- [~] **synthetic buffer capacity ablation** (2026-07-28 시작, reacher-hard)
+      capacity ∈ {50k, 200k} × 5 seed = 10 run, GPU 0–3에 (3,3,2,2).
+      1M arm은 기록된 `reacher_final` 데이터를 그대로 쓰므로 **`--posterior_param residual`**
+      로 맞췄다 (reacher는 dmc.gin이라 I-5 무관, I-16은 로깅값 불변, I-13은 no-op,
+      env_defaults의 reacher 값이 기록된 run과 동일 → 세 곡선이 capacity만 다르다).
+      `num_samples`도 capacity에 맞췄다 — 남는 샘플은 어차피 posterior i.i.d.라 분포가 같고
+      sampling이 20배 싸다.
+      ```bash
+      bash scripts/run_ablation_buffer.sh          # DRY=1로 계획 확인
+      python exp/tools/fetch_curves.py             # -> exp/data/buffer_ablation_reacher.csv
+      python exp/tools/plot_buffer_ablation.py --smooth 5   # -> exp/figures/
+      ```
+      wandb: project `reacher_buffer_ablation`, group `Ours+curiosity_res_buf{50,200}k`
+
 ## 추가 실험 (논문 방어용)
 
 - [ ] **I-3** α sensitivity: hopper 또는 walker에서 `alpha_rtb ∈ {0.5, 1, 2, 4, 10}` × seed 3
