@@ -146,20 +146,46 @@ bash scripts/run.sh ours walker 0 -- --alpha_rtb 4.0 --epochs 50
 | `--inter_onpolicy` | 0.0 | `--sample_batch_size` | 100000 |
 | `--eta` | 1.0 | `--clip_reward` | 0.95 |
 | `--ddim` | **True** (`--no_ddim`으로 끔) | `--anneal` | False |
+| `--posterior_param` | **`absolute`** | | |
 
 이전 기본값과 달라진 것: `ft_batch_size` 256→1024, `inter_onpolicy` 0.1→0.0,
 `accumulation_steps` 2→env별, `num_posterior_epochs` 50→env별, `ddim` False→True.
 `--gin_params`는 이제 필요 없다 (`redq_sac.cond_top_frac` 바인딩은 로깅에만 쓰였고,
 동작은 항상 `args.cond_top_frac`을 읽었다). 여전히 다른 gin 값을 덮어쓰는 데는 쓸 수 있다.
 
-## 7. Ablation
+## 7. `--posterior_param` (Ours 전용)
+
+posterior epsilon을 어떻게 만드는지 고른다. sampling 비용이 여기서 갈린다.
+
+| 값 | posterior epsilon | sampling NFE (DDIM 100) |
+|---|---|---|
+| **`absolute`** (기본) | `qflow(x,t)` | **100** — CFG PGR의 절반 |
+| `residual` | `qflow(x,t) + bc_net(x,t)` | 200 — `*_final` 205 run이 쓴 방식 |
+
+`absolute`이 맞는 설정이다. `qflow`가 prior 사본이라 init에서 posterior ≡ prior가 성립하고
+(residual은 `2 × eps_prior`에서 출발했다), 샘플링에 prior forward가 필요 없다. 배경은
+[02_code_notes.md I-15](02_code_notes.md).
+
+```bash
+# 기존 205 run과 동일한 parameterization으로 대조 실험
+bash scripts/run.sh ours hopper 0 -- --posterior_param residual
+```
+
+wandb run 이름/group에 `_abs` / `_res`가 붙어 섞이지 않는다.
+샘플링 비용은 `diffusion/sample_nfe`로 로깅된다.
+
+## 8. Ablation
 
 [online_cond_ddpm_ori_abl.py](../synther/online/online_cond_ddpm_ori_abl.py)는 아직
 `env_defaults.py`를 쓰지 않는다 (진행 중인 ablation을 건드리지 않기 위해 그대로 뒀다).
 `epochs=62`가 하드코딩되어 있고 모든 플래그를 직접 넘겨야 한다.
 정리는 [03_backlog.md](03_backlog.md) 참고.
 
-## 8. 확인한 것
+⚠️ 단, 이 스크립트도 `QFlow`를 공유하므로 **`posterior_param`이 새 기본값 `absolute`로 바뀐다**
+(argparse에 플래그가 없어서 `residual`로 되돌릴 수단도 없다). 이전에 뽑은
+`ablation_data/`의 reward 히스토그램은 `residual` 기준이라 새로 뽑은 것과 섞으면 안 된다.
+
+## 9. 확인한 것
 
 - `python -m py_compile synther/online/*.py` 통과
 - `env_defaults`가 8개 태스크 × {curiosity, rnd} 전부를 `*_final` 값으로 해석 (HalfCheetah gin만 의도적으로 변경)
@@ -167,3 +193,6 @@ bash scripts/run.sh ours walker 0 -- --alpha_rtb 4.0 --epochs 50
 - `--epochs 1` 스모크런: baseline(SER)과 Ours 모두 exit 0.
   Ours는 `--gin_params "redq_sac.retrain_diffusion_every = 500"`으로 prior 학습 →
   RTB fine-tuning → 샘플링 → DynMSE 경로까지 실제로 통과시켜 확인했다.
+- `--posterior_param` 양쪽 스모크런 exit 0. NFE 100(absolute) / 200(residual),
+  wall-clock 0.86s / 1.68s로 NFE 비율과 일치. init에서
+  `max|eps_post − eps_prior|`가 absolute 0.000e+00 / residual 1.155e+00(ratio 2.000).

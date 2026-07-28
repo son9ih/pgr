@@ -246,11 +246,14 @@ def redq_sac(
     seed = args.seed
 
     if args.wandb:
-        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Ours+{args.novelty_measure}_ftlr{args.finetune_lr}_clip{args.ft_clip_grad}_A{args.alpha_rtb}_On{args.inter_onpolicy}_anl{args.anneal}"
+        # `_abs`/`_res` marks the posterior parameterization -- the *_final runs are all
+        # `res`, and the two are not comparable, so keep them in separate wandb groups.
+        pp = args.posterior_param[:3]
+        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Ours+{args.novelty_measure}_{pp}_ftlr{args.finetune_lr}_clip{args.ft_clip_grad}_A{args.alpha_rtb}_On{args.inter_onpolicy}_anl{args.anneal}"
         wandb.init(
             entity="gda-for-orl",
             project = env_name,
-            group = f'Ours+{args.novelty_measure}',
+            group = f'Ours+{args.novelty_measure}_{pp}',
             name = run_name,
             config={
                 "env_name": env_name,
@@ -305,6 +308,7 @@ def redq_sac(
                 "clip_reward": args.clip_reward,
                 "ft_clip_grad": args.ft_clip_grad,
                 "anneal": args.anneal,
+                "posterior_param": args.posterior_param,
             }
         )
         print(f'Initialized wandb with run name {run_name}')
@@ -759,7 +763,8 @@ def redq_sac(
             # TODO: This is the main cause of not decreasing the loss
             posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb,
                                     obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-                                    agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim).to(device=device)
+                                    agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim,
+                                    posterior_param=args.posterior_param).to(device=device)
             
             # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
             #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
@@ -976,7 +981,10 @@ def redq_sac(
             # else: # 
             #     M = 1
             posterior_model.eval()
-                
+            # Count denoiser forwards so the sampling cost is reported, not asserted.
+            # 'absolute' posterior: ddim_steps NFE. CFG-based PGR needs 2x that.
+            posterior_model.reset_nfe()
+
             for _ in tqdm(range(eval_epochs)): #NOTE B * M**2 samples proposal.
                 # Split into batches due to memory constraints
                 # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
@@ -1012,13 +1020,23 @@ def redq_sac(
             # logR_sample = torch.cat(logR_sample_total, dim=0)
             
             posterior_sampling_elapsed = time.time() - posterior_sampling_start
+            # NFE per generated sample = forwards / batches, i.e. per-batch step count.
+            sample_nfe_total = posterior_model.nfe
+            sample_nfe_per_batch = sample_nfe_total / max(eval_epochs, 1)
             print(f'Sampling complete in {posterior_sampling_elapsed:.2f} s ({posterior_sampling_elapsed/60.0:.2f} min)')
+            print(f'[NFE] posterior_param={args.posterior_param}  '
+                  f'{sample_nfe_per_batch:.0f} denoiser forwards per sampling batch '
+                  f'({posterior_model.ddim_steps} DDIM steps)')
             if args.wandb:
                 # Keep keys consistent with online_cond_origin_baseline.py for easy comparison/plotting
                 wandb.log(
                     {
                         "diffusion/sampling_time_sec": posterior_sampling_elapsed,
                         "diffusion/sampling_time_min": posterior_sampling_elapsed / 60.0,
+                        # Denoiser forwards per sampling batch -- the number the paper's
+                        # sampling-cost comparison against CFG should quote.
+                        "diffusion/sample_nfe": sample_nfe_per_batch,
+                        "diffusion/sample_nfe_total": sample_nfe_total,
                     },
                     step=cur_epoch,
                 )
@@ -1337,6 +1355,13 @@ if __name__ == '__main__':
     parser.add_argument('--ft_batch_size', type=int, default=1024)
 
     parser.add_argument('--inter_onpolicy', type=float, default=0.0)
+
+    # How the posterior epsilon is built from the fine-tuned net.
+    #   absolute: eps_post = qflow(x,t)                  -> 1 forward per sampling step
+    #   residual: eps_post = qflow(x,t) + bc_net(x,t)    -> 2 forwards (the *_final runs)
+    # See synther/diffusion/diffusion.py QFlow.__init__ for why absolute is correct.
+    parser.add_argument('--posterior_param', type=str, default='absolute',
+                        choices=['absolute', 'residual'])
 
     # DDIM sampling is on by default (every final run used it); --no_ddim opts out.
     parser.add_argument('--ddim', action='store_true', default=True)

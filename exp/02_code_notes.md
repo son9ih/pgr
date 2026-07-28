@@ -12,8 +12,8 @@
 | [synther/online/online_cond_origin_baseline.py](../synther/online/online_cond_origin_baseline.py) | **SER / PGR / PGR-rnd** baseline (DDPM 버전, 1141 lines) |
 | [synther/online/online_cond_ddpm_ori_abl.py](../synther/online/online_cond_ddpm_ori_abl.py) | ablation 변형. ↓ §4 |
 | [synther/online/env_defaults.py](../synther/online/env_defaults.py) | env별 기본값 표 (gin, `cond_top_frac`, `alpha_rtb`, ...). `--env`만으로 해석 |
-| [synther/diffusion/diffusion.py](../synther/diffusion/diffusion.py) | `DiffusionModel`, `QFlow`(RTB), `posterior_log_reward`, `compute_loss*` — **Ours가 쓰는 쪽** |
-| [synther/diffusion/diffusion_cond.py](../synther/diffusion/diffusion_cond.py) | 위 파일과 **byte 단위로 동일한 사본** — baseline이 쓰는 쪽 (⚠️ I-13) |
+| [synther/diffusion/diffusion.py](../synther/diffusion/diffusion.py) | `DiffusionModel`, `QFlow`(RTB), `posterior_eps`, `posterior_log_reward`, `compute_loss*`. **여기만 수정한다** |
+| [synther/diffusion/diffusion_cond.py](../synther/diffusion/diffusion_cond.py) | 위 파일의 re-export (구 import 경로 호환용). 내용 없음 |
 | [synther/diffusion/denoiser_network_cond.py](../synther/diffusion/denoiser_network_cond.py) | `ResidualMLPDenoiser` |
 | [config/online/sac_cond_synther_dmc.gin](../config/online/sac_cond_synther_dmc.gin) | DMC 기본 설정 (UTD 20, cfg_scale 2.0, `skip_reward_norm=True`, terminal 없음) |
 | [config/online/sac_cond_synther_openai.gin](../config/online/sac_cond_synther_openai.gin) | dmc.gin include + `skip_reward_norm=False` + `modelled_terminals=True` |
@@ -39,7 +39,9 @@
    0.5 * ( ( logZ + α·logpf_prior − logr.detach() − α·logpf_posterior ) / x_dim )²
    ```
 
-   - `α = --alpha_rtb`, `logZ`는 학습 파라미터 (`diffusion.py:559`)
+   - posterior epsilon은 `qflow(x,t)` **하나**다 (`posterior_param='absolute'`).
+     샘플링은 `QFlow.posterior_eps`로 **1 NFE**, loss는 prior도 필요해 `forward`로 2 NFE → I-15
+   - `α = --alpha_rtb`, `logZ`는 학습 파라미터 (`diffusion.py`의 `QFlow.__init__`)
    - `logr = log(posterior_log_reward(x))`, reward는 novelty measure
      ([diffusion.py:1085](../synther/diffusion/diffusion.py#L1085)):
      `curiosity` = forward-dynamics ensemble error `q_net(obs, next_obs, act)`,
@@ -63,7 +65,9 @@
   DMC에서는 조용히 `False`를 반환하고 지표가 안 찍힌다.
 - `eval/StateEnt` — k-NN state entropy
 - `eval/AverageNormQBias` — Q bias
-- `diffusion/*_time_*` — 최근 커밋(`d478081`~`404186a`)이 추가한 prior/RTB/샘플링 소요시간
+- `diffusion/*_time_*` — 커밋 `d478081`~`404186a`가 추가한 prior/RTB/샘플링 소요시간
+- `diffusion/sample_nfe` — 샘플링 batch 하나당 denoiser forward 수.
+  **논문 sampling-cost 표에 그대로 쓸 값** → I-15
 
 ---
 
@@ -179,7 +183,54 @@ DMC는 `env.unwrapped.physics.set_state()` / `get_state()`로 같은 걸 할 수
 `_mujoco_set_state_from_obs`에 dm_control 분기를 추가하면 8개 태스크 전부에서
 같은 그림을 그릴 수 있다. **여기가 지금 가장 가성비 높은 코드 작업이다.**
 
-### I-13 (P0) `diffusion.py` == `diffusion_cond.py` (완전 중복)
+### I-15 (P0) sampling이 불필요하게 2 NFE → **fixed in `b21c00b`**
+
+`*_final` 시점의 posterior는 **residual**로 정의돼 있었다:
+
+```python
+eps_post = qflow(x, t) + bc_net(x, t)     # sampling마다 prior도 같이 forward
+```
+
+그래서 DDIM 100 step 샘플링이 **200 NFE**였고, CFG를 쓰는 PGR(uncond+cond, 역시 200 NFE)에
+대해 sampling 이점이 없었다. 하지만 **RTB loss만 prior density가 필요하고, 샘플링에는
+posterior drift 하나면 충분하다.**
+
+→ `qflow`가 posterior epsilon **전체**를 예측하도록 바꿨다 (`posterior_param='absolute'`,
+[diffusion.py](../synther/diffusion/diffusion.py) `QFlow.posterior_eps`).
+`--posterior_param residual`로 기존 동작을 재현할 수 있다.
+
+**부수 효과: init 버그도 해결.** `self.qflow = copy.deepcopy(bc_net.policy)`이므로 residual에서는
+fine-tuning 시작 시점에 `eps_post = 2 × eps_prior`였다. 즉 **posterior가 prior에서 출발하지 않았다** —
+RTB의 전제(posterior≡prior, `logZ=0`에서 시작)가 깨져 있었다.
+`# problem: needs debugging` / `# TODO: This is the main cause of not decreasing the loss`
+주석이 붙어 있던 자리다. 측정값:
+
+| | init `max|eps_post − eps_prior|` | init ratio | sampling NFE | 스모크런 첫 RTB loss |
+|---|---|---|---|---|
+| `absolute` | **0.000e+00** | **1.000** | **100** | 0.0 |
+| `residual` | 1.155e+00 | 2.000 | 200 | 1.07e12 |
+
+(loss 0.0은 스모크런의 reward normalizer가 퇴화해 `logr=0`이 된 영향도 있다. 확실한 건
+posterior≡prior라서 `logpf_p`와 `logpf_pi`가 정확히 상쇄된다는 것.)
+
+**논문에 쓸 sampling cost 표** (전부 DDIM 100 step, batch 하나당 denoiser forward):
+
+| 방법 | step당 forward | NFE | 근거 |
+|---|---|---|---|
+| SER | 1 (uncond) | 100 | [diffusion.py](../synther/diffusion/diffusion.py) `DiffusionModel.sample` |
+| **PGR (CFG)** | 2 (uncond + cond) | **200** | 같은 함수의 `cfg_scale` 분기 |
+| **Ours (absolute)** | 1 (posterior) | **100** | `QFlow.posterior_eps` |
+| Ours (residual, 구버전) | 2 (qflow + prior) | 200 | `QFlow.forward` |
+
+즉 **reward tilt가 가중치에 amortize되어 있어 guidance-free 모델과 같은 비용으로 샘플링한다.**
+학습 때는 여전히 2 NFE지만(RTB 목적함수에 prior density가 들어가므로 불가피) sampling 비용과는
+무관하다. 실측 wall-clock도 스모크런에서 0.86s vs 1.68s로 NFE 비율과 일치했다.
+`diffusion/sample_nfe`를 wandb에 로깅하므로 표를 값으로 뽑을 수 있다.
+
+⚠️ **fine-tuning의 의미가 바뀌는 변경이다.** 기록된 205 run은 모두 `residual`이므로
+[01_experiments.md](01_experiments.md)의 값과 직접 비교할 수 없다. 전체 재실행 필요.
+
+### I-13 (P0) `diffusion.py` == `diffusion_cond.py` (완전 중복) → **fixed in `b21c00b`**
 
 ```
 $ md5sum synther/diffusion/diffusion.py synther/diffusion/diffusion_cond.py
@@ -194,10 +245,9 @@ afab5241...  synther/diffusion/diffusion_cond.py
 | `online_cond_ddpm_ori.py:30`, `online_cond_ddpm_ori_abl.py:31` | `from synther.diffusion.diffusion import DiffusionModel, QFlow` |
 | `online_cond_origin_baseline.py:29` | `from synther.diffusion.diffusion_cond import DiffusionModel, QFlow` |
 
-→ **I-1/I-2를 한쪽만 고치면 Ours와 baseline이 서로 다른 RTB 코드로 돌아간다.**
-`diffusion_cond.py`를 `from synther.diffusion.diffusion import *` 한 줄로 바꾸거나,
-baseline의 import를 `diffusion`으로 통일해 사본을 없애는 게 맞다.
-(baseline은 QFlow를 실제로 쓰지 않을 수도 있으니 사용처 확인 후 정리)
+→ 한쪽만 고치면 Ours와 baseline이 서로 다른 코드로 돌아간다.
+`diffusion_cond.py`를 `diffusion.py`의 re-export로 만들어 사본을 없앴다.
+**이제 `diffusion.py`만 수정하면 된다.**
 
 ### I-14 (P2) 삭제된 스크립트를 호출하는 런처/README 잔존 → **fixed in `5173525`**
 
@@ -212,6 +262,7 @@ dead 런처 `run.sh` / `run_muj.sh` / `run_rtb.sh`를 삭제했다.
 | 날짜 | 이슈 | commit | 비고 |
 |---|---|---|---|
 | 2026-07-28 | §7 정리 | `607853c` | `synther/online/` 미사용 entry-point 9개 삭제 |
+| 2026-07-28 | I-13, I-15 | `b21c00b` | posterior를 absolute로 → sampling 1 NFE (PGR의 절반). `diffusion_cond.py` 사본 제거. **Ours 재실행 필요** |
 | 2026-07-28 | I-5, I-8, I-10, I-14 | `5173525` | `env_defaults.py` 도입 — 커맨드 25플래그 → 3~4플래그. HalfCheetah gin을 openai로 교정. 자세한 건 [04_script.md](04_script.md) |
 
 ---

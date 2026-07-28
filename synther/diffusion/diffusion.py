@@ -550,8 +550,27 @@ class QFlow(nn.Module):
         reward_percentile=None,
         eta=0.0,
         ddim=False,
+        posterior_param='absolute',
     ):
         super(QFlow, self).__init__()
+        # How the posterior epsilon is built from the fine-tuned net `qflow`:
+        #
+        #   'absolute' : eps_post = qflow(x, t)
+        #       `qflow` is a copy of the prior, so eps_post == eps_prior at init (what
+        #       RTB assumes) and *sampling needs a single network forward* -- the prior
+        #       is only touched by the loss, which needs its density anyway.
+        #       DDIM-100 sampling: 100 NFE, i.e. half of CFG-based PGR's 200.
+        #
+        #   'residual' : eps_post = qflow(x, t) + bc_net(x, t)
+        #       What the `*_final` runs used. Kept for reproducibility only: it forces
+        #       2 NFE per sampling step, and since `qflow` starts as a copy of the
+        #       prior it makes eps_post == 2 * eps_prior at init, so fine-tuning does
+        #       not start from the prior.
+        assert posterior_param in ('absolute', 'residual'), posterior_param
+        self.posterior_param = posterior_param
+        # Number of denoiser forwards, for the sampling-cost table. reset_nfe() before
+        # a sampling call, then read `nfe`.
+        self.nfe = 0
         self.x_dim = x_dim
         self.diffusion_steps = diffusion_steps
         self.schedule = schedule
@@ -600,11 +619,36 @@ class QFlow(nn.Module):
         self.ddim = ddim
         self.ddim_steps = 100
 
+    def reset_nfe(self):
+        self.nfe = 0
+
+    def posterior_eps(self, x, t, cond=None):
+        """Posterior epsilon only.
+
+        In 'absolute' mode this is ONE network forward -- use it on every path that
+        does not also need the prior epsilon (i.e. sampling). `forward` is for the RTB
+        loss, which needs both.
+        """
+        self.nfe += 1
+        q_epsilon = self.qflow(x, t, cond=cond)
+        if self.posterior_param == 'absolute':
+            return q_epsilon
+        self.nfe += 1
+        with torch.no_grad():
+            return q_epsilon + self.bc_net(x, t, cond=cond).detach()
+
     def forward(self, x, t, cond=None):
-        # problem: needs debugging
+        """Returns (posterior epsilon, prior epsilon) -- 2 network forwards.
+
+        Only the RTB loss needs the prior epsilon; sampling should call
+        `posterior_eps` instead.
+        """
+        self.nfe += 2
         q_epsilon = self.qflow(x, t, cond=cond)
         with torch.no_grad():
             bc_epsilon = self.bc_net(x, t, cond=cond).detach()
+        if self.posterior_param == 'residual':
+            return q_epsilon + bc_epsilon, bc_epsilon
         return q_epsilon, bc_epsilon
 
     def sample(self, bs, device, extra=False, eval=False, cond=None):
@@ -644,8 +688,9 @@ class QFlow(nn.Module):
                         # 같은 t에서 여러 번 epsilon을 재평가할 수 있음.
                         # (DDIM은 원래 1회 업데이트가 일반적이지만, 너 코드는 extra 옵션이 있으니 보존)
                         for _ in range(extra_steps):
-                            q_eps, bc_eps = self(x, t, cond=cond)
-                            eps = (q_eps + bc_eps).detach()
+                            # Sampling only needs the posterior drift: 1 NFE in
+                            # 'absolute' mode, 2 in 'residual' mode.
+                            eps = self.posterior_eps(x, t, cond=cond).detach()
 
                             abar_i = self.bc_net.alphabar_t[i]
                             sqrt_abar_i = torch.sqrt(abar_i)
@@ -705,11 +750,9 @@ class QFlow(nn.Module):
                         extra_steps = 20
                     for i in range(self.diffusion_steps):
                         for j in range(extra_steps):
-                            # problem: needs debugging
-                            q_epsilon, bc_epsilon = self(x, t, cond=cond)
+                            # Sampling only needs the posterior drift (see above).
+                            epsilon = self.posterior_eps(x, t, cond=cond)
 
-                            epsilon = q_epsilon + bc_epsilon
-                            
                             # if it is the last step, no noise is added
                             if i < self.diffusion_steps - 1:
                                 new_x = self.bc_net.oneover_sqrta[i] * (
@@ -780,9 +823,10 @@ class QFlow(nn.Module):
                     # 같은 t에서 여러 번 epsilon을 재평가할 수 있음.
                     # (DDIM은 원래 1회 업데이트가 일반적이지만, 너 코드는 extra 옵션이 있으니 보존)
                     for _ in range(extra_steps):
-                        q_eps, bc_eps = self(x, t, cond=cond)
-                        eps = (q_eps + bc_eps).detach()
-                        
+                        # RTB loss path: needs the prior epsilon too, so 2 NFE.
+                        eps, bc_eps = self(x, t, cond=cond)
+                        eps = eps.detach()
+
                         abar_i = self.bc_net.alphabar_t[i]
                         sqrt_abar_i = torch.sqrt(abar_i)
                         sqrt_one_m_abar_i = torch.sqrt(1.0 - abar_i)
@@ -893,10 +937,8 @@ class QFlow(nn.Module):
                     extra_steps = 20
                 for i in range(self.diffusion_steps):
                     for j in range(extra_steps):
-                        # problem: needs debugging
-                        q_epsilon, bc_epsilon = self(x, t)
-
-                        epsilon = q_epsilon + bc_epsilon
+                        # RTB loss path: needs the prior epsilon too, so 2 NFE.
+                        epsilon, bc_epsilon = self(x, t)
                         new_x = self.bc_net.oneover_sqrta[i] * (
                             x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
                         ) + torch.sqrt(self.bc_net.beta_t[i]) * torch.randn_like(x, dtype=self.dtype)
@@ -932,8 +974,7 @@ class QFlow(nn.Module):
         # Forth
         dt = 1 / self.diffusion_steps
         for i in range(int(self.diffusion_steps * (1.0 - ratio)), self.diffusion_steps):
-            q_epsilon, bc_epsilon = self(x, t)
-            epsilon = q_epsilon + bc_epsilon
+            epsilon, bc_epsilon = self(x, t)
             
             new_x = self.bc_net.oneover_sqrta[i] * (
                     x - self.bc_net.mab_over_sqrtmab_inv[i] * epsilon.detach()
@@ -955,8 +996,7 @@ class QFlow(nn.Module):
             )
             new_x = pb_dist.sample()
             
-            q_epsilon, bc_epsilon = self(new_x, t + i * dt)
-            epsilon = q_epsilon + bc_epsilon
+            epsilon, bc_epsilon = self(new_x, t + i * dt)
             
             pf_pi_dist = torch.distributions.Normal(
                 self.bc_net.oneover_sqrta[i] * (new_x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
@@ -980,8 +1020,7 @@ class QFlow(nn.Module):
             )
             new_x = pb_dist.sample()
             
-            q_epsilon, bc_epsilon = self(new_x, t + i * dt)
-            epsilon = q_epsilon + bc_epsilon
+            epsilon, bc_epsilon = self(new_x, t + i * dt)
             
             pf_pi_dist = torch.distributions.Normal(
                 self.bc_net.oneover_sqrta[i] * (new_x - self.bc_net.mab_over_sqrtmab_inv[i] * bc_epsilon),
@@ -1218,8 +1257,7 @@ class QFlow(nn.Module):
                 # new_x에서 epsilon 예측 (new_x는 j 상태이므로 j의 시간을 사용해야 함)
                 if j is not None:
                     t_j = torch.full((bs,), float(j) / float(T), dtype=self.dtype, device=device)
-                    q_epsilon, bc_epsilon = self(new_x, t_j)
-                    epsilon = q_epsilon + bc_epsilon
+                    epsilon, bc_epsilon = self(new_x, t_j)
                     
                     # DDIM 업데이트를 역으로 사용하여 proposal 분포 계산
                     # new_x (x_j)에서 x (x_i)로 가는 proposal
@@ -1316,8 +1354,7 @@ class QFlow(nn.Module):
                 )
                 new_x = pb_dist.sample()
 
-                q_epsilon, bc_epsilon = self(new_x, t + i * dt)
-                epsilon = q_epsilon + bc_epsilon
+                epsilon, bc_epsilon = self(new_x, t + i * dt)
                 
                 # noised 샘플로 만든 proposal이 필요함
                 # 이걸 만드려면 j가 필요함

@@ -4,9 +4,9 @@
 
 ## 코드 (실험 전에 먼저)
 
-- [ ] **I-13** `diffusion.py` / `diffusion_cond.py` 중복 제거 — **I-1보다 먼저.**
-      지금 두 파일이 byte 단위로 같은데 Ours는 `diffusion`, baseline은 `diffusion_cond`를
-      import한다. 한쪽만 고치면 두 방법이 다른 코드로 돌아간다
+- [x] **I-15** posterior를 absolute parameterization으로 → sampling 1 NFE
+      (`--posterior_param`, 기본 `absolute`). init `posterior≡prior` 버그도 같이 해결
+- [x] **I-13** `diffusion_cond.py`를 `diffusion.py` re-export로 (사본 제거)
 - [ ] **I-1** `posterior_log_reward` 반환값 `clamp_min(1e-6)` — `log(0)` 방지
       → 이거 고치기 전에 돌린 clip/α 결과는 재해석 대상
 - [ ] **I-12** `_mujoco_set_state_from_obs`에 dm_control 분기 추가 → DMC 5종에도 DynMSE
@@ -19,6 +19,17 @@
 
 ## 재실행 (결과 신뢰성)
 
+- [ ] **I-15** ⚠️ **Ours 전체 재실행 (8 태스크 × 2 novelty × 5 seed).**
+      `absolute`는 fine-tuning의 의미가 달라 기존 205 run과 비교 불가.
+      baseline(SER/PGR)은 영향 없으므로 그대로 쓸 수 있다 (HalfCheetah만 I-5로 재실행).
+      ```bash
+      for a in ours ours-rnd; do GPUS="0 1 2 3" bash scripts/run.sh $a all; done
+      ```
+- [ ] **I-15b** sampling cost 표용 대조군: 같은 태스크에서 `--posterior_param residual`
+      1 seed씩 돌려 `diffusion/sample_nfe`와 `diffusion/sampling_time_sec`를 나란히 확보
+      ```bash
+      bash scripts/run.sh ours hopper 0 -- --posterior_param residual
+      ```
 - [ ] **I-5** HalfCheetah 전체 재실행 — gin이 `openai.gin`으로 바뀌었으므로(`5173525`)
       기존 `half_final` 값은 새 설정과 비교 불가. 5 method × 5 seed:
       ```bash
@@ -45,7 +56,12 @@
 
 ## 논문 스토리 메모
 
-주장 순서는 **"성능"이 아니라 "품질"**로 잡는 게 데이터에 맞는다:
+**sampling 효율 (I-15)**: amortized posterior는 step당 1 forward라 CFG를 쓰는 PGR의 절반이다
+(DDIM 100 step 기준 100 NFE vs 200). reward tilt가 가중치에 들어가 있어 test-time guidance가
+필요 없다는 것 — guidance-free SER과 같은 비용으로 reward-tilted 샘플을 얻는다.
+`diffusion/sample_nfe` + `diffusion/sampling_time_sec`로 값을 뽑을 수 있다.
+
+주장 순서는 **"성능"이 아니라 "품질 + 효율"**로 잡는 게 데이터에 맞는다:
 
 1. RTB fine-tuning은 생성 transition의 dynamics 오차를 크게 줄인다 (DynMSE, MuJoCo 3/3)
 2. 동시에 state entropy를 유지·향상시킨다 (novelty를 좇되 prior를 안 깬다)
