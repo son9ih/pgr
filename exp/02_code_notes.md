@@ -1,6 +1,6 @@
 # 02. 코드 맵 & 수정 방향
 
-기준 commit: `242d57e`, branch `AAAI2027`.
+기준 commit: `a8f254f`, branch `AAAI2027`.
 
 ---
 
@@ -104,7 +104,7 @@
 q_r = ((q_r + 1) / 2).clamp_min(1e-6)
 ```
 
-⚠️ `diffusion.py`와 `diffusion_cond.py` **양쪽 모두** 고쳐야 한다 (I-13).
+`diffusion.py`만 고치면 된다 (I-13 해결 후 `diffusion_cond.py`는 re-export).
 
 → `ft_clip_grad=1.0`이 finger/quad에서 오히려 나빴던 것도(§01 관찰 6) 이 경로에서
 튄 gradient를 clip이 방향까지 뭉갠 결과일 수 있다. **먼저 이걸 고치고 clip 실험을 다시 해석해야 한다.**
