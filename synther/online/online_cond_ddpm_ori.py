@@ -249,11 +249,13 @@ def redq_sac(
         # `_abs`/`_res` marks the posterior parameterization -- the *_final runs are all
         # `res`, and the two are not comparable, so keep them in separate wandb groups.
         pp = args.posterior_param[:3]
-        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Ours+{args.novelty_measure}_{pp}_ftlr{args.finetune_lr}_clip{args.ft_clip_grad}_A{args.alpha_rtb}_On{args.inter_onpolicy}_anl{args.anneal}"
+        # Synthetic-buffer capacity, so a capacity ablation is separable in the UI.
+        buf = f"buf{diffusion_buffer_size // 1000}k"
+        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Ours+{args.novelty_measure}_{pp}_{buf}_ftlr{args.finetune_lr}_clip{args.ft_clip_grad}_A{args.alpha_rtb}_On{args.inter_onpolicy}_anl{args.anneal}"
         wandb.init(
             entity="gda-for-orl",
-            project = env_name,
-            group = f'Ours+{args.novelty_measure}_{pp}',
+            project = args.wandb_project or env_name,
+            group = f'Ours+{args.novelty_measure}_{pp}_{buf}',
             name = run_name,
             config={
                 "env_name": env_name,
@@ -1137,7 +1139,8 @@ def redq_sac(
                 print(f'Diffusion Reward: {np.mean(rewards):.2f} {np.std(rewards):.2f}')
                 print(f'     Real Reward: {np.mean(real_rewards):.2f} {np.std(real_rewards):.2f}')
                 print(f'Replay buffer size: {ptr_location}')
-                print(f'Diffusion buffer size: {agent.diffusion_buffer.ptr}')
+                # .size, not .ptr -- ptr wraps to 0 when the buffer is exactly full.
+                print(f'Diffusion buffer size: {agent.diffusion_buffer.size}')
 
             # ---- Dynamic MSE logging (placed right after print_buffer_stats, as requested) ----
             print(f'Computing Dynamic MSE...')
@@ -1332,6 +1335,8 @@ if __name__ == '__main__':
     # Additional arguments
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--wandb', action='store_true', default=False)
+    # None -> the env name, which is what the *_final projects were collected from by hand.
+    parser.add_argument('--wandb_project', type=str, default=None)
     parser.add_argument('--synther', action='store_true', default=False)
 
     parser.add_argument('--knn_clip', type=float, default=0.0)

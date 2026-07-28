@@ -49,7 +49,13 @@ class ReplayBuffer:
         self.rews_buf[self.ptr] = rew
         self.done_buf[self.ptr] = done
         ## move the pointer to store in next location in buffer
-        self.ptr = (self.ptr+1) % (self.max_size + 1)
+        # NOTE: this was `% (self.max_size + 1)`, which lets ptr reach max_size and index
+        # one past the end of the arrays -- an IndexError on store number max_size+1.
+        # Nothing hit it because every buffer here is filled with at most max_size items
+        # (the synthetic buffer is recreated per retrain and takes exactly num_samples),
+        # so this fix is behaviour-neutral for existing configs and makes the buffer
+        # actually wrap FIFO when it is smaller than the number of stores.
+        self.ptr = (self.ptr+1) % self.max_size
         ## keep track of the current buffer size
         self.size = min(self.size+1, self.max_size)
 
