@@ -4,8 +4,14 @@
 
 ## 코드 (실험 전에 먼저)
 
+- [ ] **I-13** `diffusion.py` / `diffusion_cond.py` 중복 제거 — **I-1보다 먼저.**
+      지금 두 파일이 byte 단위로 같은데 Ours는 `diffusion`, baseline은 `diffusion_cond`를
+      import한다. 한쪽만 고치면 두 방법이 다른 코드로 돌아간다
 - [ ] **I-1** `posterior_log_reward` 반환값 `clamp_min(1e-6)` — `log(0)` 방지
       → 이거 고치기 전에 돌린 clip/α 결과는 재해석 대상
+- [ ] **I-14** README "Running Instructions"를 실제 커맨드로 교체
+      (`online_cond.py --algorithm ...`은 파일도 인자도 없음) + `run.sh:160`,
+      `run_muj.sh:109`, `run_ori.sh:217,227` 정리
 - [ ] **I-12** `_mujoco_set_state_from_obs`에 dm_control 분기 추가 → DMC 5종에도 DynMSE
 - [ ] **I-11** reward 함수 안 `print` 디버그 플래그로 게이트
 - [ ] **I-2** off-policy `y_weights` 갱신 여부 결정 (의도된 고정인지 확인 후)

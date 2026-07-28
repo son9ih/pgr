@@ -10,12 +10,17 @@
 |---|---|
 | [synther/online/online_cond_ddpm_ori.py](../synther/online/online_cond_ddpm_ori.py) | **Ours.** SAC/REDQ 루프 + DDPM prior 학습 + RTB posterior fine-tuning (1356 lines) |
 | [synther/online/online_cond_origin_baseline.py](../synther/online/online_cond_origin_baseline.py) | **SER / PGR / PGR-rnd** baseline (DDPM 버전, 1141 lines) |
-| [synther/online/online_cond_ddpm_ori_abl.py](../synther/online/online_cond_ddpm_ori_abl.py) | ablation 변형 (untracked). ↓ §4 |
-| [synther/diffusion/diffusion_cond.py](../synther/diffusion/diffusion_cond.py) | `DiffusionModel`, `QFlow`(RTB), `posterior_log_reward`, `compute_loss*` |
+| [synther/online/online_cond_ddpm_ori_abl.py](../synther/online/online_cond_ddpm_ori_abl.py) | ablation 변형. ↓ §4 |
+| [synther/diffusion/diffusion.py](../synther/diffusion/diffusion.py) | `DiffusionModel`, `QFlow`(RTB), `posterior_log_reward`, `compute_loss*` — **Ours가 쓰는 쪽** |
+| [synther/diffusion/diffusion_cond.py](../synther/diffusion/diffusion_cond.py) | 위 파일과 **byte 단위로 동일한 사본** — baseline이 쓰는 쪽 (⚠️ I-13) |
 | [synther/diffusion/denoiser_network_cond.py](../synther/diffusion/denoiser_network_cond.py) | `ResidualMLPDenoiser` |
 | [config/online/sac_cond_synther_dmc.gin](../config/online/sac_cond_synther_dmc.gin) | DMC 기본 설정 (UTD 20, cfg_scale 2.0, `skip_reward_norm=True`, terminal 없음) |
 | [config/online/sac_cond_synther_openai.gin](../config/online/sac_cond_synther_openai.gin) | dmc.gin include + `skip_reward_norm=False` + `modelled_terminals=True` |
-| `run_ori.sh` / `run_ori_ours.sh` / `run_abl.sh` | 런처 (⚠️ 현재 내용이 `*_final` 실행값과 어긋남 — I-8) |
+| `run_ori.sh` / `run_ori_ours.sh` / `run_abl.sh` | 런처 (untracked, `.gitignore`의 `*.sh`에 걸림). ⚠️ 내용이 `*_final` 실행값과 어긋남 — I-8 |
+| `run.sh` / `run_muj.sh` / `run_rtb.sh` | 구 런처 (tracked). ⚠️ 삭제된 스크립트를 호출하는 라인 잔존 — I-14 |
+
+`synther/online/`에는 위 3개 entry-point와 공용 모듈(`redq_rlpd_agent.py`,
+`conditional_nets.py`, `eco.py`, `utils.py`)만 남겼다. 삭제 목록은 §7.
 
 ## 2. 알고리즘 요약 (Ours)
 
@@ -27,15 +32,15 @@
    (`cfg_dropout=0.25`, `cfg_scale=2.0`).
 2. **Posterior (RTB)**: `QFlow`가 prior EMA 사본을 복제해 fine-tuning
    ([online_cond_ddpm_ori.py:761](../synther/online/online_cond_ddpm_ori.py#L761)).
-   loss ([diffusion_cond.py:1294](../synther/diffusion/diffusion_cond.py#L1294)):
+   loss ([diffusion.py:1294](../synther/diffusion/diffusion.py#L1294)):
 
    ```
    0.5 * ( ( logZ + α·logpf_prior − logr.detach() − α·logpf_posterior ) / x_dim )²
    ```
 
-   - `α = --alpha_rtb`, `logZ`는 학습 파라미터 (`diffusion_cond.py:559`)
+   - `α = --alpha_rtb`, `logZ`는 학습 파라미터 (`diffusion.py:559`)
    - `logr = log(posterior_log_reward(x))`, reward는 novelty measure
-     ([diffusion_cond.py:1085](../synther/diffusion/diffusion_cond.py#L1085)):
+     ([diffusion.py:1085](../synther/diffusion/diffusion.py#L1085)):
      `curiosity` = forward-dynamics ensemble error `q_net(obs, next_obs, act)`,
      `rnd` = `agent.compute_intrinsic_reward(next_obs)`, `eco` = `compute_eco_reward(obs)`
    - reward는 `cond_normalizer` → `clamp(-1,1)` → `(x+1)/2` 로 [0,1]에 밀어넣는다
@@ -83,7 +88,7 @@
 
 ### I-1 (P0) `log(0)` → `-inf` 위험
 
-[diffusion_cond.py:1085-1128](../synther/diffusion/diffusion_cond.py#L1085)에서
+[diffusion.py:1085-1128](../synther/diffusion/diffusion.py#L1085)에서
 `q_r = clamp(normalize(q_r), -1, 1); q_r = (q_r + 1) / 2` → **정확히 0이 될 수 있다**.
 그 뒤 `logr = self.posterior_log_reward(x).log()` (L949, L1174, L1309) 이므로
 `-inf` → loss `inf`/`nan`. `--clip_reward 0.95`를 쓰면 하위 샘플이 clamp 하한에 붙기 때문에
@@ -93,6 +98,8 @@
 # 수정안
 q_r = ((q_r + 1) / 2).clamp_min(1e-6)
 ```
+
+⚠️ `diffusion.py`와 `diffusion_cond.py` **양쪽 모두** 고쳐야 한다 (I-13).
 
 → `ft_clip_grad=1.0`이 finger/quad에서 오히려 나빴던 것도(§01 관찰 6) 이 경로에서
 튄 gradient를 clip이 방향까지 뭉갠 결과일 수 있다. **먼저 이걸 고치고 clip 실험을 다시 해석해야 한다.**
@@ -163,10 +170,78 @@ DMC는 `env.unwrapped.physics.set_state()` / `get_state()`로 같은 걸 할 수
 `_mujoco_set_state_from_obs`에 dm_control 분기를 추가하면 8개 태스크 전부에서
 같은 그림을 그릴 수 있다. **여기가 지금 가장 가성비 높은 코드 작업이다.**
 
+### I-13 (P0) `diffusion.py` == `diffusion_cond.py` (완전 중복)
+
+```
+$ md5sum synther/diffusion/diffusion.py synther/diffusion/diffusion_cond.py
+afab5241...  synther/diffusion/diffusion.py
+afab5241...  synther/diffusion/diffusion_cond.py
+```
+
+**byte 단위로 동일한 두 사본**인데 import 경로가 갈린다:
+
+| 스크립트 | import |
+|---|---|
+| `online_cond_ddpm_ori.py:30`, `online_cond_ddpm_ori_abl.py:31` | `from synther.diffusion.diffusion import DiffusionModel, QFlow` |
+| `online_cond_origin_baseline.py:29` | `from synther.diffusion.diffusion_cond import DiffusionModel, QFlow` |
+
+→ **I-1/I-2를 한쪽만 고치면 Ours와 baseline이 서로 다른 RTB 코드로 돌아간다.**
+`diffusion_cond.py`를 `from synther.diffusion.diffusion import *` 한 줄로 바꾸거나,
+baseline의 import를 `diffusion`으로 통일해 사본을 없애는 게 맞다.
+(baseline은 QFlow를 실제로 쓰지 않을 수도 있으니 사용처 확인 후 정리)
+
+### I-14 (P2) 삭제된 스크립트를 호출하는 런처/README 잔존
+
+§7 정리 후 아래가 dangling 상태다:
+
+| 위치 | 호출 |
+|---|---|
+| `README.md` "Running Instructions" 전체 (L24-115) | `online_cond.py --algorithm ...` — 파일도, `--algorithm` 인자도 없음 |
+| `run.sh:160` | `online_cond_ddpm.py` |
+| `run_muj.sh:109` | `online_cond.py` |
+| `run_ori.sh:217,227` (untracked) | `online_cond.py` |
+
+README는 [01_experiments.md §2](01_experiments.md)의 실제 커맨드로 교체해야 한다.
+
 ---
 
 ## 6. 수정 이력
 
 | 날짜 | 이슈 | commit | 비고 |
 |---|---|---|---|
-| | | | |
+| 2026-07-28 | §7 정리 | (아래 커밋) | `synther/online/` 미사용 entry-point 9개 삭제 |
+
+---
+
+## 7. `synther/online/` 정리 (2026-07-28)
+
+**남긴 것** — entry-point 3개 + 공용 모듈 4개
+
+| 파일 | 남긴 이유 |
+|---|---|
+| `online_cond_ddpm_ori.py` | Ours |
+| `online_cond_origin_baseline.py` | SER / PGR / PGR-rnd |
+| `online_cond_ddpm_ori_abl.py` | 진행 중인 ablation (reward 히스토그램). §4 |
+| `redq_rlpd_agent.py` | 위 3개가 모두 import |
+| `conditional_nets.py` | `redq_rlpd_agent.py:9` (`Curiosity`, `Predictor`) |
+| `eco.py` | `redq_rlpd_agent.py:11` (`ECO`) |
+| `utils.py` | 위 3개가 모두 import (`PBE`, `RMS`, `compute_intr_reward`, ...) |
+
+**삭제한 것** — import하는 곳이 없는 중간 완성물 9개
+
+| 파일 | 크기 | 삭제 근거 |
+|---|---|---|
+| `online_cond.py` | 88K | 어떤 .py도 import 안 함 (README/런처 텍스트 참조만 → I-14) |
+| `online_cond2.py` | 58K | 참조 0 |
+| `online_cond_ddpm.py` | 94K | 참조 0 (`run.sh:160`만 → I-14) |
+| `online_cond_origin.py` | 26K | 참조 0 |
+| `online_cond_rtb.py` | 49K | 참조 0 |
+| `online_cond_maze.py` | 62K | 참조 0 |
+| `redq_rlpd_agent_maze.py` | 14K | 유일한 importer가 `online_cond_maze.py`였음 |
+| `online_cond_vis.py` | 64K | 참조 0 |
+| `visual/vis_env.py` | — | 유일한 importer가 `online_cond_vis.py`였음 |
+
+- maze / visual-env 실험 경로가 통째로 사라진다. 되살릴 땐
+  `git show 404186a:synther/online/<file> > <file>`.
+- 삭제 후 `python -m py_compile synther/online/*.py` 통과, 남은 .py 중
+  삭제 모듈을 import하는 곳 없음.
