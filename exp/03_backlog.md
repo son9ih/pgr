@@ -12,7 +12,7 @@
 - [ ] **I-12** `_mujoco_set_state_from_obs`에 dm_control 분기 추가 → DMC 5종에도 DynMSE
 - [ ] **I-11** reward 함수 안 `print` 디버그 플래그로 게이트
 - [ ] **I-2** off-policy `y_weights` 갱신 여부 결정 (의도된 고정인지 확인 후)
-- [ ] **I-9** `--wandb_project` / `--wandb_group` 인자화
+- [x] **I-9** `--wandb_project` 인자화 (`164fca3`) — `--wandb_group`은 미구현
 - [x] **I-10** `--epochs` 인자화 (`5173525`) — 남은 일: `*_abl.py`를
       `--epochs 62` + reward-dump 플래그로 접어서 사본 제거
 - [x] **I-8/I-14** 런처·README 정리 → `scripts/run.sh` + [04_script.md](04_script.md) (`5173525`)
@@ -45,21 +45,13 @@
 - [ ] **I-6** quad를 다른 태스크와 같은 `accumulation_steps=4`, `num_posterior_epochs=100`으로
       한 번 더 돌려 연산량 confound 제거
 
-## 진행 중
+## 완료된 실험
 
-- [~] **synthetic buffer capacity ablation** (2026-07-28 시작, reacher-hard)
-      capacity ∈ {50k, 200k} × 5 seed = 10 run, GPU 0–3에 (3,3,2,2).
-      1M arm은 기록된 `reacher_final` 데이터를 그대로 쓰므로 **`--posterior_param residual`**
-      로 맞췄다 (reacher는 dmc.gin이라 I-5 무관, I-16은 로깅값 불변, I-13은 no-op,
-      env_defaults의 reacher 값이 기록된 run과 동일 → 세 곡선이 capacity만 다르다).
-      `num_samples`도 capacity에 맞췄다 — 남는 샘플은 어차피 posterior i.i.d.라 분포가 같고
-      sampling이 20배 싸다.
-      ```bash
-      bash scripts/run_ablation_buffer.sh          # DRY=1로 계획 확인
-      python exp/tools/fetch_curves.py             # -> exp/data/buffer_ablation_reacher.csv
-      python exp/tools/plot_buffer_ablation.py --smooth 5   # -> exp/figures/
-      ```
-      wandb: project `reacher_buffer_ablation`, group `Ours+curiosity_res_buf{50,200}k`
+- [x] **synthetic buffer capacity ablation** (2026-07-28~29, reacher-hard, 10 run)
+      → 전체 기록은 [05_ablation_buffer.md](05_ablation_buffer.md).
+      단조 순서(50k < 200k < 1M)는 나오지만 **n=5로는 어느 쌍도 유의하지 않고**
+      (최소 p=0.10), 가장 견고한 신호는 분산 축소(std 206 → 182 → 68)다.
+      → 후속: **seed 10개로 확장** (지금 효과 크기 194에 std ±206이면 검정력 부족)
 
 ## 추가 실험 (논문 방어용)
 
