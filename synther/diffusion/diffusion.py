@@ -551,8 +551,13 @@ class QFlow(nn.Module):
         eta=0.0,
         ddim=False,
         posterior_param='absolute',
+        onpolicy_grad=False,
     ):
         super(QFlow, self).__init__()
+        # True: the on-policy DDIM loss path builds the posterior mean from a non-detached
+        # epsilon so the fine-tuned net gets gradient (default False reproduces the old
+        # behaviour, where only logZ was trained on on-policy epochs).
+        self.onpolicy_grad = onpolicy_grad
         # How the posterior epsilon is built from the fine-tuned net `qflow`:
         #
         #   'absolute' : eps_post = qflow(x, t)
@@ -824,8 +829,8 @@ class QFlow(nn.Module):
                     # (DDIM은 원래 1회 업데이트가 일반적이지만, 너 코드는 extra 옵션이 있으니 보존)
                     for _ in range(extra_steps):
                         # RTB loss path: needs the prior epsilon too, so 2 NFE.
-                        eps, bc_eps = self(x, t, cond=cond)
-                        eps = eps.detach()
+                        eps_grad, bc_eps = self(x, t, cond=cond)
+                        eps = eps_grad.detach()
 
                         abar_i = self.bc_net.alphabar_t[i]
                         sqrt_abar_i = torch.sqrt(abar_i)
@@ -834,6 +839,9 @@ class QFlow(nn.Module):
                         # x0 prediction
                         x0 = (x - sqrt_one_m_abar_i * eps) / (sqrt_abar_i + 1e-12)
                         x0_bc = (x - sqrt_one_m_abar_i * bc_eps) / (sqrt_abar_i + 1e-12)
+                        # Only the log-prob mean carries gradient; the trajectory stays detached.
+                        eps_mean = eps_grad if self.onpolicy_grad else eps
+                        x0_mean = (x - sqrt_one_m_abar_i * eps_mean) / (sqrt_abar_i + 1e-12)
                         
                         if j is None:
                             x = x0
@@ -885,7 +893,7 @@ class QFlow(nn.Module):
                         logpf_pi += pf_pi_dist.log_prob(x).sum(1)
                         
                         pf_p_dist = torch.distributions.Normal(
-                            sqrt_abar_j * x0 + c * eps,
+                            sqrt_abar_j * x0_mean + c * eps_mean,
                             sigma * torch.ones_like(x, dtype=self.dtype),
                         )
                         logpf_p += pf_p_dist.log_prob(x).sum(1)
