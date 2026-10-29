@@ -551,13 +551,8 @@ class QFlow(nn.Module):
         eta=0.0,
         ddim=False,
         posterior_param='absolute',
-        onpolicy_grad=False,
     ):
         super(QFlow, self).__init__()
-        # True: the on-policy DDIM loss path builds the posterior mean from a non-detached
-        # epsilon so the fine-tuned net gets gradient (default False reproduces the old
-        # behaviour, where only logZ was trained on on-policy epochs).
-        self.onpolicy_grad = onpolicy_grad
         # How the posterior epsilon is built from the fine-tuned net `qflow`:
         #
         #   'absolute' : eps_post = qflow(x, t)
@@ -840,8 +835,7 @@ class QFlow(nn.Module):
                         x0 = (x - sqrt_one_m_abar_i * eps) / (sqrt_abar_i + 1e-12)
                         x0_bc = (x - sqrt_one_m_abar_i * bc_eps) / (sqrt_abar_i + 1e-12)
                         # Only the log-prob mean carries gradient; the trajectory stays detached.
-                        eps_mean = eps_grad if self.onpolicy_grad else eps
-                        x0_mean = (x - sqrt_one_m_abar_i * eps_mean) / (sqrt_abar_i + 1e-12)
+                        x0_grad = (x - sqrt_one_m_abar_i * eps_grad) / (sqrt_abar_i + 1e-12)
                         
                         if j is None:
                             x = x0
@@ -893,7 +887,7 @@ class QFlow(nn.Module):
                         logpf_pi += pf_pi_dist.log_prob(x).sum(1)
                         
                         pf_p_dist = torch.distributions.Normal(
-                            sqrt_abar_j * x0_mean + c * eps_mean,
+                            sqrt_abar_j * x0_grad + c * eps_grad,
                             sigma * torch.ones_like(x, dtype=self.dtype),
                         )
                         logpf_p += pf_p_dist.log_prob(x).sum(1)

@@ -251,7 +251,7 @@ def redq_sac(
         pp = args.posterior_param[:3]
         # Synthetic-buffer capacity, so a capacity ablation is separable in the UI.
         buf = f"buf{diffusion_buffer_size // 1000}k"
-        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Ours+{args.novelty_measure}_{pp}_{buf}_ftlr{args.finetune_lr}_clip{args.ft_clip_grad}_A{args.alpha_rtb}_On{args.inter_onpolicy}_anl{args.anneal}{'_opg' if args.onpolicy_grad else ''}"
+        run_name = f"{env_name}_{seed}_{time.strftime('%Y%m%d-%H%M%S')}_Ours+{args.novelty_measure}_{pp}_{buf}_ftlr{args.finetune_lr}_clip{args.ft_clip_grad}_A{args.alpha_rtb}_On{args.inter_onpolicy}_anl{args.anneal}"
         wandb.init(
             entity="gda-for-orl",
             project = args.wandb_project or env_name,
@@ -311,7 +311,6 @@ def redq_sac(
                 "ft_clip_grad": args.ft_clip_grad,
                 "anneal": args.anneal,
                 "posterior_param": args.posterior_param,
-                "onpolicy_grad": args.onpolicy_grad,
             }
         )
         print(f'Initialized wandb with run name {run_name}')
@@ -780,7 +779,7 @@ def redq_sac(
             posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb,
                                     obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
                                     agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim,
-                                    posterior_param=args.posterior_param, onpolicy_grad=args.onpolicy_grad).to(device=device)
+                                    posterior_param=args.posterior_param).to(device=device)
             
             # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
             #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
@@ -1381,8 +1380,6 @@ if __name__ == '__main__':
     # See synther/diffusion/diffusion.py QFlow.__init__ for why absolute is correct.
     parser.add_argument('--posterior_param', type=str, default='absolute',
                         choices=['absolute', 'residual'])
-    # Let on-policy RTB epochs train the net (default off = behaviour of every run so far).
-    parser.add_argument('--onpolicy_grad', action='store_true', default=False)
 
     # DDIM sampling is on by default (every final run used it); --no_ddim opts out.
     parser.add_argument('--ddim', action='store_true', default=True)
