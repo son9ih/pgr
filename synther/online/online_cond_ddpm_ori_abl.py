@@ -93,6 +93,7 @@ def compute_dynamic_mse_from_diffusion_buffer(
     diffusion_buffer,
     gt_env: gym.Env,
     n_samples: int = 5000,
+    batch=None,
 ) -> dict:
     """
     Computes per-transition Dynamic MSE on synthetic transitions stored in diffusion_buffer,
@@ -105,10 +106,10 @@ def compute_dynamic_mse_from_diffusion_buffer(
     Returns a dict with arrays + summary stats.
     """
     n_samples = int(n_samples)
-    if diffusion_buffer.size <= 0:
-        return dict(ok=False, reason="empty_diffusion_buffer")
-
-    batch = diffusion_buffer.sample_batch(batch_size=min(n_samples, diffusion_buffer.size))
+    if batch is None:
+        if diffusion_buffer.size <= 0:
+            return dict(ok=False, reason="empty_diffusion_buffer")
+        batch = diffusion_buffer.sample_batch(batch_size=min(n_samples, diffusion_buffer.size))
     obs1 = batch["obs1"]
     acts = batch["acts"]
     obs2 = batch["obs2"]
@@ -172,6 +173,7 @@ def compute_dynamic_mse_from_diffusion_buffer(
         ok=True,
         n_total=int(obs1.shape[0]),
         n_ok=int(ok_mask.sum()),
+        ok_mask=ok_mask,
         dyn_mse=dyn_mse,
         state_mse=state_mse,
         reward_mse=reward_mse,
@@ -252,7 +254,7 @@ def redq_sac(
         wandb.init(
             entity="gda-for-orl",
             project = env_name,
-            group = f'Ours+{args.novelty_measure}_ablation',
+            group = args.wandb_group or f'Ours+{args.novelty_measure}_ablation',
             name = run_name,
             config={
                 "env_name": env_name,
@@ -728,346 +730,358 @@ def redq_sac(
             
             # rtb fine-tuning
             
-            alpha_rtb = args.alpha_rtb
-            # beta = args.beta
+            betas = [float(b) for b in args.beta_sweep.split(',')] if args.beta_sweep and cur_epoch == args.sweep_epoch else [None]
+            for beta in betas:  # beta sweep at one checkpoint: same prior, posterior re-fit per beta (beta=0: prior only)
+                alpha_rtb = args.alpha_rtb if beta is None else (1.0 / beta if beta > 0 else 1.0)
+                num_posterior_epochs = args.num_posterior_epochs if beta != 0 else 0
+                # beta = args.beta
             
             
-            # define reward proxy 
-            # update basic onpolicy reward
-            agent.update_onpolicy_reward()
-            print(f'max_onpolicy_reward: {agent.max_onpolicy_reward}')
+                # define reward proxy 
+                # update basic onpolicy reward
+                agent.update_onpolicy_reward()
+                print(f'max_onpolicy_reward: {agent.max_onpolicy_reward}')
             
-            # Choose different reward function to optimize for different algorithms
-            # For unity, each compute_intrinsic_reward and compute_reward should take the whole transition as input
-            # TODO
-            if args.novelty_measure == 'curiosity':
-                proxy_model_ens = agent.cond_net.compute_reward_torch
-            elif args.novelty_measure == 'rnd':
-                proxy_model_ens = agent.compute_intrinsic_reward
-            elif args.novelty_measure == 'eco':
-                proxy_model_ens = agent.compute_eco_reward
-            else:
-                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
+                # Choose different reward function to optimize for different algorithms
+                # For unity, each compute_intrinsic_reward and compute_reward should take the whole transition as input
+                # TODO
+                if args.novelty_measure == 'curiosity':
+                    proxy_model_ens = agent.cond_net.compute_reward_torch
+                elif args.novelty_measure == 'rnd':
+                    proxy_model_ens = agent.compute_intrinsic_reward
+                elif args.novelty_measure == 'eco':
+                    proxy_model_ens = agent.compute_eco_reward
+                else:
+                    raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
             
-            # define posterior model and optimizer
-            # proxy_model_ens is not used in our settings, so replace it with agent.compute_intrinsic_reward()
-            # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
-            # TODO: requires an argument for onpolicy reward function in QFlow()
-            # add 1) onpolicy reward function, 2) args.novelty measure (curiosity, rnd, eco)
-            # TODO: We need to normalize the novelty, so that we can handle different scales of novelty measures with on-policy reward
-            # EMA: Instead of using original prior, we use EMA model
+                # define posterior model and optimizer
+                # proxy_model_ens is not used in our settings, so replace it with agent.compute_intrinsic_reward()
+                # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha, beta=beta).to(dtype=dtype, device=device)
+                # TODO: requires an argument for onpolicy reward function in QFlow()
+                # add 1) onpolicy reward function, 2) args.novelty measure (curiosity, rnd, eco)
+                # TODO: We need to normalize the novelty, so that we can handle different scales of novelty measures with on-policy reward
+                # EMA: Instead of using original prior, we use EMA model
             
-            # TODO: deep copy prior_ema.ema_model to prior_model
-            # TODO: This is the main cause of not decreasing the loss
-            posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb,
-                                    obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-                                    agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim).to(device=device)
+                # TODO: deep copy prior_ema.ema_model to prior_model
+                # TODO: This is the main cause of not decreasing the loss
+                posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_ema.ema_model, alpha=alpha_rtb,
+                                        obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
+                                        agent=agent, inter_onpolicy=args.inter_onpolicy, reward_percentile=test_function_y_percentile, eta=args.eta, ddim=args.ddim, posterior_param=args.posterior_param).to(device=device)
             
-            # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
-            #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-            #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
+                # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
+                #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
+                #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
             
-            # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
-            #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
-            #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
+                # posterior_model = QFlow(x_dim=diff_dims, diffusion_steps=args.diffusion_steps, q_net=proxy_model_ens, bc_net=prior_model, alpha=alpha_rtb, beta=beta,
+                #                         square=args.square, pow_reward=args.pow_reward, obs_dim=obs_dim, act_dim=act_dim, dtype=dtype, novelty_measure=args.novelty_measure, 
+                #                         agent=agent, inter_onpolicy=args.inter_onpolicy).to(device=device)
             
-            # def n_trainable(m):
-            #     return sum(p.numel() for p in m.parameters() if p.requires_grad)
+                # def n_trainable(m):
+                #     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
-            # print("qflow trainable params:", n_trainable(posterior_model.qflow))
-            # print("bc_net policy trainable params:", n_trainable(posterior_model.bc_net.policy))
-            # print("logZ requires_grad:", posterior_model.logZ.requires_grad)
+                # print("qflow trainable params:", n_trainable(posterior_model.qflow))
+                # print("bc_net policy trainable params:", n_trainable(posterior_model.bc_net.policy))
+                # print("logZ requires_grad:", posterior_model.logZ.requires_grad)
             
-            # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
-            # posterior_model_optimizer = torch.optim.AdamW(posterior_model.parameters(), lr=args.finetune_lr)
+                # posterior_model_optimizer = torch.optim.Adam(posterior_model.parameters(), lr=args.finetune_lr)
+                # posterior_model_optimizer = torch.optim.AdamW(posterior_model.parameters(), lr=args.finetune_lr)
             
-            # special optimizer
-            no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
-            optimizer_grouped_parameters = [
-                    {
-                        'params': [p for n, p in posterior_model.named_parameters() if not any(nd in n for nd in no_decay)],
-                        'weight_decay': 0.,
-                    },
-                    {
-                        'params': [p for n, p in posterior_model.named_parameters() if any(nd in n for nd in no_decay)],
-                        'weight_decay': 0.0,
-                    },
-                ]
-            posterior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.finetune_lr, betas=args.rtb_adam_betas)
-            posterior_model_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    posterior_model_optimizer,
-                    args.num_posterior_epochs
-                )
-            
-            xs = test_function_x_tensor.clone().detach().to(device)
-            xs = prior_model.normalizer.normalize(xs)
-            next_obs_start = obs_dim + act_dim + 1
-            next_obs_end = next_obs_start + obs_dim
-            ys = test_function_y_tensor.clone().detach().to(device)
-            y_weights = torch.softmax(ys, dim=0)
-            
-            posterior_model.train()
-            
-            # fine-tuning loop
-            if num_posterior_epochs > 0:
-                # Initialize wandb table for posterior training logs
-                if args.wandb:
-                    posterior_log_table = wandb.Table(
-                        columns=["Epoch", "Training_Epoch", "Loss", "logZ", "OnPolicy_Reward"]
+                # special optimizer
+                no_decay = ['bias', 'LayerNorm.weight', 'norm.weight', '.g']
+                optimizer_grouped_parameters = [
+                        {
+                            'params': [p for n, p in posterior_model.named_parameters() if not any(nd in n for nd in no_decay)],
+                            'weight_decay': 0.,
+                        },
+                        {
+                            'params': [p for n, p in posterior_model.named_parameters() if any(nd in n for nd in no_decay)],
+                            'weight_decay': 0.0,
+                        },
+                    ]
+                posterior_model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.finetune_lr, betas=args.rtb_adam_betas)
+                posterior_model_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        posterior_model_optimizer,
+                        args.num_posterior_epochs
                     )
-                s1 = 1
-                
-                # ---- measure posterior fine-tuning time ----
-                posterior_ft_start = time.time()
-                print(f"[Diffusion-DDPM] Posterior fine-tuning start (cur_epoch={cur_epoch}, num_posterior_epochs={num_posterior_epochs})")
-                for epoch in tqdm(range(num_posterior_epochs), dynamic_ncols=True):
-                    if args.training_posterior == "both":
-                        # toggle between on-policy and off-policy
-                        s1 = (s1+1) % 2
-                    elif args.training_posterior == "on":
-                        s1 = 0
-                    else: # off
-                        s1 = 1
-                    
-                    # Gradient accumulation settings
-                    accumulation_steps = args.accumulation_steps
-                    micro_batch_size = args.ft_batch_size // accumulation_steps
-                    posterior_model_optimizer.zero_grad()
-                    
-                    # Accumulate gradients over micro-batches
-                    total_loss = 0.0
-                    total_logZ = 0.0
-                    # all_x_list = []
-                    # all_y_list = []
-                    
-                    on_policy_rewards = []
-                    for acc_step in range(accumulation_steps):
-                        if s1 == 0:
-                            # on-policy
-                            if acc_step == 0:
-                                print(f'On-policy training (gradient accumulation: {accumulation_steps} steps)')
-                            # return normalized samples x
-                            loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=micro_batch_size)
-                            # Extract obs and next_obs from x for reward computation
-                            x_unnormalized = prior_model.normalizer.unnormalize(x)
-                            x_obs_unnormalized = x_unnormalized[:, :obs_dim]
-                            x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-                            # x_next_obs should be unnormalized as input of proxy_model_ens
-                            if args.novelty_measure == 'rnd':
-                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
-                            elif args.novelty_measure == 'curiosity':
-                                x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
-                                y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
-                            elif args.novelty_measure == 'eco':
-                                # ECO reward computation
-                                # According to paper: "takes the current observation o as input"
-                                # Use current obs (obs at time t, before action was taken)
-                                y = proxy_model_ens(x_obs_unnormalized).squeeze()
-                            else:
-                                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-                            on_policy_rewards.append(y.detach().mean().item())
-                        else:
-                            # off-policy (reward prioritization)
-                            if acc_step == 0:
-                                print(f'Off-policy training (gradient accumulation: {accumulation_steps} steps)')
-                            idx = torch.multinomial(y_weights.squeeze(), micro_batch_size, replacement=True)
-                            # this is normalized samples x
-                            x = xs[idx]
-                            # [Optional] Add noise to x
-                            # x += torch.randn_like(x) * 0.01
-                            loss, logZ = posterior_model.compute_loss_with_sample(x, device)
-                            # Extract obs and next_obs from x for reward computation
-                            x_unnormalized = prior_model.normalizer.unnormalize(x)
-                            x_obs_unnormalized = x_unnormalized[:, :obs_dim]
-                            x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
-                            if args.novelty_measure == 'rnd':
-                                y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
-                            elif args.novelty_measure == 'curiosity':
-                                x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
-                                y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
-                            elif args.novelty_measure == 'eco':
-                                # ECO reward computation
-                                # According to paper: "takes the current observation o as input"
-                                # Use current obs (obs at time t, before action was taken)
-                                y = proxy_model_ens(x_obs_unnormalized).squeeze()
-                            else:
-                                raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-                        
-                        # Scale loss by accumulation_steps to maintain same effective learning rate
-                        (loss / accumulation_steps).backward()
-                        total_loss += loss.item()
-                        if isinstance(logZ, torch.Tensor):
-                            total_logZ += logZ.item()
-                        else:
-                            total_logZ += logZ
-                        # all_x_list.append(x)
-                        # all_y_list.append(y)
-                    
-                    # Update weights after accumulating all gradients
-                    # posterior_model_optimizer.step()              
-                    if args.ft_clip_grad > 0.0:
-                        # print(f'Clipping gradients during finetuning')
-                        torch.nn.utils.clip_grad_norm_(posterior_model.parameters(), max_norm=args.ft_clip_grad)
-                    posterior_model_optimizer.step()
-                    if posterior_model_lr_scheduler is not None:
-                        posterior_model_lr_scheduler.step()
-                    
-                    # Concatenate all samples
-                    # x = torch.cat(all_x_list, dim=0)
-                    # y = torch.cat(all_y_list, dim=0)
-                    # 데이터 하나 당 평균 loss
-                    loss = total_loss / accumulation_steps  # Average loss for logging
-                    logZ = total_logZ / accumulation_steps  # Average logZ for logging
-                    
-                    # xs = torch.cat([xs, x], dim=0)
-                    # ys = torch.cat([ys, y], dim=0)
-                    
-                    # y_weights = torch.softmax(ys, dim=0)
-                    print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss:.9f}')
-                    
-                    # Add data to wandb table
+            
+                xs = test_function_x_tensor.clone().detach().to(device)
+                xs = prior_model.normalizer.normalize(xs)
+                next_obs_start = obs_dim + act_dim + 1
+                next_obs_end = next_obs_start + obs_dim
+                ys = test_function_y_tensor.clone().detach().to(device)
+                y_weights = torch.softmax(ys, dim=0)
+            
+                posterior_model.train()
+            
+                # fine-tuning loop
+                if num_posterior_epochs > 0:
+                    # Initialize wandb table for posterior training logs
                     if args.wandb:
-                        loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
-                        logZ_value = logZ.item() if isinstance(logZ, torch.Tensor) else logZ
-                        if on_policy_rewards:
-                            on_policy_reward_value = torch.tensor(on_policy_rewards).mean().item()
-                            on_policy_reward_value = f"{on_policy_reward_value:.9f}"
-                        else:
-                            on_policy_reward_value = "NA"
-                        posterior_log_table.add_data(
-                            cur_epoch,
-                            epoch + 1,
-                            f"{loss_value:.9f}",
-                            f"{logZ_value:.9f}",
-                            on_policy_reward_value
+                        posterior_log_table = wandb.Table(
+                            columns=["Epoch", "Training_Epoch", "Loss", "logZ", "OnPolicy_Reward"]
                         )
-                        print(f'On-policy reward (Mean): {on_policy_reward_value}')
+                    s1 = 1
                 
-                posterior_ft_elapsed = time.time() - posterior_ft_start
-                print(f"[Diffusion-DDPM] Posterior fine-tuning finished in {posterior_ft_elapsed:.2f} s "
-                      f"({posterior_ft_elapsed/60.0:.2f} min)")
-                # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
+                    # ---- measure posterior fine-tuning time ----
+                    posterior_ft_start = time.time()
+                    print(f"[Diffusion-DDPM] Posterior fine-tuning start (cur_epoch={cur_epoch}, num_posterior_epochs={num_posterior_epochs})")
+                    for epoch in tqdm(range(num_posterior_epochs), dynamic_ncols=True):
+                        if args.training_posterior == "both":
+                            # toggle between on-policy and off-policy
+                            s1 = (s1+1) % 2
+                        elif args.training_posterior == "on":
+                            s1 = 0
+                        else: # off
+                            s1 = 1
+                    
+                        # Gradient accumulation settings
+                        accumulation_steps = args.accumulation_steps
+                        micro_batch_size = args.ft_batch_size // accumulation_steps
+                        posterior_model_optimizer.zero_grad()
+                    
+                        # Accumulate gradients over micro-batches
+                        total_loss = 0.0
+                        total_logZ = 0.0
+                        # all_x_list = []
+                        # all_y_list = []
+                    
+                        on_policy_rewards = []
+                        for acc_step in range(accumulation_steps):
+                            if s1 == 0:
+                                # on-policy
+                                if acc_step == 0:
+                                    print(f'On-policy training (gradient accumulation: {accumulation_steps} steps)')
+                                # return normalized samples x
+                                loss, logZ, x, logr = posterior_model.compute_loss(device, gfn_batch_size=micro_batch_size)
+                                # Extract obs and next_obs from x for reward computation
+                                x_unnormalized = prior_model.normalizer.unnormalize(x)
+                                x_obs_unnormalized = x_unnormalized[:, :obs_dim]
+                                x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
+                                # x_next_obs should be unnormalized as input of proxy_model_ens
+                                if args.novelty_measure == 'rnd':
+                                    y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
+                                elif args.novelty_measure == 'curiosity':
+                                    x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
+                                    y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
+                                elif args.novelty_measure == 'eco':
+                                    # ECO reward computation
+                                    # According to paper: "takes the current observation o as input"
+                                    # Use current obs (obs at time t, before action was taken)
+                                    y = proxy_model_ens(x_obs_unnormalized).squeeze()
+                                else:
+                                    raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
+                                on_policy_rewards.append(y.detach().mean().item())
+                            else:
+                                # off-policy (reward prioritization)
+                                if acc_step == 0:
+                                    print(f'Off-policy training (gradient accumulation: {accumulation_steps} steps)')
+                                idx = torch.multinomial(y_weights.squeeze(), micro_batch_size, replacement=True)
+                                # this is normalized samples x
+                                x = xs[idx]
+                                # [Optional] Add noise to x
+                                # x += torch.randn_like(x) * 0.01
+                                loss, logZ = posterior_model.compute_loss_with_sample(x, device)
+                                # Extract obs and next_obs from x for reward computation
+                                x_unnormalized = prior_model.normalizer.unnormalize(x)
+                                x_obs_unnormalized = x_unnormalized[:, :obs_dim]
+                                x_next_obs_unnormalized = x_unnormalized[:, next_obs_start:next_obs_end]
+                                if args.novelty_measure == 'rnd':
+                                    y = proxy_model_ens(x_next_obs_unnormalized).squeeze()
+                                elif args.novelty_measure == 'curiosity':
+                                    x_act_unnormalized = x_unnormalized[:, obs_dim:obs_dim+act_dim]
+                                    y = proxy_model_ens(x_obs_unnormalized, x_next_obs_unnormalized, x_act_unnormalized).squeeze()
+                                elif args.novelty_measure == 'eco':
+                                    # ECO reward computation
+                                    # According to paper: "takes the current observation o as input"
+                                    # Use current obs (obs at time t, before action was taken)
+                                    y = proxy_model_ens(x_obs_unnormalized).squeeze()
+                                else:
+                                    raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
+                        
+                            # Scale loss by accumulation_steps to maintain same effective learning rate
+                            (loss / accumulation_steps).backward()
+                            total_loss += loss.item()
+                            if isinstance(logZ, torch.Tensor):
+                                total_logZ += logZ.item()
+                            else:
+                                total_logZ += logZ
+                            # all_x_list.append(x)
+                            # all_y_list.append(y)
+                    
+                        # Update weights after accumulating all gradients
+                        # posterior_model_optimizer.step()              
+                        if args.ft_clip_grad > 0.0:
+                            # print(f'Clipping gradients during finetuning')
+                            torch.nn.utils.clip_grad_norm_(posterior_model.parameters(), max_norm=args.ft_clip_grad)
+                        posterior_model_optimizer.step()
+                        if posterior_model_lr_scheduler is not None:
+                            posterior_model_lr_scheduler.step()
+                    
+                        # Concatenate all samples
+                        # x = torch.cat(all_x_list, dim=0)
+                        # y = torch.cat(all_y_list, dim=0)
+                        # 데이터 하나 당 평균 loss
+                        loss = total_loss / accumulation_steps  # Average loss for logging
+                        logZ = total_logZ / accumulation_steps  # Average logZ for logging
+                    
+                        # xs = torch.cat([xs, x], dim=0)
+                        # ys = torch.cat([ys, y], dim=0)
+                    
+                        # y_weights = torch.softmax(ys, dim=0)
+                        print(f'Epoch: {epoch+1}/{num_posterior_epochs} \tLoss: {loss:.9f}')
+                    
+                        # Add data to wandb table
+                        if args.wandb:
+                            loss_value = loss.item() if isinstance(loss, torch.Tensor) else loss
+                            logZ_value = logZ.item() if isinstance(logZ, torch.Tensor) else logZ
+                            if on_policy_rewards:
+                                on_policy_reward_value = torch.tensor(on_policy_rewards).mean().item()
+                                on_policy_reward_value = f"{on_policy_reward_value:.9f}"
+                            else:
+                                on_policy_reward_value = "NA"
+                            posterior_log_table.add_data(
+                                cur_epoch,
+                                epoch + 1,
+                                f"{loss_value:.9f}",
+                                f"{logZ_value:.9f}",
+                                on_policy_reward_value
+                            )
+                            print(f'On-policy reward (Mean): {on_policy_reward_value}')
+                
+                    posterior_ft_elapsed = time.time() - posterior_ft_start
+                    print(f"[Diffusion-DDPM] Posterior fine-tuning finished in {posterior_ft_elapsed:.2f} s "
+                          f"({posterior_ft_elapsed/60.0:.2f} min)")
+                    # Log table at the end of posterior training (with epoch-specific key to avoid overwriting)
+                    if args.wandb:
+                        # Fine-tuning uses a separate key, but keep the same "diffusion/*" prefix family.
+                        wandb.log(
+                            {
+                                f"Posterior_Training_Log_Epoch_{cur_epoch}" + (f"_beta{beta}" if beta is not None else ""): posterior_log_table,
+                                "diffusion/finetune_time_sec": posterior_ft_elapsed,
+                                "diffusion/finetune_time_min": posterior_ft_elapsed / 60.0,
+                            },
+                            step=cur_epoch,
+                        )
+                    
+                posterior_model.eval()
+        
+        
+        
+            # +++++++++++ training over +++++++++++
+            
+                # +++++++++++ 2. Sampling +++++++++++
+                posterior_sampling_start = time.time()
+                print(f'Sampling...')
+                X_sample_total = []
+                # we only need X_sample, not logR_sample
+                # logR_sample_total = []
+                eval_epochs = int(args.num_samples // args.sample_batch_size)
+                assert args.num_samples % args.sample_batch_size == 0
+                # In our settings, filtering is not used
+                # if args.filtering:
+                #     M = args.num_proposals
+                # else: # 
+                #     M = 1
+                posterior_model.eval()
+                
+                for _ in tqdm(range(eval_epochs)): #NOTE B * M**2 samples proposal.
+                    # Split into batches due to memory constraints
+                    # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
+                    # if args.algorithm == 'Ours':
+                    # posterior_model.eval()
+                    X_sample = (prior_ema.ema_model if beta == 0 else posterior_model).sample(bs=args.sample_batch_size, device=device, eval=True)
+                    # elif args.algorithm == 'PGRrnd' or args.algorithm == 'PGR':
+                    #     # prior_model.eval()
+                    #     # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
+                    #     # # pdb.set_trace()
+                    #     # cond = prior_model.cond_normalizer.normalize(cond)
+                    #     # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale)
+                    #     prior_ema.ema_model.eval()
+                    #     cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
+                    #     cond = prior_ema.ema_model.cond_normalizer.normalize(cond)
+                    #     X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale, ddim=args.ddim)
+                    # elif args.algorithm == 'SER':
+                    #     # prior_model.eval()
+                    #     # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
+                    #     prior_ema.ema_model.eval()
+                    #     X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None, ddim=args.ddim)
+                    # else:
+                    #     raise ValueError(f'Invalid algorithm: {args.algorithm}')
+                
+                    # local search is not used in our settings
+                    # if args.local_search and args.local_search_epochs > 0:
+                    #     break
+                    # else:
+                    X_sample_total.append(X_sample)
+                        # logR_sample_total.append(logR)
+                    
+                X_sample = torch.cat(X_sample_total, dim=0)
+                # logR_sample = torch.cat(logR_sample_total, dim=0)
+            
+                posterior_sampling_elapsed = time.time() - posterior_sampling_start
+                print(f'Sampling complete in {posterior_sampling_elapsed:.2f} s ({posterior_sampling_elapsed/60.0:.2f} min)')
                 if args.wandb:
-                    # Fine-tuning uses a separate key, but keep the same "diffusion/*" prefix family.
+                    # Keep keys consistent with online_cond_origin_baseline.py for easy comparison/plotting
                     wandb.log(
                         {
-                            f"Posterior_Training_Log_Epoch_{cur_epoch}": posterior_log_table,
-                            "diffusion/finetune_time_sec": posterior_ft_elapsed,
-                            "diffusion/finetune_time_min": posterior_ft_elapsed / 60.0,
+                            "diffusion/sampling_time_sec": posterior_sampling_elapsed,
+                            "diffusion/sampling_time_min": posterior_sampling_elapsed / 60.0,
                         },
                         step=cur_epoch,
                     )
-                    
-            posterior_model.eval()
-        
-        
-        
-        # +++++++++++ training over +++++++++++
             
-            # +++++++++++ 2. Sampling +++++++++++
-            posterior_sampling_start = time.time()
-            print(f'Sampling...')
-            X_sample_total = []
-            # we only need X_sample, not logR_sample
-            # logR_sample_total = []
-            eval_epochs = int(args.num_samples // args.sample_batch_size)
-            assert args.num_samples % args.sample_batch_size == 0
-            # In our settings, filtering is not used
-            # if args.filtering:
-            #     M = args.num_proposals
-            # else: # 
-            #     M = 1
-            posterior_model.eval()
-                
-            for _ in tqdm(range(eval_epochs)): #NOTE B * M**2 samples proposal.
-                # Split into batches due to memory constraints
-                # X_sample, logpf_pi, logpf_p = posterior_model.sample(bs=args.sample_batch_size * M, device=device)
-                # if args.algorithm == 'Ours':
-                # posterior_model.eval()
-                X_sample = posterior_model.sample(bs=args.sample_batch_size, device=device, eval=True)
-                # elif args.algorithm == 'PGRrnd' or args.algorithm == 'PGR':
-                #     # prior_model.eval()
-                #     # cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
-                #     # # pdb.set_trace()
-                #     # cond = prior_model.cond_normalizer.normalize(cond)
-                #     # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale)
-                #     prior_ema.ema_model.eval()
-                #     cond = torch.FloatTensor(cond_distri.sample_cond(args.sample_batch_size)).to(device)
-                #     cond = prior_ema.ema_model.cond_normalizer.normalize(cond)
-                #     X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=cond, cfg_scale=cfg_scale, ddim=args.ddim)
-                # elif args.algorithm == 'SER':
-                #     # prior_model.eval()
-                #     # X_sample = prior_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None)
-                #     prior_ema.ema_model.eval()
-                #     X_sample = prior_ema.ema_model.sample(bs=args.sample_batch_size, device=device, eval=True, cond=None, cfg_scale=None, ddim=args.ddim)
-                # else:
-                #     raise ValueError(f'Invalid algorithm: {args.algorithm}')
-                
-                # local search is not used in our settings
-                # if args.local_search and args.local_search_epochs > 0:
-                #     break
-                # else:
-                X_sample_total.append(X_sample)
-                    # logR_sample_total.append(logR)
-                    
-            X_sample = torch.cat(X_sample_total, dim=0)
-            # logR_sample = torch.cat(logR_sample_total, dim=0)
-            
-            posterior_sampling_elapsed = time.time() - posterior_sampling_start
-            print(f'Sampling complete in {posterior_sampling_elapsed:.2f} s ({posterior_sampling_elapsed/60.0:.2f} min)')
-            if args.wandb:
-                # Keep keys consistent with online_cond_origin_baseline.py for easy comparison/plotting
-                wandb.log(
-                    {
-                        "diffusion/sampling_time_sec": posterior_sampling_elapsed,
-                        "diffusion/sampling_time_min": posterior_sampling_elapsed / 60.0,
-                    },
-                    step=cur_epoch,
+                # clip
+                print(f'X_sample before clipping: {X_sample}')
+                # originally in PGR source code
+                if isinstance(prior_model.normalizer, MinMaxNormalizer):
+                    print('Clipping X_sample to [-1, 1]')
+                    print('it works anyway')
+                    X_sample = torch.clamp(X_sample, -1., 1.)
+                else:
+                    print('Not clipping X_sample')
+                # unnormalize samples after clipping
+                X_sample_unnorm = prior_model.normalizer.unnormalize(X_sample)
+                # if actions are not clipped, then clamp them to [-1, 1]
+                # X_sample_unnorm = torch.clamp(X_sample_unnorm, -1, 1)
+
+                # --- Compute and save reward vector for ablation analysis ---
+                with torch.no_grad():
+                    reward_vec_list = []
+                    reward_compute_batch = 4096
+                    for ri in range(0, X_sample_unnorm.shape[0], reward_compute_batch):
+                        batch_unnorm = X_sample_unnorm[ri:ri + reward_compute_batch]
+                        b_obs = batch_unnorm[:, :obs_dim].to(device)
+                        b_next_obs = batch_unnorm[:, next_obs_start:next_obs_end].to(device)
+                        if args.novelty_measure == 'rnd':
+                            b_rew = proxy_model_ens(b_next_obs).squeeze()
+                        elif args.novelty_measure == 'curiosity':
+                            b_act = batch_unnorm[:, obs_dim:obs_dim + act_dim].to(device)
+                            b_rew = proxy_model_ens(b_obs, b_next_obs, b_act).squeeze()
+                        elif args.novelty_measure == 'eco':
+                            b_rew = proxy_model_ens(b_obs).squeeze()
+                        else:
+                            raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
+                        reward_vec_list.append(b_rew.cpu().numpy())
+                    sample_reward_vector = np.concatenate(reward_vec_list)
+
+                abl_folder_name = (
+                    f"{env_name}_epoch{cur_epoch}_seed{seed}"
+                    f"_alpha{alpha_rtb}_{time.strftime('%Y%m%d_%H%M%S')}"
                 )
-            
-            # clip
-            print(f'X_sample before clipping: {X_sample}')
-            # originally in PGR source code
-            if isinstance(prior_model.normalizer, MinMaxNormalizer):
-                print('Clipping X_sample to [-1, 1]')
-                print('it works anyway')
-                X_sample = torch.clamp(X_sample, -1., 1.)
-            else:
-                print('Not clipping X_sample')
-            # unnormalize samples after clipping
-            X_sample_unnorm = prior_model.normalizer.unnormalize(X_sample)
-            # if actions are not clipped, then clamp them to [-1, 1]
-            # X_sample_unnorm = torch.clamp(X_sample_unnorm, -1, 1)
-
-            # --- Compute and save reward vector for ablation analysis ---
-            with torch.no_grad():
-                reward_vec_list = []
-                reward_compute_batch = 4096
-                for ri in range(0, X_sample_unnorm.shape[0], reward_compute_batch):
-                    batch_unnorm = X_sample_unnorm[ri:ri + reward_compute_batch]
-                    b_obs = batch_unnorm[:, :obs_dim].to(device)
-                    b_next_obs = batch_unnorm[:, next_obs_start:next_obs_end].to(device)
-                    if args.novelty_measure == 'rnd':
-                        b_rew = proxy_model_ens(b_next_obs).squeeze()
-                    elif args.novelty_measure == 'curiosity':
-                        b_act = batch_unnorm[:, obs_dim:obs_dim + act_dim].to(device)
-                        b_rew = proxy_model_ens(b_obs, b_next_obs, b_act).squeeze()
-                    elif args.novelty_measure == 'eco':
-                        b_rew = proxy_model_ens(b_obs).squeeze()
-                    else:
-                        raise ValueError(f'Invalid novelty measure: {args.novelty_measure}')
-                    reward_vec_list.append(b_rew.cpu().numpy())
-                sample_reward_vector = np.concatenate(reward_vec_list)
-
-            abl_folder_name = (
-                f"{env_name}_epoch{cur_epoch}_seed{seed}"
-                f"_alpha{alpha_rtb}_{time.strftime('%Y%m%d_%H%M%S')}"
-            )
-            abl_save_dir = os.path.join("ablation_data", abl_folder_name)
-            os.makedirs(abl_save_dir, exist_ok=True)
-            reward_save_path = os.path.join(abl_save_dir, f"reward_vector_epoch{cur_epoch}.npy")
-            np.save(reward_save_path, sample_reward_vector)
-            print(f'Saved reward vector (shape={sample_reward_vector.shape}) to {reward_save_path}')
+                abl_save_dir = os.path.join("ablation_data", abl_folder_name)
+                os.makedirs(abl_save_dir, exist_ok=True)
+                reward_save_path = os.path.join(abl_save_dir, f"reward_vector_epoch{cur_epoch}.npy")
+                np.save(reward_save_path, sample_reward_vector)
+                print(f'Saved reward vector (shape={sample_reward_vector.shape}) to {reward_save_path}')
+                if beta is not None:  # same samples: novelty + ground-truth dynamics error
+                    X_np = X_sample_unnorm.cpu().numpy()
+                    o_s, a_s, r_s, no_s = [np.asarray(v) for v in split_diffusion_samples(X_np, env, modelled_terminals=model_terminals)[:4]]
+                    dyn = compute_dynamic_mse_from_diffusion_buffer(None, gt_dyn_env, batch=dict(obs1=o_s, acts=a_s, obs2=no_s, rews=r_s.reshape(-1)))
+                    os.makedirs(args.sweep_out, exist_ok=True)
+                    np.savez(os.path.join(args.sweep_out, f'{env_name}_seed{seed}_beta{beta}_epoch{cur_epoch}.npz'),
+                             X=X_np, novelty=sample_reward_vector, dyn_mse=dyn['dyn_mse'], state_mse=dyn['state_mse'], reward_mse=dyn['reward_mse'],
+                             ok_mask=dyn['ok_mask'], clip_threshold=float(test_function_y_percentile), beta=beta, alpha=alpha_rtb)
+                    print(f'[beta sweep] beta={beta} novelty mean={sample_reward_vector.mean():.6f} dyn_mse mean={dyn["dyn_mse"].mean():.6f} n_ok={dyn["n_ok"]}')
 
 
             # put it in diffusion replay buffer
@@ -1371,6 +1385,11 @@ if __name__ == '__main__':
     # Dynamic MSE logging (synthetic transition plausibility)
     parser.add_argument('--dynamic_mse_samples', type=int, default=5000)
     parser.add_argument('--dynamic_mse_every', type=int, default=1)
+    parser.add_argument('--posterior_param', type=str, default='residual')  # the Table 3 runs predate the absolute parameterization
+    parser.add_argument('--beta_sweep', type=str, default='')  # e.g. '0,0.2,0.5,1,2'
+    parser.add_argument('--sweep_epoch', type=int, default=59)
+    parser.add_argument('--sweep_out', type=str, default='rebuttal_aaai/data/novelty_mse')
+    parser.add_argument('--wandb_group', type=str, default=None)
     
     args = parser.parse_args()
     
